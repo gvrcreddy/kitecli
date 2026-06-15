@@ -1,6 +1,6 @@
-# KCLI — Kite Connect CLI
+# Kite Connect CLI (kitecli)
 
-A multi-account Zerodha Kite Connect positions viewer with a beautiful terminal interface.
+A multi-account Zerodha Kite Connect trading positions viewer with a beautiful interactive terminal user interface (TUI).
 
 ```
   ╦╔═╔═╗╦  ╦
@@ -9,124 +9,105 @@ A multi-account Zerodha Kite Connect positions viewer with a beautiful terminal 
   Kite Connect CLI
 ```
 
-## Architecture
+---
 
-```
-┌─────────────────┐       HTTPS       ┌──────────────────┐      Kite API      ┌─────────────────┐
-│   kcli (CLI)    │ ──────────────── │  FastAPI Server  │ ──────────────────│  Zerodha Kite   │
-│   Your Machine  │                   │  Google Cloud    │                    │  Connect API    │
-└─────────────────┘                   └──────────────────┘                    └─────────────────┘
-        │
-        ▼
-  ~/.kcli/config.yaml
+## Key Features
+
+- 🔒 **Local-Only Architecture**: No server layer, no database, no cloud deployment. Your Zerodha API credentials and session tokens stay strictly on your local machine.
+- 👥 **Multi-Account**: View and manage open positions and order books from multiple Zerodha accounts in a single consolidated screen.
+- ⚡ **Parallelized Requests**: All network calls (positions, orders, initialization) are executed concurrently in a thread pool, keeping updates extremely fast and fluid.
+- 🔑 **Auto-Login**: Session tokens are cached securely in `~/.kcli/sessions.json`. Using your credentials (`user_id`, `password`, `totp_secret`), `kcli` automatically handles authentication and daily OTP generation in the background.
+- 🌐 **Proxy Routing**: Map different HTTP/HTTPS proxies to each account individually to comply with Zerodha API connection requirements.
+- 📊 **Interactive TUI Dashboard**: Launch the live dashboard to view:
+  - Consolidated active positions with soft-color styling.
+  - Live indices panel (**NIFTY 50**, **SENSEX**, and **INDIA VIX**).
+  - Info Pane to view Pending Orders, Executed Orders, or Option Chains (`F1`, `F2`, `F3`).
+  - Active logs with color-coded alerts and focus highlights for simple navigation.
+
+---
+
+## Installation
+
+Install the package via `pip`:
+
+```bash
+pip install kitecli
 ```
 
-- **CLI (`kcli`)**: Runs on your machine. Beautiful color-coded terminal UI.
-- **Server**: Runs on Google Cloud (Cloud Run). Proxies Kite API calls.
-- **Config**: Multi-account config stored locally at `~/.kcli/config.yaml`.
+*(For local development or installing from source)*:
+```bash
+git clone https://github.com/vgolugur/kitecli.git
+cd kitecli
+pip install -e .
+```
+
+---
 
 ## Quick Start
 
-### 1. Deploy the Server
+### 1. Initialize Configuration
+
+Create a default configuration template:
 
 ```bash
-# Build and deploy to Cloud Run
-cd server
-gcloud run deploy kcli-server \
-  --source . \
-  --region asia-south1 \
-  --allow-unauthenticated \
-  --set-env-vars AUTH_TOKEN=your-secret-token
-```
-
-### 2. Install the CLI
-
-```bash
-# From the project root
-pip install -e .
-```
-
-### 3. Initialize Config
-
-```bash
-# Create the default config file
 kcli config --init
-
-# Edit the config with your accounts
-# Open ~/.kcli/config.yaml and add your Kite API credentials
 ```
 
-**Config file format (`~/.kcli/config.yaml`):**
+This generates a config file at `~/.kcli/config.yaml`.
+
+### 2. Configure Accounts
+
+Open `~/.kcli/config.yaml` in your text editor and add your accounts. Include your login credentials and TOTP secrets to enable auto-login:
 
 ```yaml
-server:
-  url: "https://your-cloud-run-url.run.app"
-  auth_token: "your-secret-token"
-
 accounts:
-  - name: "Trading Account 1"
+  - name: "Account 1"
     api_key: "your_api_key_1"
     api_secret: "your_api_secret_1"
-  - name: "Trading Account 2"
-    api_key: "your_api_key_2"
-    api_secret: "your_api_secret_2"
+    user_id: "your_zerodha_user_id_1"
+    password: "your_zerodha_password_1"
+    totp_secret: "your_totp_secret_1"
+    proxy: "http://username:password@ip:port"  # Optional per-account proxy
 ```
 
-### 4. Login to Kite
+### 3. Log In & Authenticate
+
+Authenticate and start your sessions (auto-login will run in the background for accounts with complete credentials):
 
 ```bash
-# Initialize and authenticate all accounts
 kcli init
 ```
 
-This will:
-1. Send your account configs to the server
-2. Display login URLs for each account
-3. Prompt you to paste the `request_token` after logging in via browser
+### 4. Run commands
 
-> **Note:** Kite access tokens expire daily (~6 AM IST). You need to run `kcli init` once each trading day.
+- **Interactive Dashboard**:
+  ```bash
+  kcli live
+  ```
+- **Positions Snapshot**:
+  ```bash
+  kcli positions
+  ```
+- **Status Check**:
+  ```bash
+  kcli status
+  ```
 
-### 5. View Positions
+---
 
-```bash
-# View positions across all accounts
-kcli positions
-```
-
-## Commands
+## CLI Command Reference
 
 | Command | Description |
 |---|---|
-| `kcli init` | Authenticate all accounts (daily) |
-| `kcli positions` | View positions across all accounts |
-| `kcli status` | Check authentication status |
-| `kcli config --init` | Create default config file |
-| `kcli config --show` | Show current config (secrets masked) |
-| `kcli config --path` | Print config file path |
+| `kcli live` | Launch the interactive live TUI dashboard |
+| `kcli init` | Initialize and authenticate account sessions |
+| `kcli positions` | Print a quick snapshot of active positions |
+| `kcli status` | Check authentication status of configured accounts |
+| `kcli config --init` | Generate a default configuration file |
+| `kcli config --show` | Display current configuration (secrets masked) |
+| `kcli config --path` | Print the configuration file path |
 
-## Development
-
-### Run Server Locally
-
-```bash
-cd server
-pip install -r requirements.txt
-AUTH_TOKEN=test-token uvicorn main:app --reload --port 8080
-```
-
-### Run CLI
-
-```bash
-pip install -e .
-kcli --help
-```
-
-## Getting Kite API Credentials
-
-1. Go to [Kite Developer Console](https://developers.kite.trade/)
-2. Create a new app
-3. Note your **API Key** and **API Secret**
-4. Set the **Redirect URL** to your server's callback URL
+---
 
 ## License
 

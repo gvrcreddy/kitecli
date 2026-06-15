@@ -6,6 +6,7 @@ Public API is identical to the old HTTP-based KCLIClient so that
 cli/main.py and cli/live_session.py require zero changes.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from cli.kite_manager import KiteAccountManager
 
 
@@ -45,13 +46,11 @@ class KCLIClient:
         """Always True — no server to ping in local mode."""
         return True
 
-    # ── public API (mirrors old KCLIClient exactly) ────────────────
+    # ── public API (mirrors old KCLIClient exactly, but runs in parallel) ──
 
     def init_accounts(self, accounts: list[dict]) -> dict:
-        """Initialise (or re-initialise) accounts and attempt auto-login."""
-        result_accounts = []
-
-        for acct in accounts:
+        """Initialise (or re-initialise) accounts and attempt auto-login in parallel."""
+        def init_one(acct):
             api_key = acct.get("api_key", "")
             name = acct.get("name", api_key)
 
@@ -63,14 +62,13 @@ class KCLIClient:
             )
 
             if _manager.is_authenticated(api_key):
-                result_accounts.append({
+                return {
                     "name": name,
                     "api_key": api_key,
                     "login_url": login_url,
                     "auto_logged_in": True,
                     "message": "Session restored from saved token",
-                })
-                continue
+                }
 
             user_id = acct.get("user_id")
             password = acct.get("password")
@@ -83,32 +81,34 @@ class KCLIClient:
                     totp_secret=totp_secret,
                 )
                 if success:
-                    result_accounts.append({
+                    return {
                         "name": name,
                         "api_key": api_key,
                         "login_url": login_url,
                         "auto_logged_in": True,
                         "message": "Auto-login successful",
-                    })
-                    continue
+                    }
                 else:
-                    result_accounts.append({
+                    return {
                         "name": name,
                         "api_key": api_key,
                         "login_url": login_url,
                         "auto_logged_in": False,
                         "message": "Auto-login failed. Use manual login URL.",
-                    })
+                    }
             else:
-                result_accounts.append({
+                return {
                     "name": name,
                     "api_key": api_key,
                     "login_url": login_url,
                     "auto_logged_in": False,
                     "message": "Credentials incomplete — manual login required.",
-                })
+                }
 
-        return {"accounts": result_accounts}
+        with ThreadPoolExecutor(max_workers=max(1, len(accounts))) as executor:
+            results = list(executor.map(init_one, accounts))
+
+        return {"accounts": results}
 
     def complete_callback(self, api_key: str, request_token: str) -> dict:
         """Complete Kite OAuth login with a request token."""
@@ -121,41 +121,42 @@ class KCLIClient:
             raise KCLIClientError(str(exc)) from exc
 
     def get_positions(self, api_keys: list[str]) -> dict:
-        """Fetch open positions for the given accounts."""
-        result_accounts = []
+        """Fetch open positions for the given accounts in parallel."""
         keys = api_keys or _manager.get_all_api_keys()
 
-        for api_key in keys:
+        def fetch_one(api_key):
             info = _manager.get_account_info(api_key)
             if not info.get("authenticated"):
-                result_accounts.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "positions": [],
                     "total_pnl": 0.0,
                     "status": "unauthenticated",
-                })
-                continue
+                }
             try:
                 positions = _manager.get_positions(api_key)
                 total_pnl = sum(p.get("pnl", 0.0) for p in positions)
-                result_accounts.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "positions": positions,
                     "total_pnl": total_pnl,
                     "status": "success",
-                })
+                }
             except Exception as exc:
-                result_accounts.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "positions": [],
                     "total_pnl": 0.0,
                     "status": f"error: {exc}",
-                })
+                }
 
-        return {"accounts": result_accounts}
+        with ThreadPoolExecutor(max_workers=max(1, len(keys))) as executor:
+            results = list(executor.map(fetch_one, keys))
+
+        return {"accounts": results}
 
     def get_status(self) -> dict:
         """Get authentication status for all accounts."""
@@ -177,21 +178,19 @@ class KCLIClient:
         trigger_price: float | None = None,
         product: str = "NRML",
     ) -> dict:
-        """Place an order across specified accounts."""
+        """Place an order across specified accounts in parallel."""
         keys = api_keys or _manager.get_all_api_keys()
-        results = []
 
-        for api_key in keys:
+        def place_one(api_key):
             info = _manager.get_account_info(api_key)
             if not info.get("authenticated"):
-                results.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "status": "error",
                     "order_id": None,
                     "message": "Account not authenticated",
-                })
-                continue
+                }
             try:
                 order_id = _manager.place_order(
                     api_key=api_key,
@@ -204,21 +203,24 @@ class KCLIClient:
                     trigger_price=trigger_price,
                     product=product,
                 )
-                results.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "status": "success",
                     "order_id": str(order_id),
                     "message": f"Order placed: {order_id}",
-                })
+                }
             except Exception as exc:
-                results.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "status": "error",
                     "order_id": None,
                     "message": str(exc),
-                })
+                }
+
+        with ThreadPoolExecutor(max_workers=max(1, len(keys))) as executor:
+            results = list(executor.map(place_one, keys))
 
         return {"results": results}
 
@@ -227,38 +229,39 @@ class KCLIClient:
         api_keys: list[str],
         tradingsymbol: str | None = None,
     ) -> dict:
-        """Exit positions across specified accounts."""
+        """Exit positions across specified accounts in parallel."""
         keys = api_keys or _manager.get_all_api_keys()
-        results = []
 
-        for api_key in keys:
+        def exit_one(api_key):
             info = _manager.get_account_info(api_key)
             if not info.get("authenticated"):
-                results.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "status": "error",
                     "message": "Account not authenticated",
                     "orders_placed": [],
-                })
-                continue
+                }
             try:
                 orders = _manager.exit_positions(api_key, tradingsymbol)
-                results.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "status": "success",
                     "message": f"Exited {len(orders)} position(s)",
                     "orders_placed": orders,
-                })
+                }
             except Exception as exc:
-                results.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "status": "error",
                     "message": str(exc),
                     "orders_placed": [],
-                })
+                }
+
+        with ThreadPoolExecutor(max_workers=max(1, len(keys))) as executor:
+            results = list(executor.map(exit_one, keys))
 
         return {"results": results}
 
@@ -281,37 +284,38 @@ class KCLIClient:
             raise KCLIClientError(str(exc)) from exc
 
     def get_orders(self, api_keys: list[str]) -> dict:
-        """Fetch today's order book for specified accounts."""
+        """Fetch today's order book for specified accounts in parallel."""
         keys = api_keys or _manager.get_all_api_keys()
-        result_accounts = []
 
-        for api_key in keys:
+        def fetch_one(api_key):
             info = _manager.get_account_info(api_key)
             if not info.get("authenticated"):
-                result_accounts.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "orders": [],
                     "status": "unauthenticated",
-                })
-                continue
+                }
             try:
                 orders = _manager.get_orders(api_key)
-                result_accounts.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "orders": orders,
                     "status": "success",
-                })
+                }
             except Exception as exc:
-                result_accounts.append({
+                return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "orders": [],
                     "status": f"error: {exc}",
-                })
+                }
 
-        return {"accounts": result_accounts}
+        with ThreadPoolExecutor(max_workers=max(1, len(keys))) as executor:
+            results = list(executor.map(fetch_one, keys))
+
+        return {"accounts": results}
 
     def get_market_indices(self) -> dict:
         """Fetch live Nifty, Sensex, and India VIX."""

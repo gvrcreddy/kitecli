@@ -758,29 +758,34 @@ class KiteAccountManager:
                     except Exception as exc:
                         logger.warning("Kite indices fetch failed for api_key=%s…: %s", api_key[:8], exc)
 
-        # 2. Fallback to Yahoo Finance chart API
+        # 2. Fallback to Yahoo Finance chart API (in parallel)
         try:
             logger.info("Fetching indices from Yahoo Finance fallback...")
             import requests as http_requests
             headers = {"User-Agent": "Mozilla/5.0"}
+            from concurrent.futures import ThreadPoolExecutor
 
-            # Fetch Nifty (^NSEI)
-            n_resp = http_requests.get("https://query1.finance.yahoo.com/v8/finance/chart/^NSEI?interval=1m&range=1d", headers=headers, timeout=5)
-            n_price = n_resp.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            symbols = {
+                "nifty": "^NSEI",
+                "sensex": "^BSESN",
+                "vix": "^INDIAVIX",
+            }
 
-            # Fetch Sensex (^BSESN)
-            s_resp = http_requests.get("https://query1.finance.yahoo.com/v8/finance/chart/^BSESN?interval=1m&range=1d", headers=headers, timeout=5)
-            s_price = s_resp.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            def fetch_symbol_price(item):
+                name, code = item
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}?interval=1m&range=1d"
+                resp = http_requests.get(url, headers=headers, timeout=5)
+                price = resp.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+                return name, float(price)
 
-            # Fetch India VIX (^INDIAVIX)
-            v_resp = http_requests.get("https://query1.finance.yahoo.com/v8/finance/chart/^INDIAVIX?interval=1m&range=1d", headers=headers, timeout=5)
-            v_price = v_resp.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                results = dict(executor.map(fetch_symbol_price, symbols.items()))
 
             return {
                 "status": "success",
-                "nifty": float(n_price),
-                "sensex": float(s_price),
-                "vix": float(v_price),
+                "nifty": results["nifty"],
+                "sensex": results["sensex"],
+                "vix": results["vix"],
             }
         except Exception as exc:
             logger.error("Yahoo Finance fallback failed: %s", exc)

@@ -27,6 +27,195 @@ from cli.display import render_positions_to_string
 logger = logging.getLogger(__name__)
 
 
+def _silence_websocket_loggers() -> None:
+    """Route noisy third-party WebSocket loggers to a file instead of the
+    terminal.
+
+    kiteconnect/autobahn/twisted emit ``log.error(...)`` calls (e.g. the
+    repeated "Connection closed: 1006" / "Connection error: 1006" lines) on a
+    module-level logger. The root logger has no handlers, so Python's
+    "last resort" handler writes them to stderr — which corrupts this
+    full-screen prompt_toolkit TUI. We attach a dedicated file handler to those
+    loggers and disable propagation so nothing reaches the terminal.
+    """
+    from pathlib import Path
+
+    log_dir = Path.home() / ".kcli"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "websocket.log"
+
+    file_handler = logging.FileHandler(str(log_file))
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    )
+
+    for name in ("kiteconnect", "kiteconnect.ticker", "autobahn", "twisted"):
+        noisy = logging.getLogger(name)
+        # Avoid stacking duplicate handlers if run() is called more than once.
+        if not any(isinstance(h, logging.FileHandler) for h in noisy.handlers):
+            noisy.addHandler(file_handler)
+        noisy.propagate = False
+        noisy.setLevel(logging.WARNING)
+
+
+def probe_ws_auth(api_key: str, access_token: str, proxy_str: str = None,
+                  timeout: float = 12.0) -> tuple[str, str]:
+    """Probe Zerodha's WebSocket endpoint to check whether streaming auth works.
+
+    This performs a single, lightweight WebSocket *upgrade* handshake against
+    ``wss://ws.kite.trade`` (optionally through the account's HTTP proxy) and
+    inspects the HTTP status of the response.
+
+    Why this exists: a token can authenticate REST (``/user/profile`` returns
+    200) yet still be rejected by the WebSocket with ``403 Authentication
+    failed`` — this happens per api_key/app (e.g. an app without an active
+    streaming subscription, or a token not generated via the api_secret
+    ``generate_session`` flow). A REST-only check (``kite.profile()``) cannot
+    detect this, so we probe the actual streaming handshake to decide whether
+    to start the ticker and avoid an endless 403 reconnect storm.
+
+    Returns a ``(status, detail)`` tuple where status is one of:
+      - ``"ok"``            → server returned 101 Switching Protocols.
+      - ``"auth_failed"``   → server returned 403/401 (token rejected for streaming).
+      - ``"proxy_blocked"`` → proxy refused the CONNECT tunnel.
+      - ``"error"``         → network/other failure (inconclusive).
+    """
+    import socket
+    import base64
+    import ssl
+    import os
+
+    host = "ws.kite.trade"
+    port = 443
+
+    # Build TLS context. The production kiteconnect ticker does not verify the
+    # certificate either, but prefer a verified context when certifi is present.
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    raw_sock = None
+    try:
+        if proxy_str:
+            p_str = proxy_str if "://" in proxy_str else f"http://{proxy_str}"
+            pr = urlparse(p_str)
+            raw_sock = socket.create_connection((pr.hostname, pr.port), timeout=timeout)
+            connect_req = (
+                f"CONNECT {host}:{port} HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+            )
+            if pr.username and pr.password:
+                auth = base64.b64encode(
+                    f"{pr.username}:{pr.password}".encode()
+                ).decode("ascii")
+                connect_req += f"Proxy-Authorization: Basic {auth}\r\n"
+            connect_req += "\r\n"
+            raw_sock.sendall(connect_req.encode())
+            connect_resp = raw_sock.recv(4096).decode(errors="replace")
+            first = connect_resp.splitlines()[0] if connect_resp else ""
+            if " 200" not in first:
+                return "proxy_blocked", first.strip() or "proxy CONNECT failed"
+        else:
+            raw_sock = socket.create_connection((host, port), timeout=timeout)
+
+        try:
+            tls = ctx.wrap_socket(raw_sock, server_hostname=host)
+        except ssl.SSLError:
+            # Fall back to an unverified handshake (matches ticker behaviour).
+            ctx2 = ssl.create_default_context()
+            ctx2.check_hostname = False
+            ctx2.verify_mode = ssl.CERT_NONE
+            tls = ctx2.wrap_socket(raw_sock, server_hostname=host)
+
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        upgrade = (
+            f"GET /?api_key={api_key}&access_token={access_token} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"X-Kite-Version: 3\r\n"
+            f"User-Agent: kite3-python\r\n\r\n"
+        )
+        tls.sendall(upgrade.encode())
+        resp = tls.recv(8192).decode(errors="replace")
+        try:
+            tls.close()
+        except Exception:
+            pass
+
+        status_line = resp.splitlines()[0] if resp else ""
+        if "101" in status_line:
+            return "ok", ""
+        if "403" in status_line or "401" in status_line:
+            msg = "Authentication failed."
+            if '"message"' in resp:
+                try:
+                    import json as _json
+                    body = resp.split("\r\n\r\n", 1)[1]
+                    msg = _json.loads(body).get("message", msg)
+                except Exception:
+                    pass
+            return "auth_failed", msg
+        return "error", status_line.strip() or "unexpected response"
+    except Exception as exc:
+        return "error", str(exc)
+    finally:
+        if raw_sock is not None:
+            try:
+                raw_sock.close()
+            except Exception:
+                pass
+
+
+# ── Monkeypatch Autobahn to support Proxy Authentication ───────────
+try:
+    import base64
+    import txaio
+    
+    # Safely select framework for txaio if not already selected
+    if not getattr(txaio, "_explicit_framework", None):
+        try:
+            txaio.use_twisted()
+        except Exception:
+            try:
+                txaio.use_asyncio()
+            except Exception:
+                pass
+
+    from autobahn.websocket.protocol import WebSocketClientProtocol
+
+    def custom_startProxyConnect(self):
+        """Autobahn startProxyConnect override to inject Proxy-Authorization."""
+        request = f"CONNECT {self.factory.host}:{self.factory.port} HTTP/1.1\x0d\x0a"
+        request += f"Host: {self.factory.host}:{self.factory.port}\x0d\x0a"
+
+        # Check if proxy dict contains username/password
+        if (
+            hasattr(self, "factory")
+            and getattr(self.factory, "proxy", None)
+            and "username" in self.factory.proxy
+            and "password" in self.factory.proxy
+        ):
+            usr = self.factory.proxy["username"]
+            pwd = self.factory.proxy["password"]
+            auth_str = f"{usr}:{pwd}"
+            auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("ascii")
+            request += f"Proxy-Authorization: Basic {auth_b64}\x0d\x0a"
+
+        request += "\x0d\x0a"
+        self.sendData(request.encode("utf-8"))
+
+    WebSocketClientProtocol.startProxyConnect = custom_startProxyConnect
+except Exception as patch_exc:
+    logger.warning("Failed to monkeypatch Autobahn proxy connect: %s", patch_exc)
+
+
 class DragInterceptDict(UserDict):
     def __init__(self, session, original_defaultdict):
         super().__init__()
@@ -94,6 +283,15 @@ class KCLILiveSession:
         self.running = True
         self.tickers = {}
         self.subscribed_tokens = set()
+        # Throttle state for noisy per-account WebSocket close/error logging.
+        self._ws_log_throttle = {}
+
+        # Market index instrument tokens (constant on Kite). These are streamed
+        # over the WebSocket alongside position tokens so NIFTY/SENSEX/INDIA VIX
+        # update live rather than only on REST refresh. Verified via quote/ltp:
+        #   NSE:NIFTY 50 -> 256265, BSE:SENSEX -> 265, NSE:INDIA VIX -> 264969
+        self.index_tokens = {256265: "nifty", 265: "sensex", 264969: "vix"}
+        self.index_values = {"nifty": None, "sensex": None, "vix": None}
         
         # In-memory store of active positions used to resolve partial symbols
         self.active_positions = []
@@ -432,6 +630,85 @@ class KCLILiveSession:
             f"Ctrl+C: Quit │ Escape: Deselect"
         )
 
+    async def _diagnose_tokens(self) -> dict[str, str]:
+        """Check each account's token validity and report it in the Status Logs.
+
+        Returns a mapping of api_key -> status so the caller can skip or warn
+        about accounts whose WebSocket handshake will be rejected (e.g. 403).
+        """
+        self.log_message("Running token diagnostics...")
+        statuses: dict[str, str] = {}
+        any_bad = False
+        for acct in self.accounts:
+            api_key = acct.get("api_key")
+            if not api_key:
+                continue
+            try:
+                result = await self._run_api_call(self.client.check_token, api_key)
+            except Exception as exc:
+                result = {"name": acct.get("name", api_key), "status": "error",
+                          "detail": str(exc)}
+            status = result.get("status", "error")
+            statuses[api_key] = status
+            name = result.get("name", api_key)
+            detail = result.get("detail", "")
+            if status == "valid":
+                # REST works, but that does NOT guarantee streaming works: the
+                # WebSocket can still reject this token with 403 "Authentication
+                # failed" (per api_key/app — e.g. no active streaming
+                # subscription). Probe the actual WS handshake so we only start
+                # tickers that will succeed and avoid a 403 reconnect storm.
+                access_token = self.client.get_access_token(api_key)
+                proxy_str = acct.get("proxy")
+                ws_status, ws_detail = await self._run_api_call(
+                    probe_ws_auth, api_key, access_token, proxy_str
+                )
+                if ws_status == "ok":
+                    self.log_message(f"[#00ff00]✓ Streaming OK:[/#] @{name}")
+                elif ws_status == "auth_failed":
+                    any_bad = True
+                    statuses[api_key] = "stream_forbidden"
+                    self.log_message(
+                        f"[#ff0000]✗ Streaming rejected:[/#] @{name} — "
+                        f"WebSocket auth failed ({ws_detail}). REST works, so the "
+                        f"token is valid but this api_key lacks streaming access. "
+                        f"Check the app's subscription on the Kite Connect dashboard."
+                    )
+                elif ws_status == "proxy_blocked":
+                    any_bad = True
+                    statuses[api_key] = "proxy_blocked"
+                    self.log_message(
+                        f"[#ff8700]⚠ Proxy blocked streaming:[/#] @{name} — "
+                        f"proxy refused the WebSocket tunnel ({ws_detail})."
+                    )
+                else:
+                    # Inconclusive probe — let the ticker try anyway.
+                    self.log_message(
+                        f"[#ff8700]⚠ Streaming check inconclusive:[/#] @{name} "
+                        f"({ws_detail}). Will attempt to connect."
+                    )
+            elif status == "no_token":
+                any_bad = True
+                self.log_message(f"[#ff8700]⚠ No token:[/#] @{name} — login required (run 'kcli init').")
+            elif status == "expired":
+                any_bad = True
+                self.log_message(f"[#ff8700]⚠ Token expired:[/#] @{name} — re-login (run 'kcli init'). {detail}")
+            elif status == "forbidden":
+                any_bad = True
+                self.log_message(f"[#ff0000]✗ Forbidden:[/#] @{name} — token rejected / no streaming entitlement. {detail}")
+            else:
+                any_bad = True
+                self.log_message(f"[#ff0000]✗ Token check failed:[/#] @{name} — {detail}")
+
+        if any_bad:
+            self.log_message(
+                "[#ff8700]Note:[/#] Accounts flagged above are skipped for "
+                "streaming to avoid 403/1006 reconnect storms. 'Streaming "
+                "rejected' with working REST usually means that api_key's app "
+                "has no active streaming subscription — re-init won't fix it."
+            )
+        return statuses
+
     async def _initial_fetch_and_connect(self) -> None:
         """Initial fetch of data and connect all WebSockets."""
         self.log_message("Initializing connections and fetching data...")
@@ -441,11 +718,24 @@ class KCLILiveSession:
         except Exception as exc:
             self.log_message(f"[#ff0000]Initial fetch failed:[/#] {exc}")
 
+        # Diagnose token validity up front. The same api_key/access_token pair is
+        # used for the WebSocket ticker, so a REST 403/expired here explains the
+        # "1006 / 403 Forbidden" handshake failures.
+        token_statuses = await self._diagnose_tokens()
+
         # Connect WebSockets for all accounts
         from kiteconnect import KiteTicker
         for acct in self.accounts:
             api_key = acct.get("api_key")
             access_token = self.client.get_access_token(api_key)
+            # Skip accounts whose token we already know is bad — avoids the
+            # reconnect storm of 403 handshakes.
+            if token_statuses.get(api_key) not in (None, "valid"):
+                self.log_message(
+                    f"[#ff8700]Skipping WebSocket for @{acct.get('name')}:[/#] "
+                    f"token not valid ({token_statuses.get(api_key)})."
+                )
+                continue
             if api_key and access_token:
                 try:
                     ticker = KiteTicker(api_key, access_token)
@@ -454,6 +744,7 @@ class KCLILiveSession:
                     ticker.on_ticks = self._on_ticks
                     ticker.on_order_update = self._make_on_order_update(api_key)
                     ticker.on_close = self._make_on_close(api_key)
+                    ticker.on_error = self._make_on_error(api_key)
                     
                     # Parse proxy if configured for this account
                     proxy_str = acct.get("proxy")
@@ -468,6 +759,9 @@ class KCLILiveSession:
                                     "host": parsed.hostname,
                                     "port": int(parsed.port),
                                 }
+                                if parsed.username and parsed.password:
+                                    proxy_dict["username"] = parsed.username
+                                    proxy_dict["password"] = parsed.password
                         except Exception as p_err:
                             self.log_message(f"[#ff8700]Failed to parse proxy for {acct.get('name')}:[/#] {p_err}")
 
@@ -491,17 +785,44 @@ class KCLILiveSession:
         def on_connect(ws, response):
             name = self._get_account_name(api_key)
             self.log_message(f"[#00ff00]WebSocket connected:[/#] @{name}")
-            # Subscribe to position tokens
-            if self.subscribed_tokens:
-                ticker.subscribe(list(self.subscribed_tokens))
-                ticker.set_mode(ticker.MODE_LTP, list(self.subscribed_tokens))
+            # Subscribe to position tokens plus the market index tokens so the
+            # NIFTY/SENSEX/INDIA VIX header streams live.
+            tokens = set(self.subscribed_tokens) | set(self.index_tokens)
+            if tokens:
+                token_list = list(tokens)
+                ticker.subscribe(token_list)
+                ticker.set_mode(ticker.MODE_LTP, token_list)
         return on_connect
+
+    def _ws_should_log(self, key: str, min_interval: float = 10.0) -> bool:
+        """Return True if a throttled WebSocket message for ``key`` should be
+        logged now (rate-limited to one message per ``min_interval`` seconds).
+
+        Prevents reconnect storms (e.g. repeated 1006 closures) from flooding
+        the Status Logs pane.
+        """
+        import time
+
+        now = time.monotonic()
+        last = self._ws_log_throttle.get(key, 0.0)
+        if now - last >= min_interval:
+            self._ws_log_throttle[key] = now
+            return True
+        return False
 
     def _make_on_close(self, api_key: str):
         def on_close(ws, code, reason):
             name = self._get_account_name(api_key)
-            self.log_message(f"[#ff8700]WebSocket closed:[/#] @{name} ({reason})")
+            if self._ws_should_log(f"close:{api_key}"):
+                self.log_message(f"[#ff8700]WebSocket closed:[/#] @{name} ({code} {reason})")
         return on_close
+
+    def _make_on_error(self, api_key: str):
+        def on_error(ws, code, reason):
+            name = self._get_account_name(api_key)
+            if self._ws_should_log(f"error:{api_key}"):
+                self.log_message(f"[#ff0000]WebSocket error:[/#] @{name} ({code} {reason})")
+        return on_error
 
     def _make_on_order_update(self, api_key: str):
         def on_order_update(ws, data):
@@ -519,10 +840,20 @@ class KCLILiveSession:
 
     def _on_ticks(self, ws, ticks):
         updated = False
+        indices_updated = False
         for tick in ticks:
             token = tick.get("instrument_token")
             ltp = tick.get("last_price")
-            if token and ltp:
+            if not token or ltp is None:
+                continue
+
+            # Market index tick → update the header values.
+            if token in self.index_tokens:
+                self.index_values[self.index_tokens[token]] = ltp
+                indices_updated = True
+                continue
+
+            if ltp:
                 resp = getattr(self, "last_positions_response", None)
                 if resp:
                     for acct in resp.get("accounts", []):
@@ -542,6 +873,9 @@ class KCLILiveSession:
                         # Recalculate total P&L for account
                         acct["total_pnl"] = sum(p.get("pnl", 0.0) for p in acct.get("positions", []))
         
+        if indices_updated and hasattr(self, "app") and self.app and self.app.loop:
+            self.app.loop.call_soon_threadsafe(self._refresh_indices_header)
+
         if updated:
             self._positions_version = getattr(self, "_positions_version", 0) + 1
             if hasattr(self, "app") and self.app and self.app.loop:
@@ -553,10 +887,33 @@ class KCLILiveSession:
         if hasattr(self, "app") and self.app:
             self.app.invalidate()
 
+    def _refresh_indices_header(self) -> None:
+        """Re-render the NIFTY/SENSEX/INDIA VIX header from ``self.index_values``
+        and invalidate the TUI. Safe to call from the event loop thread."""
+        self.market_indices_control.text = self._render_indices_html()
+        if hasattr(self, "app") and self.app:
+            self.app.invalidate()
+
+    def _render_indices_html(self) -> HTML:
+        """Build the formatted market-index header from the current values."""
+        def fmt(v):
+            return f"{v:,.2f}" if v else "N/A"
+
+        nifty_str = fmt(self.index_values.get("nifty"))
+        sensex_str = fmt(self.index_values.get("sensex"))
+        vix_str = fmt(self.index_values.get("vix"))
+        return HTML(
+            f"  <ansicyan><b>NIFTY 50:</b></ansicyan> <style fg='#ffffff'>{nifty_str}</style>   "
+            f"│   <ansiyellow><b>SENSEX:</b></ansiyellow> <style fg='#ffffff'>{sensex_str}</style>   "
+            f"│   <ansired><b>INDIA VIX:</b></ansired> <style fg='#ffffff'>{vix_str}</style>"
+        )
+
     def _update_subscriptions(self, new_tokens: set[int]) -> None:
         """Subscribe to new tokens and unsubscribe from inactive ones."""
         to_subscribe = new_tokens - self.subscribed_tokens
         to_unsubscribe = self.subscribed_tokens - new_tokens
+        # Never unsubscribe the market index tokens — they must keep streaming.
+        to_unsubscribe -= set(self.index_tokens)
         
         if to_subscribe:
             for ticker in self.tickers.values():
@@ -609,23 +966,15 @@ class KCLILiveSession:
         if self.info_mode in ("orders_pending", "orders_executed"):
             self._update_info_buffer()
             
-        # 3. Fetch indices
+        # 3. Fetch indices (REST snapshot — provides an immediate value at
+        # startup; thereafter the WebSocket ticks keep these live).
         try:
             indices_resp = await self._run_api_call(self.client.get_market_indices)
             if indices_resp.get("status") == "success":
-                nifty = indices_resp.get("nifty")
-                sensex = indices_resp.get("sensex")
-                vix = indices_resp.get("vix")
-
-                nifty_str = f"{nifty:,.2f}" if nifty else "N/A"
-                sensex_str = f"{sensex:,.2f}" if sensex else "N/A"
-                vix_str = f"{vix:,.2f}" if vix else "N/A"
-
-                self.market_indices_control.text = HTML(
-                    f"  <ansicyan><b>NIFTY 50:</b></ansicyan> <style fg='#ffffff'>{nifty_str}</style>   "
-                    f"│   <ansiyellow><b>SENSEX:</b></ansiyellow> <style fg='#ffffff'>{sensex_str}</style>   "
-                    f"│   <ansired><b>INDIA VIX:</b></ansired> <style fg='#ffffff'>{vix_str}</style>"
-                )
+                self.index_values["nifty"] = indices_resp.get("nifty")
+                self.index_values["sensex"] = indices_resp.get("sensex")
+                self.index_values["vix"] = indices_resp.get("vix")
+                self.market_indices_control.text = self._render_indices_html()
             else:
                 msg = indices_resp.get("message", "Unknown error")
                 self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices: {msg}</style>")
@@ -1542,6 +1891,8 @@ class KCLILiveSession:
 
     async def run(self) -> None:
         """Launch the interactive prompt_toolkit dashboard."""
+        # Keep noisy third-party WebSocket loggers off the full-screen TUI.
+        _silence_websocket_loggers()
         # ── UI Controls ─────────────────────────────────────────────
         self.header_control = FormattedTextControl(
             text="🪁 KiteCLI Live │ Loading dashboard...",

@@ -223,6 +223,58 @@ class KiteAccountManager:
             return getattr(kite, "access_token", None)
         return None
 
+    def check_token(self, api_key: str) -> dict[str, Any]:
+        """Validate the stored access token for an account against the REST API.
+
+        Calls ``kite.profile()`` and classifies the outcome so callers can tell
+        the difference between a valid token, an expired/invalid token, and other
+        failures (network/proxy). This is the same credential pair used for the
+        WebSocket ticker, so it explains 403 handshake failures.
+
+        Returns a dict with keys:
+            name: account display name
+            api_key: the api_key
+            status: one of "valid", "no_token", "expired", "forbidden", "error"
+            detail: human-readable message
+        """
+        name = self._account_names.get(api_key, api_key)
+        kite = self._clients.get(api_key)
+        if kite is None:
+            return {"name": name, "api_key": api_key, "status": "error",
+                    "detail": "account not registered"}
+
+        token = getattr(kite, "access_token", None)
+        if not token:
+            return {"name": name, "api_key": api_key, "status": "no_token",
+                    "detail": "no access token (login required)"}
+
+        try:
+            from kiteconnect.exceptions import TokenException, PermissionException
+        except Exception:
+            TokenException = PermissionException = ()
+
+        try:
+            kite.profile()
+            return {"name": name, "api_key": api_key, "status": "valid",
+                    "detail": "token valid"}
+        except TokenException as exc:
+            return {"name": name, "api_key": api_key, "status": "expired",
+                    "detail": f"token expired/invalid: {exc}"}
+        except PermissionException as exc:
+            return {"name": name, "api_key": api_key, "status": "forbidden",
+                    "detail": f"permission denied: {exc}"}
+        except Exception as exc:
+            msg = str(exc)
+            low = msg.lower()
+            if "403" in msg or "forbidden" in low:
+                status = "forbidden"
+            elif "token" in low or "session" in low:
+                status = "expired"
+            else:
+                status = "error"
+            return {"name": name, "api_key": api_key, "status": status,
+                    "detail": msg}
+
     def get_all_api_keys(self) -> list[str]:
         """Return a list of all registered api_keys."""
         return list(self._clients.keys())

@@ -324,3 +324,11 @@ class KCLIClient:
     def get_access_token(self, api_key: str) -> str | None:
         """Get the access token for an authenticated account."""
         return _manager.get_access_token(api_key)
+
+    def check_token(self, api_key: str) -> dict:
+        """Validate an account's access token against the REST API.
+
+        Returns a dict with keys: name, api_key, status
+        ("valid"/"no_token"/"expired"/"forbidden"/"error"), and detail.
+        """
+        return _manager.check_token(api_key)

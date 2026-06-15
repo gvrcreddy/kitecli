@@ -14,10 +14,6 @@ CONFIG_DIR = Path.home() / ".kcli"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 
 DEFAULT_CONFIG = {
-    "server": {
-        "url": "http://localhost:8080",
-        "auth_token": "your-secret-token",
-    },
     "accounts": [
         {
             "name": "Account 1",
@@ -26,6 +22,7 @@ DEFAULT_CONFIG = {
             "user_id": "your_zerodha_user_id",
             "password": "your_zerodha_password",
             "totp_secret": "your_totp_secret",
+            "proxy": "http://user:pass@host:port",
         },
     ],
 }

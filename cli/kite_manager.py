@@ -47,6 +47,7 @@ class KiteAccountManager:
         self._api_secrets: dict[str, str] = {}
         self._account_names: dict[str, str] = {}
         self._authenticated: dict[str, bool] = {}
+        self._proxies: dict[str, dict] = {}  # per-account proxy dicts for requests.Session
 
     def init_account(self, api_key: str, api_secret: str, name: str = "", proxy: str = None) -> str:
         """Initialize a KiteConnect instance and return the login URL.
@@ -66,6 +67,8 @@ class KiteAccountManager:
         self._api_secrets[api_key] = api_secret
         self._account_names[api_key] = name or api_key
         self._authenticated[api_key] = False
+        # Store proxy dict so auto_login can also route via proxy
+        self._proxies[api_key] = proxies or {}
 
         # Try to restore session from saved token
         sessions = _load_sessions()
@@ -241,7 +244,13 @@ class KiteAccountManager:
             logger.error("Account not initialized for api_key=%s…", api_key[:8])
             return False
 
+        # Build a requests.Session and apply the per-account proxy so that
+        # login and 2FA calls also flow through the proxy (not just KiteConnect SDK calls).
         session = http_requests.Session()
+        account_proxies = self._proxies.get(api_key, {})
+        if account_proxies:
+            session.proxies.update(account_proxies)
+            logger.info("auto_login: using proxy for %s (api_key=%s…)", user_id, api_key[:8])
 
         try:
             # Step 1: Login with user_id + password

@@ -1,152 +1,169 @@
 """
-HTTP API client for KiteCLI.
+Local KiteCLI client.
 
-Provides a synchronous wrapper around the KiteCLI server endpoints
-using httpx with proper authentication and error handling.
+Wraps KiteAccountManager directly — no HTTP server needed.
+Public API is identical to the old HTTP-based KCLIClient so that
+cli/main.py and cli/live_session.py require zero changes.
 """
 
-import httpx
+from cli.kite_manager import KiteAccountManager
 
 
 class KCLIClientError(Exception):
-    """Raised when an API request fails or the server is unreachable."""
+    """Raised when a Kite API call fails."""
+
+
+# Module-level singleton so session state persists across calls within the process.
+_manager = KiteAccountManager()
 
 
 class KCLIClient:
-    """Synchronous HTTP client for the KiteCLI server.
+    """Local client that delegates directly to KiteAccountManager.
 
     Args:
-        server_url: Base URL of the KiteCLI server (e.g. ``http://localhost:8080``).
-        auth_token: Secret token sent via the ``X-Auth-Token`` header.
+        accounts: List of account dicts from config (name, api_key, api_secret,
+                  user_id, password, totp_secret, proxy).  Accounts are
+                  initialised eagerly on construction so that session tokens are
+                  restored before the first command runs.
     """
 
-    def __init__(self, server_url: str, auth_token: str) -> None:
-        self.base_url = server_url.rstrip("/")
-        self.auth_token = auth_token
-        self._timeout = 10.0  # seconds
-
-    # ── internal helpers ───────────────────────────────────────────
-
-    @property
-    def _headers(self) -> dict[str, str]:
-        return {"X-Auth-Token": self.auth_token}
-
-    def _get(self, path: str) -> httpx.Response:
-        """Issue a GET request and return the response.
-
-        Raises:
-            KCLIClientError: On connection or HTTP errors.
-        """
-        url = f"{self.base_url}{path}"
-        try:
-            resp = httpx.get(url, headers=self._headers, timeout=self._timeout)
-            resp.raise_for_status()
-            return resp
-        except httpx.ConnectError as exc:
-            raise KCLIClientError(
-                f"Could not connect to server at {self.base_url}. "
-                "Is the server running?"
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise KCLIClientError(
-                f"Request to {url} timed out after {self._timeout}s."
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            raise KCLIClientError(
-                f"Server returned {exc.response.status_code} for {url}: "
-                f"{exc.response.text}"
-            ) from exc
-
-    def _post(self, path: str, json: dict | list | None = None) -> httpx.Response:
-        """Issue a POST request and return the response.
-
-        Raises:
-            KCLIClientError: On connection or HTTP errors.
-        """
-        url = f"{self.base_url}{path}"
-        try:
-            resp = httpx.post(
-                url, headers=self._headers, json=json, timeout=self._timeout
+    def __init__(self, accounts: list[dict]) -> None:
+        self._accounts = accounts
+        self._api_keys = [a.get("api_key", "") for a in accounts]
+        # Eagerly init all accounts (restores saved sessions if available)
+        for acct in accounts:
+            _manager.init_account(
+                api_key=acct.get("api_key", ""),
+                api_secret=acct.get("api_secret", ""),
+                name=acct.get("name", ""),
+                proxy=acct.get("proxy"),
             )
-            resp.raise_for_status()
-            return resp
-        except httpx.ConnectError as exc:
-            raise KCLIClientError(
-                f"Could not connect to server at {self.base_url}. "
-                "Is the server running?"
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise KCLIClientError(
-                f"Request to {url} timed out after {self._timeout}s."
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            raise KCLIClientError(
-                f"Server returned {exc.response.status_code} for {url}: "
-                f"{exc.response.text}"
-            ) from exc
 
-    # ── public API ─────────────────────────────────────────────────
+    # ── compatibility helpers ──────────────────────────────────────
 
     def health_check(self) -> bool:
-        """Check whether the server is reachable.
+        """Always True — no server to ping in local mode."""
+        return True
 
-        Returns:
-            True if the /health endpoint responds successfully.
-        """
-        try:
-            self._get("/health")
-            return True
-        except KCLIClientError:
-            return False
+    # ── public API (mirrors old KCLIClient exactly) ────────────────
 
     def init_accounts(self, accounts: list[dict]) -> dict:
-        """Initialise accounts on the server.
+        """Initialise (or re-initialise) accounts and attempt auto-login."""
+        result_accounts = []
 
-        Args:
-            accounts: List of account dicts (name, api_key, api_secret).
+        for acct in accounts:
+            api_key = acct.get("api_key", "")
+            name = acct.get("name", api_key)
 
-        Returns:
-            JSON response from the server containing login URLs.
-        """
-        resp = self._post("/api/init", json={"accounts": accounts})
-        return resp.json()
+            login_url = _manager.init_account(
+                api_key=api_key,
+                api_secret=acct.get("api_secret", ""),
+                name=name,
+                proxy=acct.get("proxy"),
+            )
+
+            if _manager.is_authenticated(api_key):
+                result_accounts.append({
+                    "name": name,
+                    "api_key": api_key,
+                    "login_url": login_url,
+                    "auto_logged_in": True,
+                    "message": "Session restored from saved token",
+                })
+                continue
+
+            user_id = acct.get("user_id")
+            password = acct.get("password")
+            totp_secret = acct.get("totp_secret")
+            if user_id and password and totp_secret:
+                success = _manager.auto_login(
+                    api_key=api_key,
+                    user_id=user_id,
+                    password=password,
+                    totp_secret=totp_secret,
+                )
+                if success:
+                    result_accounts.append({
+                        "name": name,
+                        "api_key": api_key,
+                        "login_url": login_url,
+                        "auto_logged_in": True,
+                        "message": "Auto-login successful",
+                    })
+                    continue
+                else:
+                    result_accounts.append({
+                        "name": name,
+                        "api_key": api_key,
+                        "login_url": login_url,
+                        "auto_logged_in": False,
+                        "message": "Auto-login failed. Use manual login URL.",
+                    })
+            else:
+                result_accounts.append({
+                    "name": name,
+                    "api_key": api_key,
+                    "login_url": login_url,
+                    "auto_logged_in": False,
+                    "message": "Credentials incomplete — manual login required.",
+                })
+
+        return {"accounts": result_accounts}
 
     def complete_callback(self, api_key: str, request_token: str) -> dict:
-        """Complete the Kite login callback for an account.
-
-        Args:
-            api_key: The Kite Connect API key.
-            request_token: The request token from the redirect URL.
-
-        Returns:
-            JSON response from the server.
-        """
-        resp = self._post(
-            "/api/callback",
-            json={"api_key": api_key, "request_token": request_token},
-        )
-        return resp.json()
+        """Complete Kite OAuth login with a request token."""
+        try:
+            success = _manager.complete_login(api_key, request_token.strip())
+            if success:
+                return {"status": "success", "message": "Login successful"}
+            return {"status": "error", "message": "Login failed — check request_token"}
+        except Exception as exc:
+            raise KCLIClientError(str(exc)) from exc
 
     def get_positions(self, api_keys: list[str]) -> dict:
-        """Fetch open positions for the given accounts.
+        """Fetch open positions for the given accounts."""
+        result_accounts = []
+        keys = api_keys or _manager.get_all_api_keys()
 
-        Args:
-            api_keys: List of Kite Connect API keys.
+        for api_key in keys:
+            info = _manager.get_account_info(api_key)
+            if not info.get("authenticated"):
+                result_accounts.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "positions": [],
+                    "total_pnl": 0.0,
+                    "status": "unauthenticated",
+                })
+                continue
+            try:
+                positions = _manager.get_positions(api_key)
+                total_pnl = sum(p.get("pnl", 0.0) for p in positions)
+                result_accounts.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "positions": positions,
+                    "total_pnl": total_pnl,
+                    "status": "success",
+                })
+            except Exception as exc:
+                result_accounts.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "positions": [],
+                    "total_pnl": 0.0,
+                    "status": f"error: {exc}",
+                })
 
-        Returns:
-            JSON response containing positions per account.
-        """
-        resp = self._post("/api/positions", json={"api_keys": api_keys})
-        return resp.json()
+        return {"accounts": result_accounts}
 
     def get_status(self) -> dict:
-        """Get authentication status for all accounts.
-
-        Returns:
-            JSON response with per-account auth status.
-        """
-        resp = self._get("/api/status")
-        return resp.json()
+        """Get authentication status for all accounts."""
+        accounts = [
+            _manager.get_account_info(api_key)
+            for api_key in _manager.get_all_api_keys()
+        ]
+        return {"accounts": accounts}
 
     def place_order(
         self,
@@ -160,59 +177,90 @@ class KCLIClient:
         trigger_price: float | None = None,
         product: str = "NRML",
     ) -> dict:
-        """Place an order across specified accounts.
+        """Place an order across specified accounts."""
+        keys = api_keys or _manager.get_all_api_keys()
+        results = []
 
-        Args:
-            api_keys: List of account API keys. If empty, places in all authenticated accounts.
-            tradingsymbol: The symbol to trade (e.g. INFY, NIFTY2662325000CE).
-            exchange: Exchange name (e.g. NFO, NSE).
-            transaction_type: BUY or SELL.
-            quantity: Quantity to buy or sell.
-            order_type: MARKET, LIMIT, SL, SL-M.
-            price: Optional price (for LIMIT/SL orders).
-            trigger_price: Optional trigger price (for SL/SL-M orders).
-            product: MIS, NRML, CNC.
+        for api_key in keys:
+            info = _manager.get_account_info(api_key)
+            if not info.get("authenticated"):
+                results.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "status": "error",
+                    "order_id": None,
+                    "message": "Account not authenticated",
+                })
+                continue
+            try:
+                order_id = _manager.place_order(
+                    api_key=api_key,
+                    tradingsymbol=tradingsymbol,
+                    exchange=exchange,
+                    transaction_type=transaction_type,
+                    quantity=quantity,
+                    order_type=order_type,
+                    price=price,
+                    trigger_price=trigger_price,
+                    product=product,
+                )
+                results.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "status": "success",
+                    "order_id": str(order_id),
+                    "message": f"Order placed: {order_id}",
+                })
+            except Exception as exc:
+                results.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "status": "error",
+                    "order_id": None,
+                    "message": str(exc),
+                })
 
-        Returns:
-            JSON response from the server with order IDs/statuses.
-        """
-        payload = {
-            "api_keys": api_keys,
-            "tradingsymbol": tradingsymbol,
-            "exchange": exchange,
-            "transaction_type": transaction_type,
-            "quantity": quantity,
-            "order_type": order_type,
-            "product": product,
-        }
-        if price is not None:
-            payload["price"] = price
-        if trigger_price is not None:
-            payload["trigger_price"] = trigger_price
-
-        resp = self._post("/api/order", json=payload)
-        return resp.json()
+        return {"results": results}
 
     def exit_positions(
         self,
         api_keys: list[str],
         tradingsymbol: str | None = None,
     ) -> dict:
-        """Exit positions across specified accounts.
+        """Exit positions across specified accounts."""
+        keys = api_keys or _manager.get_all_api_keys()
+        results = []
 
-        Args:
-            api_keys: List of account API keys. If empty, exits in all authenticated accounts.
-            tradingsymbol: Symbol to exit, or None to exit all positions.
+        for api_key in keys:
+            info = _manager.get_account_info(api_key)
+            if not info.get("authenticated"):
+                results.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "status": "error",
+                    "message": "Account not authenticated",
+                    "orders_placed": [],
+                })
+                continue
+            try:
+                orders = _manager.exit_positions(api_key, tradingsymbol)
+                results.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "status": "success",
+                    "message": f"Exited {len(orders)} position(s)",
+                    "orders_placed": orders,
+                })
+            except Exception as exc:
+                results.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "status": "error",
+                    "message": str(exc),
+                    "orders_placed": [],
+                })
 
-        Returns:
-            JSON response from the server with exit statuses.
-        """
-        payload = {
-            "api_keys": api_keys,
-            "tradingsymbol": tradingsymbol,
-        }
-        resp = self._post("/api/exit", json=payload)
-        return resp.json()
+        return {"results": results}
 
     def get_option_chain(
         self,
@@ -221,46 +269,50 @@ class KCLIClient:
         expiry_week: int = 0,
         expiry_date: str | None = None,
     ) -> dict:
-        """Fetch option chain for a specific underlying and expiry.
-
-        Args:
-            api_key: Any one authenticated account's api_key.
-            underlying: Underlying name (e.g. NIFTY, BANKNIFTY, FINNIFTY).
-            expiry_week: 0 = current week, 1 = next week, 2 = week after, etc.
-            expiry_date: Specific expiry date as ISO string (YYYY-MM-DD).
-                         If provided, overrides expiry_week.
-
-        Returns:
-            JSON response with option chain strikes, expiries, and symbols.
-        """
-        payload: dict = {
-            "api_key": api_key,
-            "underlying": underlying,
-            "expiry_week": expiry_week,
-        }
-        if expiry_date:
-            payload["expiry_date"] = expiry_date
-        resp = self._post("/api/oc", json=payload)
-        return resp.json()
+        """Fetch option chain for a specific underlying and expiry."""
+        try:
+            return _manager.get_option_chain(
+                api_key=api_key,
+                underlying=underlying,
+                expiry_week=expiry_week,
+                expiry_date=expiry_date,
+            )
+        except Exception as exc:
+            raise KCLIClientError(str(exc)) from exc
 
     def get_orders(self, api_keys: list[str]) -> dict:
-        """Fetch today's order book for specified accounts.
+        """Fetch today's order book for specified accounts."""
+        keys = api_keys or _manager.get_all_api_keys()
+        result_accounts = []
 
-        Args:
-            api_keys: List of account API keys. If empty, fetches from all
-                      authenticated accounts.
+        for api_key in keys:
+            info = _manager.get_account_info(api_key)
+            if not info.get("authenticated"):
+                result_accounts.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "orders": [],
+                    "status": "unauthenticated",
+                })
+                continue
+            try:
+                orders = _manager.get_orders(api_key)
+                result_accounts.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "orders": orders,
+                    "status": "success",
+                })
+            except Exception as exc:
+                result_accounts.append({
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "orders": [],
+                    "status": f"error: {exc}",
+                })
 
-        Returns:
-            JSON response with orders grouped by account.
-        """
-        resp = self._post("/api/orders", json={"api_keys": api_keys})
-        return resp.json()
+        return {"accounts": result_accounts}
 
     def get_market_indices(self) -> dict:
-        """Fetch live Nifty, Sensex, and India VIX LTP.
-
-        Returns:
-            JSON response containing index prices.
-        """
-        resp = self._get("/api/indices")
-        return resp.json()
+        """Fetch live Nifty, Sensex, and India VIX."""
+        return _manager.get_market_indices()

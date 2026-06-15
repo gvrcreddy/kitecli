@@ -48,40 +48,20 @@ def _load_config_or_exit() -> dict:
 
 
 def _build_client(config: dict) -> KCLIClient:
-    """Construct a KCLIClient from the loaded config."""
-    server = config.get("server", {})
-    return KCLIClient(
-        server_url=server.get("url", "http://localhost:8080"),
-        auth_token=server.get("auth_token", ""),
-    )
+    """Construct a local KCLIClient from the loaded config."""
+    accounts = config.get("accounts", [])
+    return KCLIClient(accounts)
 
 
 def _ensure_accounts_initialized(client: KCLIClient, config: dict) -> None:
-    """Check if all configured accounts are registered on the server, and initialize them if not."""
-    try:
-        status_resp = client.get_status()
-        registered_keys = {a.get("api_key") for a in status_resp.get("accounts", [])}
-    except Exception:
-        # If server is not running or other error, let the main command handle health check/error
-        return
-
-    accounts = config.get("accounts", [])
-    unregistered = [a for a in accounts if a.get("api_key") not in registered_keys]
-
-    if unregistered:
-        try:
-            display_info("Auto-initializing unregistered accounts on server...")
-            result = client.init_accounts(accounts)
-            login_accounts = result.get("accounts", [])
-            for acct in login_accounts:
-                name = acct.get("name", "Account")
-                if acct.get("auto_logged_in"):
-                    msg = acct.get("message", "Authenticated")
-                    display_success(f"{name}: {msg} ✓")
-                else:
-                    display_info(f"{name} requires login. Run [bold]kcli init[/bold] to authenticate.")
-        except Exception as exc:
-            display_error(f"Failed to auto-initialize accounts: {exc}")
+    """Show per-account init status; in local mode accounts are init'd in KCLIClient.__init__."""
+    status_resp = client.get_status()
+    for acct in status_resp.get("accounts", []):
+        name = acct.get("name", "Account")
+        if acct.get("authenticated"):
+            display_success(f"{name}: session active ✓")
+        else:
+            display_info(f"{name}: not authenticated — run [bold]kcli init[/bold]")
 
 
 def _mask_secret(value: str, visible: int = 4) -> str:
@@ -103,17 +83,11 @@ def init() -> None:
     display_banner()
 
     config = _load_config_or_exit()
-    client = _build_client(config)
-
-    # Health check
-    display_info("Checking server connectivity…")
-    if not client.health_check():
-        display_error(
-            f"Server at {client.base_url} is unreachable.\n"
-            "  Make sure the server is running and the URL is correct."
-        )
+    accounts = config.get("accounts", [])
+    if not accounts:
+        display_error("No accounts configured. Edit your config file to add accounts.")
         raise typer.Exit(code=1)
-    display_success("Server is reachable!")
+    client = _build_client(config)
     console.print()
 
     accounts = config.get("accounts", [])
@@ -187,16 +161,6 @@ def positions() -> None:
     config = _load_config_or_exit()
     client = _build_client(config)
 
-    # Health check
-    if not client.health_check():
-        display_error(
-            f"Server at {client.base_url} is unreachable.\n"
-            "  Make sure the server is running."
-        )
-        raise typer.Exit(code=1)
-
-    _ensure_accounts_initialized(client, config)
-
     accounts = config.get("accounts", [])
     api_keys = [acct.get("api_key", "") for acct in accounts]
 
@@ -223,12 +187,7 @@ def status() -> None:
 
     config = _load_config_or_exit()
     client = _build_client(config)
-
-    try:
-        result = client.get_status()
-    except KCLIClientError as exc:
-        display_error(str(exc))
-        raise typer.Exit(code=1)
+    result = client.get_status()
 
     status_accounts = result.get("accounts", [])
     if not status_accounts:
@@ -244,22 +203,11 @@ def live(
 ) -> None:
     """[bold]Live dashboard[/bold] — Interactive positions monitor and order terminal."""
     config = _load_config_or_exit()
-    client = _build_client(config)
-
-    # Health check
-    if not client.health_check():
-        display_error(
-            f"Server at {client.base_url} is unreachable.\n"
-            "  Make sure the server is running."
-        )
-        raise typer.Exit(code=1)
-
-    _ensure_accounts_initialized(client, config)
-
     accounts = config.get("accounts", [])
     if not accounts:
         display_error("No accounts configured. Edit your config file to add accounts.")
         raise typer.Exit(code=1)
+    client = _build_client(config)
 
     # Launch interactive session
     session = KCLILiveSession(client, accounts, refresh_interval=refresh)
@@ -313,14 +261,6 @@ def config_cmd(
 
     # Pretty-print config with masked secrets
     console.print()
-    console.print("  [bold cyan]Server[/bold cyan]")
-    server = config.get("server", {})
-    console.print(f"    url        : [bold]{server.get('url', 'N/A')}[/bold]")
-    console.print(
-        f"    auth_token : [dim]{_mask_secret(server.get('auth_token', ''))}[/dim]"
-    )
-    console.print()
-
     console.print("  [bold cyan]Accounts[/bold cyan]")
     for i, acct in enumerate(config.get("accounts", []), start=1):
         console.print(f"    [bold]{i}. {acct.get('name', 'Account')}[/bold]")

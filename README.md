@@ -23,6 +23,9 @@ A multi-account Zerodha Kite Connect trading positions viewer with a beautiful i
   - Live indices panel (**NIFTY 50**, **SENSEX**, and **INDIA VIX**).
   - Info Pane to view Pending Orders, Executed Orders, or Option Chains (`F1`, `F2`, `F3`).
   - Active logs with color-coded alerts and focus highlights for simple navigation.
+- 📡 **Live WebSocket Streaming**: Position LTPs/P&L, the market indices panel, and the option chain all update in real time over the Kite WebSocket (`KiteTicker`) — no manual refresh needed. Order fills push an instant positions/orders re-sync.
+- 🎯 **Primary Streaming Account**: Market data (indices, option chain, and position prices) is streamed through a single designated *primary* account instead of redundantly subscribing on every account. Mark one account with `primary: true` in the config, or let `kcli` auto-select the first streaming-capable account. Per-account positions, orders, and P&L remain fully independent.
+- 🩺 **Streaming Diagnostics**: On startup, `kcli` probes each account's WebSocket authentication. Accounts whose `api_key` lacks an active streaming subscription (REST works but the ticker is rejected with `403`) are reported clearly and skipped, preventing reconnect-error storms.
 
 ---
 
@@ -68,7 +71,29 @@ accounts:
     password: "your_zerodha_password_1"
     totp_secret: "your_totp_secret_1"
     proxy: "http://username:password@ip:port"  # Optional per-account proxy
+    primary: true                              # Optional: use this account for streaming
+
+  - name: "Account 2"
+    api_key: "your_api_key_2"
+    api_secret: "your_api_secret_2"
+    user_id: "your_zerodha_user_id_2"
+    password: "your_zerodha_password_2"
+    totp_secret: "your_totp_secret_2"
+    proxy: "http://username:password@ip:port"
 ```
+
+**The `primary` flag** (optional) designates which account streams the shared
+market data — the indices panel, option chain, and position prices. Because an
+instrument's price is the same regardless of which account holds it, streaming
+it once through a single primary account avoids redundant duplicate
+subscriptions. If `primary` is omitted (or the flagged account can't stream),
+`kcli` automatically falls back to the first streaming-capable account.
+
+> **Note on streaming:** Live WebSocket streaming requires that the account's
+> Kite Connect app has an active streaming subscription. An account can read
+> positions over REST yet still be rejected by the WebSocket (`403`) if its app
+> lacks streaming access. `kcli` detects this on startup and reports it in the
+> Status Logs.
 
 ### 3. Log In & Authenticate
 

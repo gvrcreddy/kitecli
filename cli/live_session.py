@@ -455,8 +455,27 @@ class KCLILiveSession:
                     ticker.on_order_update = self._make_on_order_update(api_key)
                     ticker.on_close = self._make_on_close(api_key)
                     
+                    # Parse proxy if configured for this account
+                    proxy_str = acct.get("proxy")
+                    proxy_dict = None
+                    if proxy_str:
+                        from urllib.parse import urlparse
+                        try:
+                            p_str = proxy_str if "://" in proxy_str else f"http://{proxy_str}"
+                            parsed = urlparse(p_str)
+                            if parsed.hostname and parsed.port:
+                                proxy_dict = {
+                                    "host": parsed.hostname,
+                                    "port": int(parsed.port),
+                                }
+                        except Exception as p_err:
+                            self.log_message(f"[#ff8700]Failed to parse proxy for {acct.get('name')}:[/#] {p_err}")
+
                     # Run ticker loop in a background thread
-                    ticker.connect(threaded=True)
+                    if proxy_dict:
+                        ticker.connect(threaded=True, proxy=proxy_dict)
+                    else:
+                        ticker.connect(threaded=True)
                     self.tickers[api_key] = ticker
                 except Exception as exc:
                     self.log_message(f"[#ff0000]Failed to connect WebSocket for {acct.get('name')}:[/#] {exc}")

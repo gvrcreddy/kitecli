@@ -307,6 +307,8 @@ class KCLILiveSession:
         self.active_positions = []
         self.position_id_map = {}
         self.last_positions_response = None
+        # Margin data keyed by api_key; fetched on order fill.
+        self.margins_by_api_key: dict = {}
         
         # Log message list (plain text for Buffer-based display)
         self.logs = ["Type 'help' to see commands. Scroll logs using Mouse Wheel."]
@@ -1028,49 +1030,67 @@ class KCLILiveSession:
             self.subscribed_tokens.difference_update(to_unsubscribe)
 
     async def _trigger_immediate_refresh(self) -> None:
-        """Trigger an immediate fetch of positions, orders, and indices from Zerodha."""
-        # 1. Fetch positions
+        """Trigger an immediate fetch of positions, orders, margins, and indices from Zerodha."""
         api_keys = [acct["api_key"] for acct in self.accounts]
-        response = await self._run_api_call(self.client.get_positions, api_keys)
-        self.last_positions_response = response
-        self._positions_version = getattr(self, "_positions_version", 0) + 1
-        
-        # Update active positions list and collect tokens
-        self.active_positions = []
-        self.position_id_map = {}
-        pos_idx = 1
-        new_tokens = set()
-        for acct in response.get("accounts", []):
-            for pos in acct.get("positions", []):
-                if pos.get("quantity", 0) != 0:
-                    pos["api_key"] = acct.get("api_key")
-                    pos["account_name"] = acct.get("name")
-                    self.active_positions.append(pos)
-                    self.position_id_map[pos_idx] = pos
-                    pos_idx += 1
-                    if pos.get("instrument_token"):
-                        new_tokens.add(int(pos["instrument_token"]))
-        
-        # Update WebSocket subscriptions
-        self._update_subscriptions(new_tokens)
-        
-        # 2. Fetch orders
-        orders_resp = await self._run_api_call(self.client.get_orders, api_keys)
-        self._last_pending_text = self._render_orders_pane(orders_resp, "orders_pending")
-        self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
-        if self.info_mode in ("orders_pending", "orders_executed"):
-            self._update_info_buffer()
-            
-        # 3. Fetch indices (REST snapshot — provides an immediate value at
-        # startup; thereafter the WebSocket ticks keep these live).
+
+        # Fetch positions, margins, orders, and indices concurrently.
+        positions_task = self._run_api_call(self.client.get_positions, api_keys)
+        margins_task   = self._run_api_call(self.client.get_margins, api_keys)
+        orders_task    = self._run_api_call(self.client.get_orders, api_keys)
+        indices_task   = self._run_api_call(self.client.get_market_indices)
+
+        response, margins_resp, orders_resp, indices_resp = await asyncio.gather(
+            positions_task, margins_task, orders_task, indices_task,
+            return_exceptions=True,
+        )
+
+        # Merge margin data into the positions response so the renderer
+        # can display it without a separate lookup.
+        if isinstance(margins_resp, dict):
+            margin_map = {m["api_key"]: m for m in margins_resp.get("accounts", [])}
+            self.margins_by_api_key = margin_map
+            if isinstance(response, dict):
+                for acct in response.get("accounts", []):
+                    key = acct.get("api_key", "")
+                    m = margin_map.get(key, {})
+                    acct["margin_net"]  = m.get("net")
+                    acct["margin_cash"] = m.get("cash")
+
+        if isinstance(response, dict):
+            self.last_positions_response = response
+            self._positions_version = getattr(self, "_positions_version", 0) + 1
+
+            self.active_positions = []
+            self.position_id_map = {}
+            pos_idx = 1
+            new_tokens = set()
+            for acct in response.get("accounts", []):
+                for pos in acct.get("positions", []):
+                    if pos.get("quantity", 0) != 0:
+                        pos["api_key"] = acct.get("api_key")
+                        pos["account_name"] = acct.get("name")
+                        self.active_positions.append(pos)
+                        self.position_id_map[pos_idx] = pos
+                        pos_idx += 1
+                        if pos.get("instrument_token"):
+                            new_tokens.add(int(pos["instrument_token"]))
+
+            self._update_subscriptions(new_tokens)
+
+        if isinstance(orders_resp, dict):
+            self._last_pending_text  = self._render_orders_pane(orders_resp, "orders_pending")
+            self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
+            if self.info_mode in ("orders_pending", "orders_executed"):
+                self._update_info_buffer()
+
+        # Indices REST snapshot (WebSocket ticks keep these live thereafter).
         try:
-            indices_resp = await self._run_api_call(self.client.get_market_indices)
-            if indices_resp.get("status") == "success":
-                self.index_values["nifty"] = indices_resp.get("nifty")
+            if isinstance(indices_resp, dict) and indices_resp.get("status") == "success":
+                self.index_values["nifty"]  = indices_resp.get("nifty")
                 self.index_values["sensex"] = indices_resp.get("sensex")
-                self.index_values["vix"] = indices_resp.get("vix")
+                self.index_values["vix"]    = indices_resp.get("vix")
                 self.market_indices_control.text = self._render_indices_html()
-            else:
+            elif isinstance(indices_resp, dict):
                 msg = indices_resp.get("message", "Unknown error")
                 self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices: {msg}</style>")
         except Exception as exc:

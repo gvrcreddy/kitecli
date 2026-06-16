@@ -806,6 +806,30 @@ class KiteAccountManager:
             )
         return kite.orders()
 
+    def get_margins(self, api_key: str) -> dict[str, Any]:
+        """Fetch equity margin summary for an account.
+
+        Returns a dict with:
+          - ``net``   — total available buying power after SPAN/exposure blocked
+                        for open F&O positions (``equity.net``).
+          - ``cash``  — actual cash available in the account
+                        (``equity.available.cash``).
+
+        Both values are ``None`` if the account is not authenticated or the
+        call fails (callers should treat ``None`` as "unavailable").
+        """
+        kite = self._clients.get(api_key)
+        if not kite or not self.is_authenticated(api_key):
+            return {"net": None, "cash": None}
+        try:
+            data = kite.margins(segment="equity")
+            net = data.get("net")
+            cash = data.get("available", {}).get("cash")
+            return {"net": net, "cash": cash}
+        except Exception as exc:
+            logger.warning("get_margins failed for api_key=%s…: %s", api_key[:8], exc)
+            return {"net": None, "cash": None}
+
     def get_market_indices(self) -> dict[str, Any]:
         """Fetch Nifty, Sensex, and India VIX LTP using first authenticated account, or fallback to Yahoo Finance."""
         # 1. Try Kite first

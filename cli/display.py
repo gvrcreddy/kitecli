@@ -183,12 +183,31 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
         grand_total_pnl += total_pnl
 
         pnl_color = _pnl_style(total_pnl)
-        header_text = Text.assemble(
+
+        margin_net  = account.get("margin_net")
+        margin_cash = account.get("margin_cash")
+
+        header_parts: list[tuple[str, str]] = [
             (f" {name} ", "bold #e6edf3"),
             (" │ ", "#8b949e"),
             ("P&L: ", "bold"),
             (f"{_format_currency(total_pnl)}", f"bold {pnl_color}"),
-        )
+        ]
+        if margin_net is not None:
+            header_parts += [
+                ("  │ ", "#8b949e"),
+                ("Net: ", "#8b949e"),
+                (_format_currency(float(margin_net)), "bold #58a6ff"),
+            ]
+        if margin_cash is not None:
+            header_parts += [
+                ("  │ ", "#8b949e"),
+                ("Cash: ", "#8b949e"),
+                (_format_currency(float(margin_cash)), "bold #3fb950"),
+            ]
+
+        header_text = Text.assemble(*header_parts)
+
 
         if not positions:
             panel = Panel(

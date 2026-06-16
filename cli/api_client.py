@@ -321,6 +321,24 @@ class KCLIClient:
         """Fetch live Nifty, Sensex, and India VIX."""
         return _manager.get_market_indices()
 
+    def get_margins(self, api_keys: list[str]) -> dict:
+        """Fetch equity margin summary for each account in parallel.
+
+        Returns ``{"accounts": [{"api_key": ..., "net": ..., "cash": ...}, ...]}``
+        where ``net`` is buying power after F&O deductions and ``cash`` is raw
+        cash balance. Both are ``None`` if the account is unavailable.
+        """
+        keys = api_keys or _manager.get_all_api_keys()
+
+        def fetch_one(api_key):
+            result = _manager.get_margins(api_key)
+            return {"api_key": api_key, "net": result["net"], "cash": result["cash"]}
+
+        with ThreadPoolExecutor(max_workers=max(1, len(keys))) as executor:
+            results = list(executor.map(fetch_one, keys))
+
+        return {"accounts": results}
+
     def get_access_token(self, api_key: str) -> str | None:
         """Get the access token for an authenticated account."""
         return _manager.get_access_token(api_key)

@@ -48,6 +48,7 @@ class KiteAccountManager:
         self._account_names: dict[str, str] = {}
         self._authenticated: dict[str, bool] = {}
         self._proxies: dict[str, dict] = {}  # per-account proxy dicts for requests.Session
+        self._nfo_lot_size_cache: dict[str, int] = {}  # fetched once, reused across calls
 
     def init_account(self, api_key: str, api_secret: str, name: str = "", proxy: str = None) -> str:
         """Initialize a KiteConnect instance and return the login URL.
@@ -833,33 +834,35 @@ class KiteAccountManager:
             return {"net": None, "cash": None}
 
     def get_nfo_lot_sizes(self) -> dict[str, int]:
-        """Fetch NFO instrument list and return a tradingsymbol → lot_size map.
+        """Return the cached NFO tradingsymbol → lot_size map.
 
-        Uses the first authenticated account. The result is a flat dict keyed
-        by *tradingsymbol* (e.g. ``"NIFTY2561924000CE"`` → ``75``) so position
-        lot lookup is an O(1) dict access with no symbol parsing required.
+        Fetches from Zerodha on the first call, then returns the in-memory
+        cache on all subsequent calls — so live_session can call this freely
+        at every REST refresh without triggering repeated API requests.
 
         Returns an empty dict if no authenticated account is available or the
-        call fails.
+        initial fetch fails.
         """
+        if self._nfo_lot_size_cache:
+            return self._nfo_lot_size_cache
         for api_key in self.get_all_api_keys():
             if self.is_authenticated(api_key):
                 kite = self._clients.get(api_key)
                 if kite:
                     try:
                         instruments = kite.instruments("NFO")
-                        return {
+                        self._nfo_lot_size_cache = {
                             inst["tradingsymbol"]: int(inst.get("lot_size", 1) or 1)
                             for inst in instruments
                             if inst.get("tradingsymbol")
                         }
+                        return self._nfo_lot_size_cache
                     except Exception as exc:
                         logger.warning("get_nfo_lot_sizes failed: %s", exc)
                         return {}
         return {}
 
-
-        """Fetch Nifty, Sensex, and India VIX LTP using first authenticated account, or fallback to Yahoo Finance."""
+    def get_market_indices(self) -> dict[str, Any]:
         # 1. Try Kite first
         for api_key in self.get_all_api_keys():
             if self.is_authenticated(api_key):

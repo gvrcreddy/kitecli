@@ -309,8 +309,7 @@ class KCLILiveSession:
         self.last_positions_response = None
         # Margin data keyed by api_key; fetched on order fill.
         self.margins_by_api_key: dict = {}
-        # NFO tradingsymbol → lot_size; fetched once at startup.
-        self.lot_size_map: dict[str, int] = {}
+        # NFO tradingsymbol → lot_size; fetched once by kite_manager, cached there.
         
         # Log message list (plain text for Buffer-based display)
         self.logs = ["Type 'help' to see commands. Scroll logs using Mouse Wheel."]
@@ -751,32 +750,11 @@ class KCLILiveSession:
                 return acct.get("api_key")
         return None
 
-    async def _fetch_lot_sizes(self) -> None:
-        """Fetch NFO lot size map once at startup and cache in self.lot_size_map."""
-        try:
-            result = await self._run_api_call(self.client.get_nfo_lot_sizes)
-            if isinstance(result, dict) and result:
-                self.lot_size_map = result
-                self.log_message(
-                    f"[#3fb950]Lot sizes loaded:[/#] {len(result):,} NFO instruments cached."
-                )
-                # Re-render positions now that lot sizes are available.
-                self._positions_version = getattr(self, "_positions_version", 0) + 1
-                if hasattr(self, "app") and self.app:
-                    self.app.invalidate()
-        except Exception as exc:
-            self.log_message(f"[#ff8700]Lot size fetch failed:[/#] {exc} — showing raw qty.")
-
     async def _initial_fetch_and_connect(self) -> None:
         """Initial fetch of data and connect all WebSockets."""
         self.log_message("Initializing connections and fetching data...")
         try:
-            # Fetch positions/orders/indices + NFO lot sizes concurrently at startup.
-            await asyncio.gather(
-                self._trigger_immediate_refresh(),
-                self._fetch_lot_sizes(),
-                return_exceptions=True,
-            )
+            await self._trigger_immediate_refresh()
         except Exception as exc:
             self.log_message(f"[#ff0000]Initial fetch failed:[/#] {exc}")
 
@@ -1092,8 +1070,10 @@ class KCLILiveSession:
                         pos["api_key"] = acct.get("api_key")
                         pos["account_name"] = acct.get("name")
                         # Annotate with lot size so the display layer can show lots.
+                        # get_nfo_lot_sizes() returns the kite_manager internal cache
+                        # after the first fetch — no repeated API calls.
                         sym = pos.get("tradingsymbol", "")
-                        lot_size = self.lot_size_map.get(sym, 1)
+                        lot_size = self.client.get_nfo_lot_sizes().get(sym, 1)
                         pos["lot_size"] = lot_size
                         pos["lots"] = pos.get("quantity", 0) / lot_size
                         self.active_positions.append(pos)

@@ -1232,6 +1232,42 @@ class KCLILiveSession:
 
 
 
+    def _resolve_qty(self, qty_arg: str, symbol: str | None) -> tuple[str, str, str | None]:
+        """Resolve a quantity argument that may use the lot suffix (e.g. '2L').
+
+        Args:
+            qty_arg: Raw qty string from the command line, e.g. '2L', '75', '1L'.
+            symbol:  Trading symbol used to look up lot_size from the cache.
+
+        Returns:
+            (raw_qty_str, display_str, error)
+            - raw_qty_str: plain integer string ready for execute_order, e.g. '150'
+            - display_str: human-friendly string shown in confirmation, e.g. '2L (150 qty)'
+            - error: non-None string if the input is invalid.
+        """
+        cleaned = qty_arg.strip()
+        if cleaned.upper().endswith("L"):
+            # Lot-based quantity
+            lots_str = cleaned[:-1]
+            if not lots_str.isdigit() or int(lots_str) <= 0:
+                return "", "", f"Invalid lot quantity '{qty_arg}'. Use e.g. '2L' for 2 lots."
+            lots = int(lots_str)
+            lot_size = 1
+            if symbol:
+                lot_size = self.client.get_nfo_lot_sizes().get(symbol.upper(), 0)
+                if not lot_size:
+                    return "", "", (
+                        f"No lot size found for '{symbol}'. "
+                        "Use raw quantity (e.g. '75') for equity symbols."
+                    )
+            raw_qty = lots * lot_size
+            return str(raw_qty), f"{lots}L ({raw_qty} qty)", None
+        else:
+            # Plain raw quantity — backward compatible
+            if not cleaned.isdigit() or int(cleaned) <= 0:
+                return "", "", f"Invalid quantity '{qty_arg}'. Must be a positive integer or lot notation (e.g. '2L')."
+            return cleaned, cleaned, None
+
     async def execute_order(self, symbol: str, transaction_type: str, qty_str: str, price_str: str = None, product: str = "NRML", api_keys: list[str] = []) -> None:
         """Place order across specified accounts in executor."""
         # 1. Validate quantity
@@ -1400,10 +1436,11 @@ class KCLILiveSession:
 
         if primary_cmd == "help":
             self.log_message("[#00afaf]Available Commands:[/#]")
-            self.log_message("  [bold]buy / sell [symbol|id] <qty> [price] [product][/bold]")
-            self.log_message("    e.g. [bold]buy 50[/bold] (buys 50 qty of selected position)")
-            self.log_message("    e.g. [bold]buy 1 50[/bold] (buys 50 qty of position ID 1)")
-            self.log_message("    e.g. [bold]buy NIFTY25JUN24000CE 50[/bold] (exact symbol)")
+            self.log_message("  [bold]buy / sell [symbol|id] <qty|lotsL> [price] [product][/bold]")
+            self.log_message("    e.g. [bold]sell 2L[/bold]               (2 lots of selected position)")
+            self.log_message("    e.g. [bold]sell 3 2L[/bold]             (2 lots of position ID 3)")
+            self.log_message("    e.g. [bold]sell NIFTY25JUN24000CE 1L[/bold]  (1 lot by symbol)")
+            self.log_message("    e.g. [bold]buy 75[/bold]                (75 raw qty, backward-compatible)")
             self.log_message("  [bold]oc <UNDERLYING> [week <N> | <YYYY-MM-DD>][/bold] - Show option chain (right pane)")
             self.log_message("    e.g. [bold]oc NIFTY[/bold]              — current week strikes")
             self.log_message("    e.g. [bold]oc NIFTY week 1[/bold]       — next week strikes")
@@ -1560,10 +1597,15 @@ class KCLILiveSession:
             target_keys = [target_key] if target_key else []
 
             # Set pending order for confirmation
+            raw_qty_str, qty_display, qty_err = self._resolve_qty(qty_str, symbol)
+            if qty_err:
+                self.log_message(f"[#ff0000]Error:[/#] {qty_err}")
+                return
+
             self.pending_order = {
                 "symbol": symbol,
                 "type": transaction_type,
-                "qty": qty_str,
+                "qty": raw_qty_str,
                 "price": price_str,
                 "product": product,
                 "api_keys": target_keys
@@ -1581,15 +1623,18 @@ class KCLILiveSession:
                 accts_desc = "All Accounts"
 
             price_desc = f"at price {price_str}" if price_str else "at MARKET"
-            self.prompt_control.text = f" Confirm {transaction_type.upper()} {qty_str} {symbol} ({product}) {price_desc} on {accts_desc}? (y/n)> "
-            self.log_message(f"[#ff8700]Pending Confirmation:[/#] {transaction_type.upper()} {qty_str} {symbol} ({product}) {price_desc} on {accts_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+            self.prompt_control.text = f" Confirm {transaction_type.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}? (y/n)> "
+            self.log_message(f"[#ff8700]Pending Confirmation:[/#] {transaction_type.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
             return
 
         # Direct Buy/Sell Commands
         if primary_cmd in ("buy", "sell"):
             args = parts[1:]
             if not args:
-                self.log_message(f"[#ff0000]Usage:[/#] {primary_cmd} [symbol|id] <qty> [price] [product]")
+                self.log_message(f"[#ff0000]Usage:[/#] {primary_cmd} [symbol|id] <qty|lotsL> [price] [product]")
+                self.log_message(f"  e.g. [bold]{primary_cmd} 2L[/bold]                  — 2 lots of selected position")
+                self.log_message(f"  e.g. [bold]{primary_cmd} 3 2L[/bold]                — 2 lots of position #3")
+                self.log_message(f"  e.g. [bold]{primary_cmd} NIFTY24DEC24000CE 1L[/bold] — 1 lot by symbol")
                 return
 
             symbol = None
@@ -1598,17 +1643,24 @@ class KCLILiveSession:
             price_str = None
             product = "NRML"
 
-            # Case 1: First argument is a valid position ID (under 100)
+            def _is_qty_token(s):
+                """Return True if s looks like a qty: plain int or NL notation."""
+                return s.isdigit() or (s.upper().endswith("L") and s[:-1].isdigit())
+
+            # Case 1: First argument is a valid position ID (plain integer < 100,
+            #         exists in position_id_map). Must be plain digit, not e.g. '2L'.
             if args[0].isdigit() and int(args[0]) < 100 and hasattr(self, "position_id_map") and int(args[0]) in self.position_id_map:
                 symbol, api_key, err = self.resolve_symbol(args[0])
+                pos = self.position_id_map.get(int(args[0]))
                 if len(args) < 2:
-                    # Quantity not specified. Default to the position's quantity.
-                    pos = self.position_id_map.get(int(args[0]))
+                    # Default to full position size, expressed in lots when possible
                     if pos:
-                        qty_str = str(abs(pos.get("quantity", 0)))
-                        self.log_message(f"Omitted quantity. Defaulting to position quantity {qty_str}.")
+                        lot_size = pos.get("lot_size", 1) or 1
+                        raw_qty = abs(pos.get("quantity", 0))
+                        qty_str = f"{raw_qty // lot_size}L" if lot_size > 1 and raw_qty % lot_size == 0 else str(raw_qty)
+                        self.log_message(f"Omitted quantity. Defaulting to position size {qty_str}.")
                     else:
-                        self.log_message(f"[#ff0000]Usage:[/#] {primary_cmd} <id> <qty> [price] [product]")
+                        self.log_message(f"[#ff0000]Usage:[/#] {primary_cmd} <id> <qty|lotsL> [price] [product]")
                         return
                 else:
                     qty_str = args[1]
@@ -1617,8 +1669,8 @@ class KCLILiveSession:
                     if len(args) > 3:
                         product = args[3]
 
-            # Case 1b: Active selection exists, and first argument is acting as quantity
-            elif args[0].isdigit() and hasattr(self, "selected_symbol") and self.selected_symbol:
+            # Case 1b: Active selection exists and first argument is a qty token
+            elif _is_qty_token(args[0]) and hasattr(self, "selected_symbol") and self.selected_symbol:
                 symbol = self.selected_symbol
                 api_key = self.selected_account_api_key
                 qty_str = args[0]
@@ -1628,26 +1680,26 @@ class KCLILiveSession:
                     product = args[2]
 
             else:
-                # Case 2: Parse symbol and quantity
-                # Search from right to left to locate quantity (to avoid strike prices or dates)
+                # Case 2: Parse symbol and quantity.
+                # Scan right-to-left for a qty token to avoid strike prices/dates.
                 qty_idx = -1
                 for i in range(len(args) - 1, -1, -1):
                     arg = args[i]
-                    if arg.isdigit():
-                        # A strike price (e.g. 23500) is followed by CE/PE/FUT
-                        if i + 1 < len(args) and args[i+1].upper() in ("CE", "PE", "FUT"):
-                            continue
-                        # A large digit (like >= 1000) is likely a strike price, not a quantity
-                        if int(arg) >= 1000:
-                            continue
+                    if _is_qty_token(arg):
+                        # A plain strike price (e.g. 23500) is followed by CE/PE/FUT — skip
+                        if arg.isdigit():
+                            if i + 1 < len(args) and args[i+1].upper() in ("CE", "PE", "FUT"):
+                                continue
+                            if int(arg) >= 1000:
+                                continue
                         qty_idx = i
                         break
 
                 if qty_idx != -1:
                     qty_str = args[qty_idx]
-                    
+
                     if qty_idx == 0:
-                        # No symbol specified. Use currently selected symbol.
+                        # No symbol specified — use currently selected symbol
                         if hasattr(self, "selected_symbol") and self.selected_symbol:
                             symbol = self.selected_symbol
                             api_key = self.selected_account_api_key
@@ -1655,7 +1707,6 @@ class KCLILiveSession:
                             self.log_message(f"[#ff0000]Error:[/#] No position selected. Type 'select <id>' first or specify a symbol.")
                             return
                     else:
-                        # Symbol is everything before the quantity
                         raw_sym = " ".join(args[:qty_idx])
                         symbol, api_key, err = self.resolve_symbol(raw_sym)
                         if err:
@@ -1667,38 +1718,44 @@ class KCLILiveSession:
                     if len(args) > qty_idx + 2:
                         product = args[qty_idx + 2]
                 else:
-                    # No quantity specified in arguments.
-                    # Check if the entire arguments string represents a symbol of an active position.
+                    # No qty token — check if entire args is a symbol with a known position
                     raw_sym = " ".join(args)
                     symbol, api_key, err = self.resolve_symbol(raw_sym)
                     if err:
                         self.log_message(f"[#ff0000]Error:[/#] {err}")
                         return
-                    
-                    # Try to find a matching active position to default its quantity
+
                     matched_pos = None
                     normalized_sym = symbol.replace(" ", "").upper()
                     for pos in getattr(self, "active_positions", []):
                         if pos.get("tradingsymbol", "").replace(" ", "").upper() == normalized_sym:
                             matched_pos = pos
                             break
-                            
+
                     if matched_pos:
-                        qty_str = str(abs(matched_pos.get("quantity", 0)))
+                        lot_size = matched_pos.get("lot_size", 1) or 1
+                        raw_qty = abs(matched_pos.get("quantity", 0))
+                        qty_str = f"{raw_qty // lot_size}L" if lot_size > 1 and raw_qty % lot_size == 0 else str(raw_qty)
                         api_key = matched_pos.get("api_key")
-                        self.log_message(f"Omitted quantity. Defaulting to position quantity {qty_str}.")
+                        self.log_message(f"Omitted quantity. Defaulting to position size {qty_str}.")
                     else:
-                        self.log_message(f"[#ff0000]Error:[/#] Missing quantity. Usage: {primary_cmd} [symbol|id] <qty> [price] [product]")
+                        self.log_message(f"[#ff0000]Error:[/#] Missing quantity. Usage: {primary_cmd} [symbol|id] <qty|lotsL> [price] [product]")
                         return
+
+            # Resolve lot notation → raw qty
+            raw_qty_str, qty_display, qty_err = self._resolve_qty(qty_str, symbol)
+            if qty_err:
+                self.log_message(f"[#ff0000]Error:[/#] {qty_err}")
+                return
 
             target_key = api_key or self.selected_account_api_key
             target_keys = [target_key] if target_key else []
 
-            # Set pending order for confirmation
+            # Set pending order for confirmation (store resolved raw qty)
             self.pending_order = {
                 "symbol": symbol,
                 "type": primary_cmd,
-                "qty": qty_str,
+                "qty": raw_qty_str,
                 "price": price_str,
                 "product": product,
                 "api_keys": target_keys
@@ -1716,8 +1773,9 @@ class KCLILiveSession:
                 accts_desc = "All Accounts"
 
             price_desc = f"at price {price_str}" if price_str else "at MARKET"
-            self.prompt_control.text = f" Confirm {primary_cmd.upper()} {qty_str} {symbol} ({product}) {price_desc} on {accts_desc}? (y/n)> "
-            self.log_message(f"[#ff8700]Pending Confirmation:[/#] {primary_cmd.upper()} {qty_str} {symbol} ({product}) {price_desc} on {accts_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+            self.prompt_control.text = f" Confirm {primary_cmd.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}? (y/n)> "
+            self.log_message(f"[#ff8700]Pending Confirmation:[/#] {primary_cmd.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+            return
             return
 
         # Exit Positions Command

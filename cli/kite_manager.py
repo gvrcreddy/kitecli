@@ -812,8 +812,9 @@ class KiteAccountManager:
         Returns a dict with:
           - ``net``   — total available buying power after SPAN/exposure blocked
                         for open F&O positions (``equity.net``).
-          - ``cash``  — actual cash available in the account
-                        (``equity.available.cash``).
+          - ``cash``  — current available cash balance (``equity.available.live_balance``).
+                        This differs from ``available.cash`` / ``available.opening_balance``
+                        which reflect the ledger balance at day start, not the live figure.
 
         Both values are ``None`` if the account is not authenticated or the
         call fails (callers should treat ``None`` as "unavailable").
@@ -824,7 +825,8 @@ class KiteAccountManager:
         try:
             data = kite.margins(segment="equity")
             net = data.get("net")
-            cash = data.get("available", {}).get("cash")
+            # live_balance is the real-time available cash, not the stale opening_balance
+            cash = data.get("available", {}).get("live_balance")
             return {"net": net, "cash": cash}
         except Exception as exc:
             logger.warning("get_margins failed for api_key=%s…: %s", api_key[:8], exc)

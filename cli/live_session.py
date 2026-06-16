@@ -1081,7 +1081,7 @@ class KCLILiveSession:
             self._last_pending_text  = self._render_orders_pane(orders_resp, "orders_pending")
             self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
             if self.info_mode in ("orders_pending", "orders_executed"):
-                self._update_info_buffer()
+                self._update_info_buffer(reset_scroll=False)
 
         # Indices REST snapshot (WebSocket ticks keep these live thereafter).
         try:
@@ -1967,7 +1967,7 @@ class KCLILiveSession:
         """Re-render the option-chain pane from streamed values and refresh TUI."""
         self._last_oc_text = self._render_oc_text()
         if self.info_mode == "oc":
-            self._update_info_buffer()
+            self._update_info_buffer(reset_scroll=False)
         if hasattr(self, "app") and self.app:
             self.app.invalidate()
 
@@ -2026,8 +2026,14 @@ class KCLILiveSession:
             lines.append("No pending orders across all accounts.")
         return "\n".join(lines)
 
-    def _update_info_buffer(self) -> None:
-        """Push current info_mode text into the info_buffer."""
+    def _update_info_buffer(self, reset_scroll: bool = True) -> None:
+        """Push current info_mode text into the info_buffer.
+
+        Args:
+            reset_scroll: When True (default) the pane scrolls back to the top.
+                          Pass False for live tick/data refreshes where the user
+                          may have scrolled down — preserves their position.
+        """
         if not hasattr(self, "info_buffer"):
             return
         if self.info_mode == "orders_pending":
@@ -2040,7 +2046,7 @@ class KCLILiveSession:
             Document(text=text, cursor_position=0),
             bypass_readonly=True,
         )
-        if hasattr(self, "_info_control"):
+        if reset_scroll and hasattr(self, "_info_control"):
             self._info_control.vertical_scroll_position = 0
         if hasattr(self, "app"):
             self.app.invalidate()

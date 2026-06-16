@@ -125,7 +125,7 @@ class KiteAccountManager:
             )
             return True
         except Exception:
-            logger.exception(
+            logger.error(
                 "Login failed for account '%s' (api_key=%s…)",
                 self._account_names.get(api_key, api_key),
                 api_key[:8],
@@ -179,7 +179,7 @@ class KiteAccountManager:
             )
             return open_positions
         except Exception as exc:
-            logger.exception(
+            logger.error(
                 "Failed to fetch positions for api_key=%s…", api_key[:8]
             )
             raise RuntimeError(f"Failed to fetch positions: {exc}") from exc
@@ -431,7 +431,7 @@ class KiteAccountManager:
             return self.complete_login(api_key, request_token)
 
         except Exception:
-            logger.exception("Auto-login failed for %s (api_key=%s…)", user_id, api_key[:8])
+            logger.error("Auto-login failed for %s (api_key=%s…)", user_id, api_key[:8])
             return False
 
     def place_order(
@@ -508,7 +508,7 @@ class KiteAccountManager:
             order_id = kite.place_order(**params)
             return order_id
         except Exception as exc:
-            logger.exception("Failed to place order for api_key=%s…", api_key[:8])
+            logger.error("Failed to place order for api_key=%s…", api_key[:8])
             raise RuntimeError(f"Failed to place order: {exc}") from exc
 
     def exit_positions(
@@ -543,7 +543,7 @@ class KiteAccountManager:
             positions_data = kite.positions()
             net_positions = positions_data.get("net", [])
         except Exception as exc:
-            logger.exception("Failed to fetch positions during exit for api_key=%s…", api_key[:8])
+            logger.error("Failed to fetch positions during exit for api_key=%s…", api_key[:8])
             raise RuntimeError(f"Failed to fetch positions: {exc}") from exc
 
         orders_placed = []
@@ -594,7 +594,7 @@ class KiteAccountManager:
                     "order_id": order_id
                 })
             except Exception as exc:
-                logger.exception(
+                logger.error(
                     "Failed to place exit order for %s in account %s: %s",
                     symbol,
                     self._account_names.get(api_key, api_key),

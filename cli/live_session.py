@@ -365,10 +365,53 @@ class KCLILiveSession:
         import re
         return re.sub(r"\[/?[^\[\]]*\]", "", text)
 
+    @staticmethod
+    def _clean_error(text: str) -> str:
+        """Extract a short human-readable message from a verbose exception string.
+
+        Strips nested Python exception chains, long URLs, and connection pool
+        boilerplate so the logs pane shows concise, actionable messages.
+        """
+        import re
+        s = str(text).strip()
+
+        # 1. Pull the innermost meaningful message from chained exceptions.
+        #    e.g. "...Failed to place order: The instrument..." → "The instrument..."
+        for sep in (": ", " — "):
+            parts = s.split(sep)
+            # Walk from the end, pick the last part that looks like a real message
+            for part in reversed(parts):
+                part = part.strip()
+                if part and not part.startswith("HTTPSConnectionPool") and not part.startswith("Max retries"):
+                    s = part
+                    break
+
+        # 2. Simplify common connection error patterns
+        if "407 Proxy Authentication Required" in s:
+            return "Proxy authentication failed (407) — check proxy credentials in config"
+        if "ProxyError" in s or "Tunnel connection failed" in s:
+            return "Proxy connection failed — check proxy settings"
+        if "ConnectionError" in s or "Max retries exceeded" in s:
+            return "Network error — connection failed"
+        if "TimeoutError" in s or "timed out" in s.lower():
+            return "Connection timed out"
+        if "TokenException" in s or "Invalid token" in s:
+            return "Token expired — run 'kcli init' to re-login"
+        if "PermissionException" in s or "403" in s:
+            return "Permission denied (403) — check account entitlements"
+
+        # 3. Strip trailing context like "(Caused by ...)" and "url: /..."
+        s = re.sub(r'\s*\(Caused by.*', '', s)
+        s = re.sub(r'\s*with url:.*', '', s)
+        s = re.sub(r'\s*HTTPSConnectionPool\(.*?\)', '', s)
+
+        return s.strip() or str(text)[:80]
+
     def log_message(self, message: str) -> None:
         """Add a timestamped message to the logs and update logs pane."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         plain = self._strip_rich_markup(message)
+        plain = self._clean_error(plain)
 
         # Compute max usable width for the logs pane so long lines don't wrap
         # and spill outside the Frame. Frame border = 2, padding = 2, safety = 2.

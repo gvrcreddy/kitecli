@@ -489,6 +489,17 @@ class KCLILiveSession:
                     break
         qty = abs(matched_pos.get("quantity", 1)) if matched_pos else 1
 
+        # Get live price (LTP) from matched position to pre-fill price
+        price = matched_pos.get("last_price") if matched_pos else None
+        if price is None:
+            price = 0.0
+        else:
+            try:
+                price = float(price)
+            except (ValueError, TypeError):
+                price = 0.0
+        price_str = f" {price:.2f}" if price > 0 else ""
+
         def _fill(snippet):
             """Return a mouse handler that pre-fills the input with snippet."""
             def _handler(*args, **kwargs):
@@ -518,15 +529,9 @@ class KCLILiveSession:
         # ── button definitions: (label, active_style, dim_style, snippet) ──
         buttons = [
             ("  BUY  ", "bg:#005f00 fg:#afffaf bold", "bg:#1a1a1a fg:#444444",
-             f"buy {sym or '<symbol>'} {qty} " if sym else None),
+             f"buy {qty}{price_str} " if sym else "buy <symbol> <qty> [price] [product]"),
             ("  SELL  ", "bg:#5f0000 fg:#ffafaf bold", "bg:#1a1a1a fg:#444444",
-             f"sell {sym or '<symbol>'} {qty} " if sym else None),
-            ("  EXIT  ", "bg:#5f005f fg:#ffafff bold", "bg:#1a1a1a fg:#444444",
-             f"exit {sym}" if sym else None),
-            ("  MODIFY  ", "bg:#00005f fg:#afafff bold", "bg:#1a1a1a fg:#444444",
-             f"order {sym} sell {qty} " if sym else None),
-            ("  CANCEL  ", "bg:#3a3a3a fg:#d0d0d0 bold", "bg:#1a1a1a fg:#444444",
-             f"cancel {sym}" if sym else None),
+             f"sell {qty}{price_str} " if sym else "sell <symbol> <qty> [price] [product]"),
         ]
 
         frags = []
@@ -535,6 +540,8 @@ class KCLILiveSession:
         if sym:
             ctx = sym + (f" @{acct}" if acct else "")
             frags.append(("bg:#262626 fg:#00afaf bold", f"  [{ctx}] "))
+        elif acct:
+            frags.append(("bg:#262626 fg:#00afaf bold", f"  [@{acct}] "))
         else:
             frags.append(("bg:#1a1a1a fg:#555555", "  Actions: "))
 

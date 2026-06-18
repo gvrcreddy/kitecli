@@ -83,7 +83,7 @@ class KiteAccountManager:
                 self._authenticated[api_key] = True
                 logger.info("Successfully restored valid session for '%s' (api_key=%s…)", name, api_key[:8])
             except Exception as exc:
-                logger.warning(
+                logger.info(
                     "Saved session token for '%s' (api_key=%s…) is invalid or expired: %s",
                     name,
                     api_key[:8],

@@ -526,12 +526,24 @@ class KCLILiveSession:
                     self.app.invalidate()
             return _handler
 
+        # Determine snippets based on context
+        if sym:
+            # Context 3: If account and symbol are selected
+            buy_snippet = f"buy {qty}{price_str} "
+            sell_snippet = f"sell {qty}{price_str} "
+        elif acct:
+            # Context 2: If account is selected (but no symbol)
+            buy_snippet = "buy <symbol> <qty> [price] [product]"
+            sell_snippet = "sell <symbol> <qty> [price] [product]"
+        else:
+            # Context 1: If nothing is selected
+            buy_snippet = "account <name> && buy <symbol> <qty> [price] [product]"
+            sell_snippet = "account <name> && sell <symbol> <qty> [price] [product]"
+
         # ── button definitions: (label, active_style, dim_style, snippet) ──
         buttons = [
-            ("  BUY  ", "bg:#005f00 fg:#afffaf bold", "bg:#1a1a1a fg:#444444",
-             f"buy {qty}{price_str} " if sym else "buy <symbol> <qty> [price] [product]"),
-            ("  SELL  ", "bg:#5f0000 fg:#ffafaf bold", "bg:#1a1a1a fg:#444444",
-             f"sell {qty}{price_str} " if sym else "sell <symbol> <qty> [price] [product]"),
+            ("  BUY  ", "bg:#005f00 fg:#afffaf bold", "bg:#1a1a1a fg:#444444", buy_snippet),
+            ("  SELL  ", "bg:#5f0000 fg:#ffafaf bold", "bg:#1a1a1a fg:#444444", sell_snippet),
         ]
 
         frags = []
@@ -1449,8 +1461,18 @@ class KCLILiveSession:
             logger.error("Error processing input: %s", exc, exc_info=True)
 
     def _handle_input_core(self, buffer) -> None:
-        """Process entered command line."""
-        cmd = buffer.text.strip()
+        """Process entered command line, supporting command chaining via &&."""
+        raw_text = buffer.text.strip()
+        if not raw_text:
+            return
+
+        # Support command chaining via '&&'
+        commands = [c.strip() for c in raw_text.split("&&") if c.strip()]
+        for cmd in commands:
+            self._execute_single_command(cmd)
+
+    def _execute_single_command(self, cmd: str) -> None:
+        """Process a single command line."""
         if not cmd:
             return
 

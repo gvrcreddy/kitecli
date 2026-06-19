@@ -356,6 +356,7 @@ class KCLILiveSession:
             "btn.exit": "bg:#4a1b4d fg:#e85ffd bold",
             "btn.modify": "bg:#18315e fg:#79c0ff bold",
             "btn.cancel": "bg:#30363d fg:#8b949e bold",
+            "btn.refresh": "bg:#0f3542 fg:#39c5bb bold",
             
             # Frame and Borders (Focused Container Highlight)
             "frame.border": "fg:#30363d",
@@ -520,6 +521,13 @@ class KCLILiveSession:
                 self.log_message(f"DEBUG: Quickaction mouse event type: {mouse_event.event_type}")
                 if mouse_event.event_type not in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP):
                     return
+
+                if snippet == "refresh":
+                    self.log_message("Triggering manual refresh via action bar button...")
+                    if hasattr(self, "app") and self.app and self.app.loop:
+                        asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+                    return
+
                 from prompt_toolkit.document import Document
                 buf = self.input_field.buffer
                 buf.set_document(
@@ -542,6 +550,7 @@ class KCLILiveSession:
             buttons = [
                 ("  MODIFY  ", "class:btn.modify", "bg:#1a1a1a fg:#444444", modify_snippet),
                 ("  CANCEL  ", "class:btn.cancel", "bg:#1a1a1a fg:#444444", cancel_snippet),
+                ("  REFRESH  ", "class:btn.refresh", "bg:#1a1a1a fg:#444444", "refresh"),
             ]
         else:
             if sym:
@@ -561,6 +570,7 @@ class KCLILiveSession:
             buttons = [
                 ("  BUY  ", "bg:#005f00 fg:#afffaf bold", "bg:#1a1a1a fg:#444444", buy_snippet),
                 ("  SELL  ", "bg:#5f0000 fg:#ffafaf bold", "bg:#1a1a1a fg:#444444", sell_snippet),
+                ("  REFRESH  ", "class:btn.refresh", "bg:#1a1a1a fg:#444444", "refresh"),
             ]
 
         frags = []

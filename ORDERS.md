@@ -8,15 +8,17 @@ This reference guide documents the syntax, usage, and interactive workflows for 
 
 The action bar at the bottom of the screen dynamically updates based on your current selection to pre-fill the input box with the correct command structure:
 
-1. **Nothing Selected**: Displays **BUY** and **SELL** buttons. Pre-fills a chained command to select an account and place an order:
+1. **Nothing Selected**: Displays **BUY**, **SELL**, and **REFRESH** buttons. Pre-fills a chained command to select an account and place an order:
    * `account <name> && buy <symbol> <qty> [price] [product]`
-2. **Account Selected**: Displays **BUY** and **SELL** buttons. Pre-fills:
+2. **Account Selected**: Displays **BUY**, **SELL**, and **REFRESH** buttons. Pre-fills:
    * `buy <symbol> <qty> [price] [product]`
-3. **Position & Account Selected**: Displays **BUY** and **SELL** buttons. Automatically resolves the active position's quantity and current last traded price (LTP) to pre-fill:
+3. **Position & Account Selected**: Displays **BUY**, **SELL**, and **REFRESH** buttons. Automatically resolves the active position's quantity and current last traded price (LTP) to pre-fill:
    * `buy <qty> <price> ` (e.g. `buy 150 240.25 `)
-4. **Pending Order Selected**: Switches the action bar to **MODIFY** and **CANCEL** buttons:
+4. **Pending Order Selected**: Switches the action bar to **MODIFY**, **CANCEL**, and **REFRESH** buttons:
    * **MODIFY** pre-fills the input with: `order <full_id> <current_qty> <current_price>`
    * **CANCEL** pre-fills the input with: `cancel <full_id>`
+
+* **REFRESH Button**: The **REFRESH** button is always present at the end of the action bar. Clicking it immediately triggers a manual sync/refresh of all active positions, pending/executed orders, margins, and indices across all accounts, without needing to type the command manually.
 
 ---
 

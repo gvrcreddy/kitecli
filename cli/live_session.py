@@ -904,14 +904,21 @@ class KCLILiveSession:
                 continue
             if api_key and access_token:
                 try:
-                    ticker = KiteTicker(api_key, access_token)
-                    
+                    # reconnect=True/reconnect_max_tries belong on KiteTicker()
+                    # constructor, not connect(). Max 50 tries (library default max
+                    # is 300; 50 gives ~15+ mins of exponential-backoff recovery).
+                    ticker = KiteTicker(
+                        api_key, access_token,
+                        reconnect=True,
+                        reconnect_max_tries=5,
+                    )
+
                     ticker.on_connect = self._make_on_connect(api_key, ticker)
                     ticker.on_ticks = self._on_ticks
                     ticker.on_order_update = self._make_on_order_update(api_key)
                     ticker.on_close = self._make_on_close(api_key)
                     ticker.on_error = self._make_on_error(api_key)
-                    
+
                     # Parse proxy if configured for this account
                     proxy_str = acct.get("proxy")
                     proxy_dict = None
@@ -931,10 +938,8 @@ class KCLILiveSession:
                         except Exception as p_err:
                             self.log_message(f"[#ff8700]Failed to parse proxy for {acct.get('name')}:[/#] {p_err}")
 
-                    # Run ticker loop in a background thread.
-                    # reconnect=True with max_tries=10 handles transient network drops
-                    # (e.g. 1006 TCP close) without hammering Zerodha on auth failures.
-                    connect_kwargs = dict(threaded=True, reconnect=True, reconnect_max_tries=10)
+                    # connect() only accepts threaded + proxy
+                    connect_kwargs = dict(threaded=True)
                     if proxy_dict:
                         connect_kwargs["proxy"] = proxy_dict
                     ticker.connect(**connect_kwargs)

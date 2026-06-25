@@ -142,6 +142,14 @@ MIT
 
 ## Changelog
 
+### 0.1.0b10 — 2026-06-25
+
+**Bug Fixes:**
+- **WebSocket reconnect crash on startup**: `reconnect` and `reconnect_max_tries` were incorrectly passed to `ticker.connect()`, which does not accept them. These params now correctly go to the `KiteTicker()` constructor. Fixes: `KiteTicker.connect() got an unexpected keyword argument 'reconnect'`.
+- **Reduced reconnect attempts to 5**: Max reconnect retries tuned down from 50 to 5 (~60s recovery window with exponential backoff) to stop faster on persistent failures.
+
+---
+
 ### 0.1.0b9 — 2026-06-24
 
 **Bug Fixes:**

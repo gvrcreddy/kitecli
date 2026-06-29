@@ -26,11 +26,13 @@ Available Command Syntax:
 3. Exit all positions:
    - Syntax: `exit all` (exits all open positions across targeted accounts)
 4. Place orders:
-   - Syntax: `buy <symbol> <quantity>` or `sell <symbol> <quantity>`
+   - Syntax: `buy <symbol> <quantity> [price] [product]` or `sell <symbol> <quantity> [price] [product]`
    - Quantity can be in lots using the 'L' suffix (e.g. `27L` for 27 lots, `2L` for 2 lots).
    - Product can be specified at the end: `MIS` or `NRML`. Default is MIS.
-   - Price can be optionally specified. If omitted, it is a MARKET order.
-   - Example: `sell NIFTY26JUN24000CE 27L`
+   - Price can be optionally specified as a raw numeric decimal/float (e.g., `1.4` or `125.5`).
+     - **CRITICAL**: Do NOT prefix the price with the `@` symbol. (For example, `buy NIFTY26JUN22300PE 50 @1.4` is WRONG; use `buy NIFTY26JUN22300PE 50 1.4` instead).
+   - Example 1 (Market Order): `sell NIFTY26JUN24000CE 27L`
+   - Example 2 (Limit Order): `buy NIFTY26JUN22300PE 1L 1.4`
 5. Show Option Chain:
    - Syntax: `oc <UNDERLYING> [week <N>]` (e.g. `oc NIFTY`, `oc NIFTY week 1`)
 6. Sync and Utilities:
@@ -45,12 +47,12 @@ Multiple commands can be chained together using ` && `.
 Resolving Exits and Replication Orders via Open Positions:
 - You must always inspect the provided `open_positions` list.
 - If the user asks to "exit", "close", "replicate", or "sell" weekly options:
-  1. Find the target contracts currently active in the `open_positions` list.
-  2. Use the exact `symbol` (e.g., `NIFTY26JUN22300PE`) from those positions to formulate the command.
-  - Do NOT invent or estimate option symbols. If a symbol is not present in user input or existing `open_positions`, you cannot resolve the command.
+  1. First, search the provided `open_positions` list across all accounts. If any account already holds active positions for the matching expiry or category, extract their exact symbols (`tradingsymbol`) and use those same symbols to formulate the commands. This ensures you replicate the exact same strikes and symbols across accounts.
+  2. If no accounts have matching positions open, look up the target option symbols in the provided `available_options` list matching the target expiry and strikes.
+  - Do NOT invent or estimate option symbols. Always use either `open_positions` or the fallback `available_options` list.
 
 Context Provided:
-We will pass you the user's input, the selected account context, available account names, and the list of active open positions across all accounts. Use this context to resolve abbreviations (e.g. "zk" -> "ZK8719").
+We will pass you the user's input, the selected account context, available account names, the nearest weekly expiries, the list of available option contracts near the spot price, and the list of active open positions across all accounts. Use this context to resolve abbreviations (e.g. "zk" -> "ZK8719").
 
 OUTPUT FORMAT:
 You MUST return a JSON object with the following fields:
@@ -70,6 +72,8 @@ async def parse_natural_language(
     accounts_list: List[str],
     open_positions: List[Dict[str, Any]],
     nifty_spot: float | None,
+    nearest_expiries: Dict[str, str] | None = None,
+    available_options: List[Dict[str, Any]] | None = None,
     model: str = "gemini-2.5-flash"
 ) -> Dict[str, Any]:
     """
@@ -78,13 +82,15 @@ async def parse_natural_language(
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     
-    # Formulate context payload for the prompt using only local state
+    # Formulate context payload for the prompt using local state and option database fallback
     context = {
         "user_input": user_input,
         "current_context": {
             "selected_account": selected_account,
             "nifty_spot": nifty_spot,
             "available_accounts": accounts_list,
+            "nearest_expiry_by_underlying": nearest_expiries,
+            "available_options": available_options,
             "open_positions": [
                 {
                     "account": pos.get("account_name"),

@@ -250,19 +250,15 @@ class ScrollableFormattedTextControl(FormattedTextControl):
 
     def create_content(self, width, height):
         ui_content = super().create_content(width, height)
+        line_count = ui_content.line_count or 1
+        self.vertical_scroll_position = max(0, min(self.vertical_scroll_position, line_count - 1))
         ui_content.cursor_position = Point(x=0, y=self.vertical_scroll_position)
         return ui_content
 
 
 class ScrollableBufferControl(BufferControl):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.vertical_scroll_position = 0
-
-    def create_content(self, width, height):
-        ui_content = super().create_content(width, height)
-        ui_content.cursor_position = Point(x=0, y=self.vertical_scroll_position)
-        return ui_content
+    """BufferControl that supports mouse wheel and keyboard scrolling via cursor synchronization."""
+    pass
 
 
 class ScrollableWindow(Window):
@@ -591,11 +587,72 @@ class KCLILiveSession:
                 buy_snippet = "account <name> && buy <symbol> <qty> [price] [product]"
                 sell_snippet = "account <name> && sell <symbol> <qty> [price] [product]"
 
+            # Resolve near-week option symbols to build explicit exit command
+            squareoff_parts = []
+            try:
+                from cli.advisor import get_nifty_options
+                import datetime
+
+                ref_key = None
+                for a in self.accounts:
+                    if self.client.is_authenticated(a["api_key"]):
+                        ref_key = a["api_key"]
+                        break
+
+                if ref_key:
+                    options = get_nifty_options(self.client, ref_key)
+                    if options:
+                        today = datetime.date.today()
+                        underlying_near_expiry = {}
+                        for inst in options:
+                            name = inst.get("name")
+                            expiry = inst.get("expiry")
+                            if name and isinstance(expiry, datetime.date) and expiry >= today:
+                                if name not in underlying_near_expiry:
+                                    underlying_near_expiry[name] = expiry
+                                else:
+                                    underlying_near_expiry[name] = min(underlying_near_expiry[name], expiry)
+
+                        # Determine targeted accounts
+                        target_key = self.selected_account_api_key
+                        target_accounts = [a for a in self.accounts if a["api_key"] == target_key] if target_key else self.accounts
+
+                        accounts_data = self.last_positions_response.get("accounts", []) if self.last_positions_response else []
+
+                        for a_cfg in target_accounts:
+                            a_key = a_cfg["api_key"]
+                            a_name = a_cfg["name"]
+                            
+                            # Find positions for this specific account
+                            acct_data = next((x for x in accounts_data if x.get("api_key") == a_key), None)
+                            if acct_data:
+                                acct_exits = []
+                                for pos in acct_data.get("positions", []):
+                                    if pos.get("quantity", 0) == 0:
+                                        continue
+                                    sym_name = pos.get("tradingsymbol", "")
+                                    inst = next((x for x in options if x.get("tradingsymbol") == sym_name), None)
+                                    if inst:
+                                        name = inst.get("name")
+                                        exp = inst.get("expiry")
+                                        if exp == underlying_near_expiry.get(name):
+                                            acct_exits.append(sym_name)
+                                
+                                if acct_exits:
+                                    if not target_key:
+                                        squareoff_parts.append(f"account {a_name}")
+                                    for sym_name in acct_exits:
+                                        squareoff_parts.append(f"exit {sym_name}")
+            except Exception:
+                pass
+
+            squareoff_snippet = " && ".join(squareoff_parts) if squareoff_parts else "exit near-week"
+
             # ── button definitions: (label, active_style, dim_style, snippet) ──
             buttons = [
                 ("  BUY  ", "bg:#005f00 fg:#afffaf bold", "bg:#1a1a1a fg:#444444", buy_snippet),
                 ("  SELL  ", "bg:#5f0000 fg:#ffafaf bold", "bg:#1a1a1a fg:#444444", sell_snippet),
-                ("  SQUAREOFF  ", "bg:#800080 fg:#ffcfff bold", "bg:#1a1a1a fg:#444444", "exit near-week"),
+                ("  SQUAREOFF  ", "bg:#800080 fg:#ffcfff bold", "bg:#1a1a1a fg:#444444", squareoff_snippet),
                 ("  REFRESH  ", "class:btn.refresh", "bg:#1a1a1a fg:#444444", "refresh"),
             ]
 
@@ -2201,10 +2258,8 @@ class KCLILiveSession:
                     for i in range(len(args) - 1, -1, -1):
                         arg = args[i]
                         if arg.isdigit():
-                            # Skip strike prices: followed by CE/PE/FUT or >= 1000
+                            # Skip strike prices: followed by CE/PE/FUT
                             if i + 1 < len(args) and args[i+1].upper() in ("CE", "PE", "FUT"):
-                                continue
-                            if int(arg) >= 1000:
                                 continue
                             qty_idx = i
                             break
@@ -2776,6 +2831,51 @@ class KCLILiveSession:
         open_positions = getattr(self, "active_positions", [])
         nifty_spot = self.index_values.get("nifty")
 
+        # Resolve nearest active weekly expiry for each underlying and compile option list fallback
+        nearest_expiries_str = {}
+        available_options_list = []
+        try:
+            from cli.advisor import get_nifty_options
+            import datetime
+            
+            ref_key = None
+            for a in self.accounts:
+                if self.client.is_authenticated(a["api_key"]):
+                    ref_key = a["api_key"]
+                    break
+                    
+            if ref_key:
+                options = get_nifty_options(self.client, ref_key)
+                if options:
+                    today = datetime.date.today()
+                    nearest_expiries = {}
+                    for inst in options:
+                        name = inst.get("name")
+                        expiry = inst.get("expiry")
+                        if name and isinstance(expiry, datetime.date) and expiry >= today:
+                            if name not in nearest_expiries:
+                                nearest_expiries[name] = expiry
+                            else:
+                                nearest_expiries[name] = min(nearest_expiries[name], expiry)
+                    
+                    nearest_expiries_str = {k: v.strftime("%Y-%m-%d") for k, v in nearest_expiries.items()}
+
+                    spot = nifty_spot or 23500.0  # fallback
+                    for opt in options:
+                        try:
+                            strike = float(opt.get("strike", 0))
+                            if abs(strike - spot) / spot <= 0.10:
+                                available_options_list.append({
+                                    "symbol": opt.get("tradingsymbol"),
+                                    "expiry": opt.get("expiry").strftime("%Y-%m-%d") if isinstance(opt.get("expiry"), datetime.date) else str(opt.get("expiry")),
+                                    "strike": strike,
+                                    "type": opt.get("instrument_type")
+                                })
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
+
         from cli.nli import parse_natural_language
 
         try:
@@ -2785,7 +2885,9 @@ class KCLILiveSession:
                 selected_account=selected_acct,
                 accounts_list=accounts_list,
                 open_positions=open_positions,
-                nifty_spot=nifty_spot
+                nifty_spot=nifty_spot,
+                nearest_expiries=nearest_expiries_str,
+                available_options=available_options_list
             )
         except Exception as exc:
             self.log_message(f"[#ff0000]NLI Translation Failed:[/#] {exc}")
@@ -3094,13 +3196,13 @@ class KCLILiveSession:
             content=self._logs_control,
             wrap_lines=True,
             height=lambda: self.log_height_lines,
-            get_vertical_scroll=lambda win: self._logs_control.vertical_scroll_position,
+            get_vertical_scroll=lambda win: self._logs_control.buffer.document.cursor_position_row,
         )
         self.info_window = ScrollableWindow(
             content=self._info_control,
             wrap_lines=True,
             allow_scroll_beyond_bottom=True,
-            get_vertical_scroll=lambda win: self._info_control.vertical_scroll_position,
+            get_vertical_scroll=lambda win: self._info_control.buffer.document.cursor_position_row,
         )
 
         def make_scroll_handler(window, control):
@@ -3108,15 +3210,23 @@ class KCLILiveSession:
             def scroll_mouse_handler(mouse_event):
                 from prompt_toolkit.mouse_events import MouseEventType
                 if mouse_event.event_type == MouseEventType.SCROLL_UP:
-                    control.vertical_scroll_position = max(0, control.vertical_scroll_position - 3)
+                    if hasattr(control, "buffer"):
+                        for _ in range(3):
+                            control.buffer.cursor_up()
+                    else:
+                        control.vertical_scroll_position = max(0, control.vertical_scroll_position - 3)
                     self.app.invalidate()
                     return None
                 elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
-                    if window.render_info:
-                        max_scroll = max(0, window.render_info.content_height - window.render_info.window_height)
-                        control.vertical_scroll_position = min(max_scroll, control.vertical_scroll_position + 3)
+                    if hasattr(control, "buffer"):
+                        for _ in range(3):
+                            control.buffer.cursor_down()
                     else:
-                        control.vertical_scroll_position += 3
+                        if window.render_info:
+                            max_scroll = max(0, window.render_info.content_height - window.render_info.window_height)
+                            control.vertical_scroll_position = min(max_scroll, control.vertical_scroll_position + 3)
+                        else:
+                            control.vertical_scroll_position += 3
                     self.app.invalidate()
                     return None
                 if original_handler:

@@ -632,22 +632,22 @@ class KiteAccountManager:
             )
 
             try:
-                order_id = kite.place_order(
-                    variety=kite.VARIETY_REGULAR,
-                    exchange=exchange,
+                order_ids = self.place_order(
+                    api_key=api_key,
                     tradingsymbol=symbol,
+                    exchange=exchange,
                     transaction_type=transaction_type,
                     quantity=exit_qty,
-                    product=product,
                     order_type=kite.ORDER_TYPE_MARKET,
-                    validity=kite.VALIDITY_DAY,
+                    product=product,
                 )
-                orders_placed.append({
-                    "tradingsymbol": symbol,
-                    "quantity": exit_qty,
-                    "product": product,
-                    "order_id": order_id
-                })
+                for order_id in order_ids:
+                    orders_placed.append({
+                        "tradingsymbol": symbol,
+                        "quantity": exit_qty,
+                        "product": product,
+                        "order_id": order_id
+                    })
             except Exception as exc:
                 logger.error(
                     "Failed to place exit order for %s in account %s: %s",

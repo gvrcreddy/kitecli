@@ -146,6 +146,17 @@ MIT
 
 ## Changelog
 
+### 0.1.0b12 — 2026-06-29
+
+**Enhancements:**
+- **Explicit Symbol Resolution on SQUAREOFF Click**: Clicking the `SQUAREOFF` action bar button now resolves near-week options using live open positions, pre-filling the exact command chain (e.g. `exit NIFTY26JUN22300PE`) directly in the input bar for full transparency before execution, rather than displaying generic `exit near-week` text.
+- **Price Format Correction in NLI**: Added strict system instructions and formatting rules to ensure the LLM outputs prices as raw numeric values (e.g. `1.4`) and explicitly forbids prefixing them with `@` (e.g. `@1.4`), which was generating invalid kcli commands.
+- **Large Quantity Parsing Fix**: Fixed a bug where any order quantity >= 1000 (e.g., 2665, 2405) was skipped by the CLI parser because it was assumed to be an option strike price.
+- **Auto-Splitting on Position Exit**: Modified position exits/square-offs to route through `self.place_order` so that exit orders exceeding the exchange freeze limit (e.g., 1800 for Nifty) are automatically sliced into separate child orders instead of getting rejected by Zerodha.
+- **Smooth TUI Scrolling & Sizing Fix**: Rebuilt the scroll bindings for the Tuesday Advisor and Option Chain panes to delegate vertical scrolling directly to prompt-toolkit's native buffer cursor movement. This unifies mouse wheel and keyboard navigation under a single native mechanism, resolving the scroll-lock and viewport snap-back issues permanently.
+
+---
+
 ### 0.1.0b11 — 2026-06-28
 
 **New Features:**

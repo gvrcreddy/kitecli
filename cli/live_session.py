@@ -1929,6 +1929,7 @@ class KCLILiveSession:
             self.log_message("  [bold]exit [symbol|id][/bold] - Exit position (current selection if symbol omitted)")
             self.log_message("  [bold]exit all[/bold] - Exit ALL open positions across all/selected accounts")
             self.log_message("  [bold]refresh[/bold] - Trigger manual sync of positions/orders")
+            self.log_message("  [bold]reconnect[/bold] - Restart all WebSocket connections")
             self.log_message("  [bold]clear[/bold] - Clear logs screen")
             self.log_message("  [bold]quit / exit[/bold] - Close dashboard")
             self.log_message("[#00afaf]Right Pane (Info Panel):[/#]")
@@ -1948,6 +1949,23 @@ class KCLILiveSession:
             self.log_message("Triggering manual refresh...")
             if hasattr(self, "app") and self.app and self.app.loop:
                 asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+            return
+
+        if primary_cmd == "reconnect":
+            self._log_command(cmd, "reconnect", "success")
+            async def _do_reconnect():
+                self.log_message("[#58a6ff]Closing existing WebSocket connections...[/#]")
+                for api_key, ticker in list(self.tickers.items()):
+                    try:
+                        ticker.close()
+                    except Exception:
+                        pass
+                self.tickers.clear()
+                await self._initial_fetch_and_connect()
+                self.log_message("[#00ff00]✓ WebSockets reconnected successfully.[/#]")
+
+            if hasattr(self, "app") and self.app and self.app.loop:
+                asyncio.run_coroutine_threadsafe(_do_reconnect(), self.app.loop)
             return
 
         # Deselect Command

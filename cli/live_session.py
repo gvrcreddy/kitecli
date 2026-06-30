@@ -375,6 +375,8 @@ class KCLILiveSession:
             "btn.sell": "bg:#5e1c18 fg:#ff7b72 bold",
             "btn.exit": "bg:#4a1b4d fg:#e85ffd bold",
             "btn.modify": "bg:#18315e fg:#79c0ff bold",
+            "btn.modify_matching": "bg:#005f73 fg:#94d2bd bold",
+            "btn.cancel_matching": "bg:#8b263e fg:#ff8b94 bold",
             "btn.cancel": "bg:#30363d fg:#8b949e bold",
             "btn.refresh": "bg:#0f3542 fg:#39c5bb bold",
             
@@ -566,14 +568,27 @@ class KCLILiveSession:
             o_id = order.get("order_id")
             o_qty = order.get("quantity", 1)
             o_price = order.get("price", 0.0)
+            o_sym = order.get("tradingsymbol")
+            
             modify_snippet = f"order {o_id} {o_qty} {o_price:.2f}"
             cancel_snippet = f"cancel {o_id}"
             
+            matching_orders = self._find_all_matching_pending_orders(o_sym) if o_sym else []
+            
             buttons = [
                 ("  MODIFY  ", "class:btn.modify", "bg:#1a1a1a fg:#444444", modify_snippet),
+            ]
+            
+            if len(matching_orders) > 1:
+                modify_matching_snippet = f"order {o_sym} {o_qty} {o_price:.2f}"
+                cancel_matching_snippet = f"cancel {o_sym}"
+                buttons.append(("  MODIFY MATCHING  ", "class:btn.modify_matching", "bg:#1a1a1a fg:#444444", modify_matching_snippet))
+                buttons.append(("  CANCEL MATCHING  ", "class:btn.cancel_matching", "bg:#1a1a1a fg:#444444", cancel_matching_snippet))
+                
+            buttons.extend([
                 ("  CANCEL  ", "class:btn.cancel", "bg:#1a1a1a fg:#444444", cancel_snippet),
                 ("  REFRESH  ", "class:btn.refresh", "bg:#1a1a1a fg:#444444", "refresh"),
-            ]
+            ])
         else:
             if sym:
                 # Context 3: If account and symbol are selected
@@ -1465,6 +1480,33 @@ class KCLILiveSession:
         # No match in active positions — pass through as-is (for new orders)
         return normalized_input, None, None
 
+    def _find_all_matching_pending_orders(self, query: str) -> list[tuple[dict, dict]]:
+        """Find all pending orders in self.last_orders_response matching an ID, suffix, or symbol."""
+        if not getattr(self, "last_orders_response", None):
+            return []
+
+        PENDING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED"}
+        matches = []
+        
+        normalized_query = query.strip().upper()
+        if not normalized_query:
+            return []
+
+        for acct in self.last_orders_response.get("accounts", []):
+            for o in acct.get("orders", []):
+                if o.get("status", "").upper() in PENDING_STATUSES:
+                    order_id = str(o.get("order_id", ""))
+                    symbol = str(o.get("tradingsymbol", "")).upper()
+                    
+                    # 1. Exact or suffix match on order ID
+                    if order_id == query or order_id.endswith(query) or (len(query) >= 4 and query in order_id):
+                        matches.append((acct, o))
+                    # 2. Match on trading symbol (exact match or query is substring of symbol)
+                    elif symbol == normalized_query or normalized_query in symbol:
+                        matches.append((acct, o))
+                        
+        return matches
+
     def _find_pending_order(self, query: str) -> tuple[tuple[dict, dict] | None, str | None]:
         """Find a pending order in self.last_orders_response by ID or suffix.
 
@@ -1890,6 +1932,16 @@ class KCLILiveSession:
                             p["api_key"],
                         )
                     )
+                elif p["type"] == "modify_multi":
+                    for order_info in p["orders"]:
+                        asyncio.create_task(
+                            self.execute_modify(
+                                order_info["order_id"],
+                                p["qty"],
+                                p["price"],
+                                order_info["api_key"],
+                            )
+                        )
                 elif p["type"] == "cancel":
                     asyncio.create_task(
                         self.execute_cancel(
@@ -1897,6 +1949,14 @@ class KCLILiveSession:
                             p["api_key"],
                         )
                     )
+                elif p["type"] == "cancel_multi":
+                    for order_info in p["orders"]:
+                        asyncio.create_task(
+                            self.execute_cancel(
+                                order_info["order_id"],
+                                order_info["api_key"],
+                            )
+                        )
                 elif p["type"] == "nli_command":
                     self.log_message(f"Executing NLI Command: [bold]{p['command']}[/bold]")
                     self._skip_confirmation = True
@@ -2173,29 +2233,27 @@ class KCLILiveSession:
             self.log_message(f"Selected account: [bold]{self.selected_account_name}[/bold]. Orders will target this account only.")
             return
 
-        # Modify Order Command: order <id_suffix|full_id> <quantity|lotsL> <price>
+        # Modify Order Command: order <id_suffix|full_id|symbol> <quantity|lotsL> <price>
         if primary_cmd == "order":
             if len(parts) < 4:
-                self.log_message("[#ff0000]Usage:[/#] order <id_suffix|full_id> <quantity|lotsL> <price>")
+                self.log_message("[#ff0000]Usage:[/#] order <id_suffix|full_id|symbol> <quantity|lotsL> <price>")
                 return
             
-            raw_id = parts[1]
+            raw_id_or_sym = parts[1]
             qty_str = parts[2]
             price_str = parts[3]
             
-            # Find the order in cache using raw_id
-            acct_and_order, err = self._find_pending_order(raw_id)
-            if err:
-                self.log_message(f"[#ff0000]Error:[/#] {err}")
+            # Find all matching pending orders
+            matches = self._find_all_matching_pending_orders(raw_id_or_sym)
+            if not matches:
+                self.log_message(f"[#ff0000]Error:[/#] No pending order matches ID/suffix/symbol '{raw_id_or_sym}'.")
                 return
-                
-            acct, order = acct_and_order
-            order_id = order.get("order_id")
-            symbol = order.get("tradingsymbol")
-            api_key = acct.get("api_key")
-            
+
             # Resolve quantity with lot size if it has L
-            raw_qty_str, qty_display, qty_err = self._resolve_qty(qty_str, symbol)
+            # Use the first matched order's symbol for lot-size resolution helper
+            first_acct, first_order = matches[0]
+            first_sym = first_order.get("tradingsymbol")
+            raw_qty_str, qty_display, qty_err = self._resolve_qty(qty_str, first_sym)
             if qty_err:
                 self.log_message(f"[#ff0000]Error:[/#] {qty_err}")
                 return
@@ -2208,70 +2266,126 @@ class KCLILiveSession:
                 return
                 
             price_desc = f"@{price_val:.2f}" if price_val > 0 else "MARKET"
-            
-            self.pending_order = {
-                "type": "modify",
-                "order_id": order_id,
-                "qty": raw_qty_str,
-                "price": price_str,
-                "api_key": api_key,
-                "symbol": symbol
-            }
-            
-            self._log_command(
-                cmd_text=cmd,
-                action=self.pending_order,
-                status="pending_confirmation",
-                api_key=api_key,
-            )
-            
-            self.prompt_control.text = f" Confirm MODIFY order {order_id[-6:]} to {qty_display} {symbol} {price_desc}? (y/n)> "
-            self.log_message(f"[#ff8700]Pending Confirmation:[/#] MODIFY order {order_id} ({symbol}) to {qty_display} {price_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+
+            # If there is exactly 1 match, run standard single order modify
+            if len(matches) == 1:
+                acct, order = matches[0]
+                order_id = order.get("order_id")
+                symbol = order.get("tradingsymbol")
+                api_key = acct.get("api_key")
+                self.pending_order = {
+                    "type": "modify",
+                    "order_id": order_id,
+                    "qty": raw_qty_str,
+                    "price": price_str,
+                    "api_key": api_key,
+                    "symbol": symbol
+                }
+                self._log_command(
+                    cmd_text=cmd,
+                    action=self.pending_order,
+                    status="pending_confirmation",
+                    api_key=api_key,
+                )
+                self.prompt_control.text = f" Confirm MODIFY order {order_id[-6:]} to {qty_display} {symbol} {price_desc}? (y/n)> "
+                self.log_message(f"[#ff8700]Pending Confirmation:[/#] MODIFY order {order_id} ({symbol}) to {qty_display} {price_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+            else:
+                # Multi-order modify
+                self.pending_order = {
+                    "type": "modify_multi",
+                    "orders": [
+                        {
+                            "order_id": o.get("order_id"),
+                            "api_key": a.get("api_key"),
+                            "account_name": a.get("name"),
+                            "symbol": o.get("tradingsymbol")
+                        }
+                        for a, o in matches
+                    ],
+                    "qty": raw_qty_str,
+                    "price": price_str
+                }
+                self._log_command(
+                    cmd_text=cmd,
+                    action=self.pending_order,
+                    status="pending_confirmation",
+                    api_key=None,
+                )
+                accts_list = ", ".join(f"@{o['account_name']}" for o in self.pending_order["orders"])
+                self.prompt_control.text = f" Confirm MODIFY {len(matches)} orders ({first_sym}) to {qty_display} {price_desc} on {accts_list}? (y/n)> "
+                self.log_message(
+                    f"[#ff8700]Pending Confirmation:[/#] MODIFY {len(matches)} pending orders for {first_sym} "
+                    f"to {qty_display} {price_desc} on accounts {accts_list}. Press [bold]y[/bold] to confirm, any other key to cancel."
+                )
             return
 
-        # Cancel Order Command: cancel [id_suffix|full_id]
+        # Cancel Order Command: cancel [id_suffix|full_id|symbol]
         if primary_cmd == "cancel":
-            target_id = None
+            target_id_or_sym = None
             if len(parts) >= 2:
-                target_id = parts[1]
+                target_id_or_sym = parts[1]
             elif self.selected_order:
-                target_id = self.selected_order.get("order_id")
+                target_id_or_sym = self.selected_order.get("order_id")
                 
-            if not target_id:
-                self.log_message("[#ff0000]Usage:[/#] cancel <id_suffix|full_id> (or select a pending order first)")
+            if not target_id_or_sym:
+                self.log_message("[#ff0000]Usage:[/#] cancel <id_suffix|full_id|symbol> (or select a pending order first)")
                 return
                 
-            acct_and_order, err = self._find_pending_order(target_id)
-            if err:
-                self.log_message(f"[#ff0000]Error:[/#] {err}")
+            matches = self._find_all_matching_pending_orders(target_id_or_sym)
+            if not matches:
+                self.log_message(f"[#ff0000]Error:[/#] No pending order matches ID/suffix/symbol '{target_id_or_sym}'.")
                 return
                 
-            acct, order = acct_and_order
-            order_id = order.get("order_id")
-            symbol = order.get("tradingsymbol")
-            api_key = acct.get("api_key")
-            qty = order.get("quantity")
-            price = order.get("price")
-            tx_type = order.get("transaction_type")
-            
-            price_desc = f"@{price:.2f}" if price else "MARKET"
-            
-            self.pending_order = {
-                "type": "cancel",
-                "order_id": order_id,
-                "api_key": api_key,
-                "symbol": symbol
-            }
-            
-            self._log_command(
-                cmd_text=cmd,
-                action=self.pending_order,
-                status="pending_confirmation",
-                api_key=api_key,
-            )
-            
-            self.prompt_control.text = f" Confirm CANCEL order {order_id[-6:]} ({tx_type} {qty} {symbol} {price_desc})? (y/n)> "
-            self.log_message(f"[#ff8700]Pending Confirmation:[/#] CANCEL order {order_id} ({tx_type} {qty} {symbol} {price_desc}). Press [bold]y[/bold] to confirm, any other key to cancel.")
+            if len(matches) == 1:
+                acct, order = matches[0]
+                order_id = order.get("order_id")
+                symbol = order.get("tradingsymbol")
+                api_key = acct.get("api_key")
+                qty = order.get("quantity")
+                price = order.get("price")
+                tx_type = order.get("transaction_type")
+                price_desc = f"@{price:.2f}" if price else "MARKET"
+                
+                self.pending_order = {
+                    "type": "cancel",
+                    "order_id": order_id,
+                    "api_key": api_key,
+                    "symbol": symbol
+                }
+                self._log_command(
+                    cmd_text=cmd,
+                    action=self.pending_order,
+                    status="pending_confirmation",
+                    api_key=api_key,
+                )
+                self.prompt_control.text = f" Confirm CANCEL order {order_id[-6:]} ({tx_type} {qty} {symbol} {price_desc})? (y/n)> "
+                self.log_message(f"[#ff8700]Pending Confirmation:[/#] CANCEL order {order_id} ({tx_type} {qty} {symbol} {price_desc}). Press [bold]y[/bold] to confirm, any other key to cancel.")
+            else:
+                self.pending_order = {
+                    "type": "cancel_multi",
+                    "orders": [
+                        {
+                            "order_id": o.get("order_id"),
+                            "api_key": a.get("api_key"),
+                            "account_name": a.get("name"),
+                            "symbol": o.get("tradingsymbol")
+                        }
+                        for a, o in matches
+                    ]
+                }
+                self._log_command(
+                    cmd_text=cmd,
+                    action=self.pending_order,
+                    status="pending_confirmation",
+                    api_key=None,
+                )
+                first_sym = matches[0][1].get("tradingsymbol")
+                accts_list = ", ".join(f"@{o['account_name']}" for o in self.pending_order["orders"])
+                self.prompt_control.text = f" Confirm CANCEL {len(matches)} orders ({first_sym}) on {accts_list}? (y/n)> "
+                self.log_message(
+                    f"[#ff8700]Pending Confirmation:[/#] CANCEL {len(matches)} pending orders for {first_sym} "
+                    f"on accounts {accts_list}. Press [bold]y[/bold] to confirm, any other key to cancel."
+                )
             return
 
         # Direct Buy/Sell Commands

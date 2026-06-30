@@ -3273,10 +3273,8 @@ class KCLILiveSession:
             cur = event.app.layout.current_control
             if cur == self.positions_control:
                 self.positions_control.vertical_scroll_position = max(0, self.positions_control.vertical_scroll_position - 1)
-            elif cur == self._logs_control:
-                self._logs_control.vertical_scroll_position = max(0, self._logs_control.vertical_scroll_position - 1)
-            elif cur == self._info_control:
-                self._info_control.vertical_scroll_position = max(0, self._info_control.vertical_scroll_position - 1)
+            elif hasattr(cur, "buffer"):
+                cur.buffer.cursor_up()
 
         @kb.add("down", filter=~has_focus(self.input_field))
         def _scroll_down_kb(event):
@@ -3289,32 +3287,17 @@ class KCLILiveSession:
                     c.vertical_scroll_position = min(max_scroll, c.vertical_scroll_position + 1)
                 else:
                     c.vertical_scroll_position += 1
-            elif cur == self._logs_control:
-                w = self.logs_window
-                c = self._logs_control
-                if w.render_info:
-                    max_scroll = max(0, w.render_info.content_height - w.render_info.window_height)
-                    c.vertical_scroll_position = min(max_scroll, c.vertical_scroll_position + 1)
-                else:
-                    c.vertical_scroll_position += 1
-            elif cur == self._info_control:
-                w = self.info_window
-                c = self._info_control
-                if w.render_info:
-                    max_scroll = max(0, w.render_info.content_height - w.render_info.window_height)
-                    c.vertical_scroll_position = min(max_scroll, c.vertical_scroll_position + 1)
-                else:
-                    c.vertical_scroll_position += 1
+            elif hasattr(cur, "buffer"):
+                cur.buffer.cursor_down()
 
         @kb.add("pageup", filter=~has_focus(self.input_field))
         def _page_up_kb(event):
             cur = event.app.layout.current_control
             if cur == self.positions_control:
                 self.positions_control.vertical_scroll_position = max(0, self.positions_control.vertical_scroll_position - 10)
-            elif cur == self._logs_control:
-                self._logs_control.vertical_scroll_position = max(0, self._logs_control.vertical_scroll_position - 10)
-            elif cur == self._info_control:
-                self._info_control.vertical_scroll_position = max(0, self._info_control.vertical_scroll_position - 10)
+            elif hasattr(cur, "buffer"):
+                for _ in range(10):
+                    cur.buffer.cursor_up()
 
         @kb.add("pagedown", filter=~has_focus(self.input_field))
         def _page_down_kb(event):
@@ -3327,22 +3310,9 @@ class KCLILiveSession:
                     c.vertical_scroll_position = min(max_scroll, c.vertical_scroll_position + 10)
                 else:
                     c.vertical_scroll_position += 10
-            elif cur == self._logs_control:
-                w = self.logs_window
-                c = self._logs_control
-                if w.render_info:
-                    max_scroll = max(0, w.render_info.content_height - w.render_info.window_height)
-                    c.vertical_scroll_position = min(max_scroll, c.vertical_scroll_position + 10)
-                else:
-                    c.vertical_scroll_position += 10
-            elif cur == self._info_control:
-                w = self.info_window
-                c = self._info_control
-                if w.render_info:
-                    max_scroll = max(0, w.render_info.content_height - w.render_info.window_height)
-                    c.vertical_scroll_position = min(max_scroll, c.vertical_scroll_position + 10)
-                else:
-                    c.vertical_scroll_position += 10
+            elif hasattr(cur, "buffer"):
+                for _ in range(10):
+                    cur.buffer.cursor_down()
 
         @kb.add("tab")
         def _tab(event):

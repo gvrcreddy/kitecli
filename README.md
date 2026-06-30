@@ -146,6 +146,13 @@ MIT
 
 ## Changelog
 
+### 0.1.0b13 — 2026-06-30
+
+**Bug Fixes:**
+- **Global IPv4 DNS Resolution Patch**: Moved and applied the IPv4 DNS resolution override globally at the package initialization level in `cli/__init__.py`. This forces all Zerodha connections (including direct, non-proxied account calls like `SS1009`) to resolve and connect strictly over IPv4, preventing IP mismatch errors ("IP not allowed") caused by transient macOS IPv6 routing.
+
+---
+
 ### 0.1.0b12 — 2026-06-29
 
 **Enhancements:**

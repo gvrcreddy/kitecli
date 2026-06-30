@@ -282,6 +282,7 @@ class KCLILiveSession:
         self.accounts = accounts
         self.running = True
         self.tickers = {}
+        self.websocket_connected = {a["api_key"]: False for a in accounts if a.get("api_key")}
         self.subscribed_tokens = set()
         # Throttle state for noisy per-account WebSocket close/error logging.
         self._ws_log_throttle = {}
@@ -846,12 +847,58 @@ class KCLILiveSession:
         self.positions_control.text = all_fragments
 
         # Update title bar info
+        self._update_header_display()
+
+    def _update_header_display(self) -> None:
+        """Update the header text and style based on WebSocket status."""
+        total = len(self.accounts)
+        connected = sum(1 for k in getattr(self, "websocket_connected", {}).values() if k)
+        
+        def _header_click_handler(*args, **kwargs):
+            from prompt_toolkit.mouse_events import MouseEventType
+            mouse_event = None
+            if len(args) == 2:
+                mouse_event = args[1]
+            elif len(args) == 1:
+                mouse_event = args[0]
+            
+            if mouse_event and mouse_event.event_type == MouseEventType.MOUSE_UP:
+                self.log_message("Header clicked. Triggering manual WebSocket reconnection...")
+                
+                async def _do_reconnect():
+                    self.log_message("[#58a6ff]Closing existing WebSocket connections...[/#]")
+                    for api_key, ticker in list(self.tickers.items()):
+                        try:
+                            ticker.close()
+                        except Exception:
+                            pass
+                    self.tickers.clear()
+                    await self._initial_fetch_and_connect()
+                    self.log_message("[#00ff00]✓ WebSockets reconnected successfully.[/#]")
+
+                if hasattr(self, "app") and self.app and self.app.loop:
+                    asyncio.run_coroutine_threadsafe(_do_reconnect(), self.app.loop)
+
+        if connected == total:
+            status_style = "fg:#00ff00 bold"
+            status_label = "WebSockets Active"
+        elif connected > 0:
+            status_style = "fg:#ff8700 bold"
+            status_label = f"WebSockets Partial ({connected}/{total})"
+        else:
+            status_style = "fg:#ff0000 bold"
+            status_label = "WebSockets Inactive"
+
         now = datetime.now().strftime("%H:%M:%S")
-        self.header_control.text = (
-            f"🪁 KiteCLI Live │ WebSockets Active │ "
-            f"Last Update: {now} │ Accounts: {len(self.accounts)} │ "
-            f"Ctrl+C: Quit │ Escape: Deselect"
-        )
+        
+        frags = [
+            ("", "🪁 KiteCLI Live │ "),
+            (status_style, status_label, _header_click_handler),
+            ("", f" │ Last Update: {now} │ Accounts: {total} │ Ctrl+C: Quit │ Escape: Deselect"),
+        ]
+        self.header_control.text = frags
+        if hasattr(self, "app") and self.app:
+            self.app.invalidate()
 
     async def _diagnose_tokens(self) -> dict[str, str]:
         """Check each account's token validity and report it in the Status Logs.
@@ -1054,6 +1101,9 @@ class KCLILiveSession:
 
     def _make_on_connect(self, api_key: str, ticker):
         def on_connect(ws, response):
+            self.websocket_connected[api_key] = True
+            if hasattr(self, "app") and self.app and self.app.loop:
+                self.app.loop.call_soon_threadsafe(self._update_header_display)
             name = self._get_account_name(api_key)
             self.log_message(f"[#00ff00]WebSocket connected:[/#] @{name}")
             # All market-data (position prices, indices, option chain) streams on
@@ -1095,6 +1145,9 @@ class KCLILiveSession:
 
     def _make_on_close(self, api_key: str):
         def on_close(ws, code, reason):
+            self.websocket_connected[api_key] = False
+            if hasattr(self, "app") and self.app and self.app.loop:
+                self.app.loop.call_soon_threadsafe(self._update_header_display)
             name = self._get_account_name(api_key)
             if self._ws_should_log(f"close:{api_key}"):
                 self.log_message(
@@ -1105,6 +1158,9 @@ class KCLILiveSession:
 
     def _make_on_error(self, api_key: str):
         def on_error(ws, code, reason):
+            self.websocket_connected[api_key] = False
+            if hasattr(self, "app") and self.app and self.app.loop:
+                self.app.loop.call_soon_threadsafe(self._update_header_display)
             name = self._get_account_name(api_key)
             reason_str = str(reason).lower()
             # Detect permanent auth failures (403, token expired) — stop reconnecting

@@ -878,21 +878,9 @@ class KCLILiveSession:
                 mouse_event = args[0]
             
             if mouse_event and mouse_event.event_type == MouseEventType.MOUSE_UP:
-                self.log_message("Header clicked. Triggering manual WebSocket reconnection...")
-                
-                async def _do_reconnect():
-                    self.log_message("[#58a6ff]Closing existing WebSocket connections...[/#]")
-                    for api_key, ticker in list(self.tickers.items()):
-                        try:
-                            ticker.close()
-                        except Exception:
-                            pass
-                    self.tickers.clear()
-                    await self._initial_fetch_and_connect()
-                    self.log_message("[#00ff00]✓ WebSockets reconnected successfully.[/#]")
-
+                self.log_message("Triggering manual WebSocket reconnection...")
                 if hasattr(self, "app") and self.app and self.app.loop:
-                    asyncio.run_coroutine_threadsafe(_do_reconnect(), self.app.loop)
+                    asyncio.run_coroutine_threadsafe(self.reconnect_websockets(), self.app.loop)
 
         if connected == total:
             status_style = "fg:#00ff00 bold"
@@ -914,6 +902,34 @@ class KCLILiveSession:
         self.header_control.text = frags
         if hasattr(self, "app") and self.app:
             self.app.invalidate()
+
+    async def reconnect_websockets(self) -> None:
+        """Close existing WebSocket connections and start fresh ones, updating the UI."""
+        self.log_message("[#58a6ff]Closing existing WebSocket connections...[/#]")
+        
+        # 1. Nullify callbacks on the old tickers before closing to prevent async race conditions
+        for api_key, ticker in list(self.tickers.items()):
+            try:
+                ticker.on_connect = None
+                ticker.on_close = None
+                ticker.on_error = None
+                ticker.on_ticks = None
+                ticker.close()
+            except Exception:
+                pass
+        self.tickers.clear()
+        
+        # 2. Reset connection flags locally and redraw the header status immediately
+        for api_key in list(self.websocket_connected.keys()):
+            self.websocket_connected[api_key] = False
+        self._update_header_display()
+        
+        # 3. Establish the new connection (triggers REST fetch & connects WS)
+        await self._initial_fetch_and_connect()
+        
+        # 4. Redraw positions and invalidate TUI to reflect new values
+        self._update_display_and_invalidate()
+        self.log_message("[#00ff00]✓ WebSockets reconnected successfully.[/#]")
 
     async def _diagnose_tokens(self) -> dict[str, str]:
         """Check each account's token validity and report it in the Status Logs.
@@ -2069,19 +2085,8 @@ class KCLILiveSession:
 
         if primary_cmd == "reconnect":
             self._log_command(cmd, "reconnect", "success")
-            async def _do_reconnect():
-                self.log_message("[#58a6ff]Closing existing WebSocket connections...[/#]")
-                for api_key, ticker in list(self.tickers.items()):
-                    try:
-                        ticker.close()
-                    except Exception:
-                        pass
-                self.tickers.clear()
-                await self._initial_fetch_and_connect()
-                self.log_message("[#00ff00]✓ WebSockets reconnected successfully.[/#]")
-
             if hasattr(self, "app") and self.app and self.app.loop:
-                asyncio.run_coroutine_threadsafe(_do_reconnect(), self.app.loop)
+                asyncio.run_coroutine_threadsafe(self.reconnect_websockets(), self.app.loop)
             return
 
         # Deselect Command

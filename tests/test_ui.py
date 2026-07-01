@@ -68,7 +68,7 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
         
         # Verify that reconnection is scheduled asynchronously
         mock_run_coroutine.assert_called_once()
-        self.session.log_message.assert_any_call("Header clicked. Triggering manual WebSocket reconnection...")
+        self.session.log_message.assert_any_call("Triggering manual WebSocket reconnection...")
 
 if __name__ == "__main__":
     unittest.main()

@@ -1270,7 +1270,8 @@ class KCLILiveSession:
                 if resp:
                     for acct in resp.get("accounts", []):
                         for pos in acct.get("positions", []):
-                            if pos.get("instrument_token") == token:
+                            pos_token = pos.get("instrument_token")
+                            if pos_token is not None and int(pos_token) == int(token):
                                 pos["last_price"] = ltp
                                 # Recalculate P&L only for open positions (quantity != 0)
                                 qty = pos.get("quantity", 0)
@@ -1325,6 +1326,23 @@ class KCLILiveSession:
             f"│   <ansired><b>INDIA VIX:</b></ansired> <style fg='#ffffff'>{vix_str}</style>"
         )
 
+    def _get_active_ticker(self):
+        """Get the primary ticker if it is connected, else fallback to any connected ticker."""
+        ticker = None
+        if self.primary_api_key and self.websocket_connected.get(self.primary_api_key):
+            ticker = self.tickers.get(self.primary_api_key)
+        
+        if ticker is None:
+            connected_keys = [k for k, conn in self.websocket_connected.items() if conn]
+            for key in connected_keys:
+                if key in self.tickers:
+                    ticker = self.tickers[key]
+                    break
+        
+        if ticker is None and self.tickers:
+            ticker = next(iter(self.tickers.values()))
+        return ticker
+
     def _update_subscriptions(self, new_tokens: set[int]) -> None:
         """Subscribe to position instrument tokens and unsubscribe inactive ones.
 
@@ -1342,12 +1360,8 @@ class KCLILiveSession:
         # Keep tokens still needed by the live option chain subscribed.
         to_unsubscribe -= set(self.oc_subscribed_tokens)
 
-        # Stream position prices on the primary ticker only. Fall back to any
-        # available ticker if no primary was selected (e.g. only non-flagged
-        # stream-capable accounts and selection returned the first one anyway).
-        ticker = self.tickers.get(self.primary_api_key) if self.primary_api_key else None
-        if ticker is None and self.tickers:
-            ticker = next(iter(self.tickers.values()))
+        # Stream position prices on the active ticker
+        ticker = self._get_active_ticker()
 
         if to_subscribe and ticker is not None:
             try:
@@ -2934,7 +2948,7 @@ class KCLILiveSession:
 
         self.oc_token_map = token_map
 
-        ticker = self.tickers.get(self.primary_api_key) if self.primary_api_key else None
+        ticker = self._get_active_ticker()
         old_tokens = self.oc_subscribed_tokens
 
         # Don't unsubscribe tokens that are also position/index tokens.

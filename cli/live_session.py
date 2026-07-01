@@ -3227,8 +3227,18 @@ class KCLILiveSession:
             text = self._last_advisor_text
         else:
             text = self._last_oc_text
+        if reset_scroll:
+            new_cursor = 0
+        else:
+            old_doc = self.info_buffer.document
+            old_row = old_doc.cursor_position_row
+            old_col = old_doc.cursor_position_col
+            temp_doc = Document(text=text)
+            target_row = min(old_row, max(0, len(temp_doc.lines) - 1))
+            new_cursor = temp_doc.translate_row_col_to_index(target_row, old_col)
+
         self.info_buffer.set_document(
-            Document(text=text, cursor_position=0),
+            Document(text=text, cursor_position=new_cursor),
             bypass_readonly=True,
         )
         if reset_scroll and hasattr(self, "_info_control"):

@@ -3108,7 +3108,7 @@ class KCLILiveSession:
                     for opt in options:
                         try:
                             strike = float(opt.get("strike", 0))
-                            if abs(strike - spot) / spot <= 0.10:
+                            if abs(strike - spot) / spot <= 0.15:
                                 available_options_list.append({
                                     "symbol": opt.get("tradingsymbol"),
                                     "expiry": opt.get("expiry").strftime("%Y-%m-%d") if isinstance(opt.get("expiry"), datetime.date) else str(opt.get("expiry")),

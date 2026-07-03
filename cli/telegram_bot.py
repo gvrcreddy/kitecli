@@ -41,6 +41,40 @@ def restrict_user(func):
     return wrapper
 
 
+def clean_option_symbol(symbol: str) -> str:
+    """Parses and formats option symbols into a compact format, stripping index names like NIFTY."""
+    # 1. Weekly option pattern: e.g. NIFTY2670722800PE
+    # Group 1: Symbol (e.g. NIFTY)
+    # Group 2: Year (26)
+    # Group 3: Month character (1-9, O, N, D)
+    # Group 4: Date (07)
+    # Group 5: Strike (22800)
+    # Group 6: Option Type (PE)
+    m_weekly = re.match(r"^([A-Z]+)(\d{2})([1-9ONDond])(\d{2})(\d+)(CE|PE)$", symbol)
+    if m_weekly:
+        _, year, month_char, date, strike, opt_type = m_weekly.groups()
+        months_map = {
+            "1": "Jan", "2": "Feb", "3": "Mar", "4": "Apr", "5": "May", "6": "Jun",
+            "7": "Jul", "8": "Aug", "9": "Sep", "O": "Oct", "N": "Nov", "D": "Dec"
+        }
+        month_name = months_map.get(month_char.upper(), month_char)
+        return f"{date}{month_name}{year} {strike}{opt_type}"
+
+    # 2. Monthly option pattern: e.g. NIFTY26JUL21100CE
+    # Group 1: Symbol (NIFTY)
+    # Group 2: Year (26)
+    # Group 3: Month name (JUL)
+    # Group 4: Strike (21100)
+    # Group 5: Option Type (CE)
+    m_monthly = re.match(r"^([A-Z]+)(\d{2})([A-Z]{3})(\d+)(CE|PE)$", symbol)
+    if m_monthly:
+        _, year, month_name, strike, opt_type = m_monthly.groups()
+        month_cap = month_name.capitalize()
+        return f"{month_cap}{year} {strike}{opt_type}"
+
+    return symbol
+
+
 class KCLITelegramBot:
     """Telegram Bot wrapper for KCLIClient."""
 
@@ -137,11 +171,6 @@ class KCLITelegramBot:
         positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
 
         pnl_sign = "+" if total_pnl >= 0 else ""
-        msg_lines = [f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})"]
-
-        if not positions:
-            return f"✅ No active open positions for *{name}*.", []
-
         msg_lines = [
             f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})",
             "_*Format:* Symbol  •  Qty  •  Avg → LTP_",
@@ -156,7 +185,8 @@ class KCLITelegramBot:
             ltp = pos.get("last_price", 0.0)
 
             # Keep it under 45 chars to prevent mobile truncation
-            btn_text = f"🔹 {sym}  •  {qty}  •  {avg:.2f} → {ltp:.2f}"
+            display_sym = clean_option_symbol(sym)
+            btn_text = f"🔹 {display_sym}  •  {qty}  •  {avg:.2f} → {ltp:.2f}"
             btn = InlineKeyboardButton(
                 btn_text,
                 callback_data=f"select_pos:{sym}:{api_key}:{qty}:{avg:.2f}:{ltp:.2f}"

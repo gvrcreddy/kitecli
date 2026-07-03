@@ -279,6 +279,60 @@ def config_cmd(
     console.print()
 
 
+@app.command("bot")
+def bot_cmd(
+    token: Optional[str] = typer.Option(None, "--token", help="Telegram Bot Token"),
+    chat_id: Optional[int] = typer.Option(None, "--chat-id", help="Authorized Telegram Chat ID"),
+) -> None:
+    """[bold]Run Telegram bot[/bold] — run the bot in polling mode to manage positions and orders."""
+    display_banner()
+
+    config = _load_config_or_exit()
+    
+    import os
+    tg_config = config.get("telegram", {})
+    resolved_token = token or tg_config.get("bot_token") or os.environ.get("TELEGRAM_BOT_TOKEN")
+    resolved_chat_id = chat_id or tg_config.get("chat_id") or os.environ.get("TELEGRAM_CHAT_ID")
+    
+    if not resolved_token:
+        display_error(
+            "Telegram Bot Token not provided.\n"
+            "  Please configure it in ~/.kcli/config.yaml under a `telegram:` section, or pass it via `--token`."
+        )
+        raise typer.Exit(code=1)
+        
+    try:
+        resolved_chat_id = int(resolved_chat_id) if resolved_chat_id else 462942994
+    except ValueError:
+        display_error("Chat ID must be a numeric value.")
+        raise typer.Exit(code=1)
+
+    client = _build_client(config)
+    
+    # Initialize connection diagnostics
+    display_info("Initializing client session...")
+    _ensure_accounts_initialized(client, config)
+
+    from cli.telegram_bot import KCLITelegramBot
+    bot = KCLITelegramBot(client=client, token=resolved_token, chat_id=resolved_chat_id)
+    
+    display_success(f"Starting Telegram Bot for Chat ID: {resolved_chat_id}... (Press Ctrl+C to exit)")
+    
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(bot.start())
+        while True:
+            loop.run_until_complete(asyncio.sleep(1))
+    except KeyboardInterrupt:
+        display_info("\nStopping bot...")
+    finally:
+        try:
+            loop.run_until_complete(bot.stop())
+        except Exception as e:
+            logger.error(f"Error during bot stop: {e}")
+        display_success("Bot stopped cleanly.")
+
+
 # ── entry point ────────────────────────────────────────────────────
 
 def main() -> None:

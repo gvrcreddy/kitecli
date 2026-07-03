@@ -152,8 +152,8 @@ class KCLITelegramBot:
             avg = pos.get("average_price", 0.0)
             ltp = pos.get("last_price", 0.0)
             
-            # Formatted readable row label
-            label = f"{sym}  |  {qty}  |  {avg:.2f}  |  {ltp:.2f}"
+            # Formatted readable row label with visual click indicator
+            label = f"🔹 {sym}  |  {qty}  |  {avg:.2f}  |  {ltp:.2f}"
             keyboard_rows.append([
                 InlineKeyboardButton(
                     label,

@@ -286,6 +286,7 @@ class KCLILiveSession:
         self.tickers = {}
         self.websocket_connected = {a["api_key"]: False for a in accounts if a.get("api_key")}
         self.subscribed_tokens = set()
+        self.ws_ltp_cache: dict[int, float] = {}
         # Throttle state for noisy per-account WebSocket close/error logging.
         self._ws_log_throttle = {}
 
@@ -1270,29 +1271,32 @@ class KCLILiveSession:
                         s[f"{side}_ltp"] = ltp
                         oc_updated = True
                         break
-                continue
-            if ltp:
-                resp = getattr(self, "last_positions_response", None)
-                if resp:
-                    for acct in resp.get("accounts", []):
-                        for pos in acct.get("positions", []):
-                            pos_token = pos.get("instrument_token")
-                            if pos_token is not None and int(pos_token) == int(token):
-                                pos["last_price"] = ltp
-                                # Recalculate P&L only for open positions (quantity != 0)
-                                qty = pos.get("quantity", 0)
-                                if qty != 0:
-                                    avg_price = pos.get("average_price", 0.0)
-                                    pos["pnl"] = (ltp - avg_price) * qty
-                                    if avg_price > 0:
-                                        pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
-                                    else:
-                                        pos["pnl_pct"] = 0.0
-                                # For closed positions, realised P&L remains unchanged and is already set.
-                                updated = True
-                        
-                        # Recalculate total P&L for account
-                        acct["total_pnl"] = sum(p.get("pnl", 0.0) for p in acct.get("positions", []))
+
+            # Cache the latest LTP.
+            self.ws_ltp_cache[int(token)] = ltp
+
+            # Position tick → update the matching positions across all accounts.
+            resp = getattr(self, "last_positions_response", None)
+            if resp:
+                for acct in resp.get("accounts", []):
+                    for pos in acct.get("positions", []):
+                        pos_token = pos.get("instrument_token")
+                        if pos_token is not None and int(pos_token) == int(token):
+                            pos["last_price"] = ltp
+                            # Recalculate P&L only for open positions (quantity != 0)
+                            qty = pos.get("quantity", 0)
+                            if qty != 0:
+                                avg_price = pos.get("average_price", 0.0)
+                                pos["pnl"] = (ltp - avg_price) * qty
+                                if avg_price > 0:
+                                    pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
+                                else:
+                                    pos["pnl_pct"] = 0.0
+                            # For closed positions, realised P&L remains unchanged and is already set.
+                            updated = True
+                    
+                    # Recalculate total P&L for account
+                    acct["total_pnl"] = sum(p.get("pnl", 0.0) for p in acct.get("positions", []))
         
         if indices_updated and hasattr(self, "app") and self.app and self.app.loop:
             self.app.loop.call_soon_threadsafe(self._refresh_indices_header)
@@ -1414,6 +1418,25 @@ class KCLILiveSession:
                     acct["margin_cash"] = m.get("cash")
 
         if isinstance(response, dict):
+            # Re-apply cached real-time WebSocket LTPs to prevent regressing to stale REST data.
+            for acct in response.get("accounts", []):
+                for pos in acct.get("positions", []):
+                    pos_token = pos.get("instrument_token")
+                    if pos_token is not None:
+                        t_int = int(pos_token)
+                        if t_int in self.ws_ltp_cache:
+                            cached_ltp = self.ws_ltp_cache[t_int]
+                            pos["last_price"] = cached_ltp
+                            qty = pos.get("quantity", 0)
+                            if qty != 0:
+                                avg_price = pos.get("average_price", 0.0)
+                                pos["pnl"] = (cached_ltp - avg_price) * qty
+                                if avg_price > 0:
+                                    pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
+                                else:
+                                    pos["pnl_pct"] = 0.0
+                acct["total_pnl"] = sum(p.get("pnl", 0.0) for p in acct.get("positions", []))
+
             self.last_positions_response = response
             self._positions_version = getattr(self, "_positions_version", 0) + 1
 

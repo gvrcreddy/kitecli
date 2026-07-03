@@ -186,7 +186,7 @@ class KCLITelegramBot:
 
             # Keep it under 45 chars to prevent mobile truncation
             display_sym = clean_option_symbol(sym)
-            btn_text = f"🔹 {display_sym}  •  {qty}  •  {avg:.2f} → {ltp:.2f}"
+            btn_text = f"{display_sym}  •  {qty}  •  {avg:.2f} → {ltp:.2f}"
             btn = InlineKeyboardButton(
                 btn_text,
                 callback_data=f"select_pos:{sym}:{api_key}:{qty}:{avg:.2f}:{ltp:.2f}"

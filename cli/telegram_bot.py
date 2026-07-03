@@ -124,90 +124,60 @@ class KCLITelegramBot:
         except Exception as exc:
             await update.message.reply_text(f"❌ Failed to fetch status: {exc}")
 
-    def _format_positions_data(self) -> tuple[str, list[list[InlineKeyboardButton]]]:
-        """Fetch and format positions into clean aligned monospaced tables with symbol buttons."""
-        api_keys = [acct["api_key"] for acct in self.client.accounts]
-        pos_resp = self.client.get_positions(api_keys)
-        accounts_data = pos_resp.get("accounts", [])
+    def _format_account_positions(self, api_key: str) -> tuple[str, list[list[InlineKeyboardButton]]]:
+        """Fetch and format positions for a specific account into an interactive button table."""
+        pos_resp = self.client.get_positions([api_key])
+        accounts = pos_resp.get("accounts", [])
+        if not accounts:
+            return "Account not found.", []
 
-        if not accounts_data:
-            return "No positions data available.", []
+        acct = accounts[0]
+        name = acct.get("name", "Account")
+        total_pnl = acct.get("total_pnl", 0.0)
+        positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
 
-        msg_lines = []
-        keyboard_rows = []
-        flat_active_positions = []
-        
-        # Color indicators for accounts
-        emojis = ["🟩", "🟦", "🟪", "🟧", "🟨", "🟥"]
-        has_any_positions = False
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        msg_text = f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})"
 
-        for idx_acct, acct in enumerate(accounts_data):
-            name = acct.get("name", "Account")
-            api_key = acct.get("api_key")
-            total_pnl = acct.get("total_pnl", 0.0)
-            positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
+        if not positions:
+            return f"✅ No active open positions for *{name}*.", []
 
-            if not positions:
-                continue
-
-            has_any_positions = True
-            pnl_sign = "+" if total_pnl >= 0 else ""
-            acct_emoji = emojis[idx_acct % len(emojis)]
+        # Table header row button
+        keyboard_rows = [
+            [InlineKeyboardButton("Symbol  |  Qty  |  Avg  |  LTP", callback_data="noop")]
+        ]
+        for pos in positions:
+            sym = pos.get("tradingsymbol", "")
+            qty = pos.get("quantity", 0)
+            avg = pos.get("average_price", 0.0)
+            ltp = pos.get("last_price", 0.0)
             
-            msg_lines.append(f"{acct_emoji} *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})")
-            
-            # Start code block for aligned monospace table
-            msg_lines.append("```")
-            header = f"{'Symbol':<18} {'Qty':>6} {'Avg':>7} {'LTP':>7}"
-            msg_lines.append(header)
-            
-            for pos in positions:
-                sym = pos.get("tradingsymbol", "")
-                qty = pos.get("quantity", 0)
-                avg = pos.get("average_price", 0.0)
-                ltp = pos.get("last_price", 0.0)
-                
-                row_str = f"{sym:<18} {qty:>6} {avg:>7.2f} {ltp:>7.2f}"
-                msg_lines.append(row_str)
-                
-                flat_active_positions.append({
-                    "symbol": sym,
-                    "api_key": api_key,
-                    "quantity": qty,
-                    "average_price": avg,
-                    "last_price": ltp
-                })
-            
-            # Close code block
-            msg_lines.append("```")
-            msg_lines.append("") # blank line between accounts
+            # Formatted readable row label
+            label = f"{sym}  |  {qty}  |  {avg:.2f}  |  {ltp:.2f}"
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"select_pos:{sym}:{api_key}:{qty}:{avg:.2f}:{ltp:.2f}"
+                )
+            ])
 
-        if not has_any_positions:
-            return "✅ No active open positions across any accounts.", []
-
-        # Create a 2-column grid of symbol buttons
-        current_row = []
-        for p in flat_active_positions:
-            btn = InlineKeyboardButton(
-                p["symbol"],
-                callback_data=f"select_pos:{p['symbol']}:{p['api_key']}:{p['quantity']}:{p['average_price']:.2f}:{p['last_price']:.2f}"
-            )
-            current_row.append(btn)
-            if len(current_row) == 2:
-                keyboard_rows.append(current_row)
-                current_row = []
-        if current_row:
-            keyboard_rows.append(current_row)
-
-        return "\n".join(msg_lines), keyboard_rows
+        return msg_text, keyboard_rows
 
     @restrict_user
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Fetch and display open positions across all accounts."""
+        """Fetch and display open positions across all accounts as separate interactive tables."""
         try:
-            msg_text, keyboard = self._format_positions_data()
-            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-            await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
+            api_keys = [acct["api_key"] for acct in self.client.accounts]
+            has_any = False
+            for api_key in api_keys:
+                msg_text, keyboard = self._format_account_positions(api_key)
+                if keyboard:  # Only send messages for accounts with active positions
+                    has_any = True
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
+            
+            if not has_any:
+                await update.message.reply_text("✅ No active open positions across any accounts.")
         except Exception as exc:
             await update.message.reply_text(f"❌ Error fetching positions: {exc}")
 
@@ -554,9 +524,10 @@ class KCLITelegramBot:
                 await query.edit_message_text(f"❌ Order placement failed: {exc}")
 
         elif action == "back_to_positions":
+            api_key = data[1]
             await query.edit_message_text("⏳ Reloading positions...")
             try:
-                msg_text, keyboard = self._format_positions_data()
+                msg_text, keyboard = self._format_account_positions(api_key)
                 reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
                 await query.edit_message_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
             except Exception as exc:

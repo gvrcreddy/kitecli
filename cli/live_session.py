@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime
 import logging
 from urllib.parse import urlparse
+import threading
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
@@ -278,6 +279,7 @@ class KCLILiveSession:
     """Manages the interactive live positions dashboard and trading command line."""
 
     def __init__(self, client: KCLIClient, accounts: list[dict]) -> None:
+        self._main_thread_id = threading.get_ident()
         self.client = client
         self.accounts = accounts
         self.running = True
@@ -436,6 +438,11 @@ class KCLILiveSession:
 
     def log_message(self, message: str) -> None:
         """Add a timestamped message to the logs and update logs pane."""
+        if hasattr(self, "app") and self.app and self.app.loop:
+            if threading.get_ident() != getattr(self, "_main_thread_id", None):
+                self.app.loop.call_soon_threadsafe(self.log_message, message)
+                return
+
         timestamp = datetime.now().strftime("%H:%M:%S")
         plain = self._strip_rich_markup(message)
         plain = self._clean_error(plain)
@@ -1264,7 +1271,6 @@ class KCLILiveSession:
                         oc_updated = True
                         break
                 continue
-
             if ltp:
                 resp = getattr(self, "last_positions_response", None)
                 if resp:

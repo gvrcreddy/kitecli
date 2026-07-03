@@ -81,7 +81,7 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
         ["/positions", "/orders"],
         ["/status", "/help"]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 
 

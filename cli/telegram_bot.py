@@ -124,62 +124,64 @@ class KCLITelegramBot:
         except Exception as exc:
             await update.message.reply_text(f"❌ Failed to fetch status: {exc}")
 
+    def _format_positions_data(self) -> tuple[str, list[list[InlineKeyboardButton]]]:
+        """Fetch and format positions into a single message text and inline keyboard markup."""
+        api_keys = [acct["api_key"] for acct in self.client.accounts]
+        pos_resp = self.client.get_positions(api_keys)
+        accounts_data = pos_resp.get("accounts", [])
+
+        if not accounts_data:
+            return "No positions data available.", []
+
+        msg_lines = []
+        keyboard_rows = []
+        has_any_positions = False
+
+        for acct in accounts_data:
+            name = acct.get("name", "Account")
+            api_key = acct.get("api_key")
+            total_pnl = acct.get("total_pnl", 0.0)
+            positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
+
+            if not positions:
+                continue
+
+            has_any_positions = True
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            msg_lines.append(f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})")
+            msg_lines.append("`Symbol             Qty     Avg     LTP`")
+
+            for pos in positions:
+                sym = pos.get("tradingsymbol", "")
+                qty = pos.get("quantity", 0)
+                avg = pos.get("average_price", 0.0)
+                ltp = pos.get("last_price", 0.0)
+                
+                # Table format columns: Symbol (18 left), Qty (5 right), Avg (7 right), LTP (7 right)
+                row_str = f"`{sym:<18} {qty:>5} {avg:>7.2f} {ltp:>7.2f}`"
+                msg_lines.append(row_str)
+                
+                # Add inline keyboard button to select this position
+                keyboard_rows.append([
+                    InlineKeyboardButton(
+                        f"📍 {name} | {sym} ({qty})",
+                        callback_data=f"select_pos:{sym}:{api_key}:{qty}"
+                    )
+                ])
+            msg_lines.append("") # blank line between accounts
+
+        if not has_any_positions:
+            return "✅ No active open positions across any accounts.", []
+
+        return "\n".join(msg_lines), keyboard_rows
+
     @restrict_user
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Fetch and display open positions across all accounts."""
         try:
-            # 1. Fetch positions
-            api_keys = [acct["api_key"] for acct in self.client.accounts]
-            pos_resp = self.client.get_positions(api_keys)
-            accounts_data = pos_resp.get("accounts", [])
-
-            if not accounts_data:
-                await update.message.reply_text("No positions data available.")
-                return
-
-            has_any_positions = False
-            for acct in accounts_data:
-                name = acct.get("name", "Account")
-                total_pnl = acct.get("total_pnl", 0.0)
-                positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
-
-                if not positions:
-                    continue
-
-                has_any_positions = True
-                pnl_sign = "+" if total_pnl >= 0 else ""
-                msg_text = f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})\n"
-
-                for pos in positions:
-                    sym = pos.get("tradingsymbol")
-                    qty = pos.get("quantity", 0)
-                    avg = pos.get("average_price", 0.0)
-                    ltp = pos.get("last_price", 0.0)
-                    pnl = pos.get("pnl", 0.0)
-                    pnl_sign_pos = "+" if pnl >= 0 else ""
-
-                    msg_text += (
-                        f"• `{sym}`\n"
-                        f"  Qty: `{qty}` | Avg: `{avg:.2f}` | LTP: `{ltp:.2f}`\n"
-                        f"  P&L: *{pnl_sign_pos}₹{pnl:.2f}*\n\n"
-                    )
-
-                    # Inline keyboard for quick actions
-                    keyboard = [
-                        [
-                            InlineKeyboardButton(
-                                f"Market Exit: {sym}",
-                                callback_data=f"confirm_exit:{sym}:all"
-                            )
-                        ]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
-                    msg_text = ""  # Reset text block for next position
-
-            if not has_any_positions:
-                await update.message.reply_text("✅ No active open positions across any accounts.")
-
+            msg_text, keyboard = self._format_positions_data()
+            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+            await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as exc:
             await update.message.reply_text(f"❌ Error fetching positions: {exc}")
 
@@ -399,7 +401,138 @@ class KCLITelegramBot:
         data = query.data.split(":")
         action = data[0]
 
-        if action == "confirm_exit":
+        if action == "select_pos":
+            symbol = data[1]
+            api_key = data[2]
+            qty = int(data[3])
+            
+            acct_name = "Account"
+            for acct in self.client.accounts:
+                if acct.get("api_key") == api_key:
+                    acct_name = acct.get("name", "Account")
+                    break
+            
+            msg = (
+                f"🎯 *Selected Position:* `{symbol}`\n"
+                f"• *Account:* `{acct_name}`\n"
+                f"• *Current Qty:* `{qty}`\n\n"
+                f"Choose an action:"
+            )
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("🚨 Exit Position", callback_data=f"confirm_exit_single:{symbol}:{api_key}:{qty}"),
+                    InlineKeyboardButton("➕ Add More", callback_data=f"confirm_add_more:{symbol}:{api_key}:{qty}")
+                ],
+                [
+                    InlineKeyboardButton("🔙 Back to Positions", callback_data="back_to_positions")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+
+        elif action == "confirm_exit_single":
+            symbol = data[1]
+            api_key = data[2]
+            qty = int(data[3])
+            
+            confirm_text = (
+                f"🚨 *Market Exit Confirmation*\n\n"
+                f"Are you sure you want to exit position `{symbol}` (Qty: `{qty}`) at market price?"
+            )
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Confirm Market Exit", callback_data=f"do_exit_single:{symbol}:{api_key}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+
+        elif action == "do_exit_single":
+            symbol = data[1]
+            api_key = data[2]
+            await query.edit_message_text(f"⏳ Placing market exit order for `{symbol}`...")
+            try:
+                res = self.client.exit_positions([api_key], tradingsymbol=symbol)
+                res_lines = [f"📊 *Market Exit Result:* `{symbol}`"]
+                for r in res.get("results", []):
+                    name = r.get("name")
+                    status = r.get("status")
+                    msg = r.get("message", "")
+                    icon = "✅" if status == "success" else "❌"
+                    res_lines.append(f"{icon} *{name}*: {msg}")
+
+                await query.edit_message_text("\n".join(res_lines), parse_mode="Markdown")
+            except Exception as exc:
+                await query.edit_message_text(f"❌ Exit execution failed: {exc}")
+
+        elif action == "confirm_add_more":
+            symbol = data[1]
+            api_key = data[2]
+            qty = int(data[3])
+            
+            tx_type = "BUY" if qty > 0 else "SELL"
+            abs_qty = abs(qty)
+            exchange = "NFO" if len(symbol) > 6 else "NSE"
+            
+            confirm_text = (
+                f"➕ *Confirm Add More Position*\n\n"
+                f"• *Symbol*: `{symbol}`\n"
+                f"• *Current Qty*: `{qty}`\n"
+                f"• *Order*: `{tx_type}` `{abs_qty}` (Market)\n\n"
+                f"Place market order to increase position size?"
+            )
+            
+            callback_payload = f"do_place_add:{tx_type}:{symbol}:{abs_qty}:{exchange}:{api_key}"
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Confirm Add More", callback_data=callback_payload),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+
+        elif action == "do_place_add":
+            tx_type = data[1]
+            symbol = data[2]
+            qty = int(data[3])
+            exchange = data[4]
+            api_key = data[5]
+            
+            await query.edit_message_text(f"⏳ Placing market order to add to `{symbol}`...")
+            try:
+                res = self.client.place_order(
+                    api_keys=[api_key],
+                    tradingsymbol=symbol,
+                    exchange=exchange,
+                    transaction_type=tx_type,
+                    quantity=qty,
+                    order_type="MARKET"
+                )
+                res_lines = [f"📊 *Order Execution Result:* `{symbol}`"]
+                for r in res.get("results", []):
+                    name = r.get("name")
+                    status = r.get("status")
+                    msg = r.get("message", "")
+                    icon = "✅" if status == "success" else "❌"
+                    res_lines.append(f"{icon} *{name}*: {msg}")
+
+                await query.edit_message_text("\n".join(res_lines), parse_mode="Markdown")
+            except Exception as exc:
+                await query.edit_message_text(f"❌ Order placement failed: {exc}")
+
+        elif action == "back_to_positions":
+            await query.edit_message_text("⏳ Reloading positions...")
+            try:
+                msg_text, keyboard = self._format_positions_data()
+                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+                await query.edit_message_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
+            except Exception as exc:
+                await query.edit_message_text(f"❌ Error reloading positions: {exc}")
+
+        elif action == "confirm_exit":
             symbol = data[1]
             confirm_text = (
                 f"🚨 *Market Exit Confirmation*\n\n"

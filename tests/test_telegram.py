@@ -77,8 +77,7 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         update.message.reply_text.assert_called_once()
         args, kwargs = update.message.reply_text.call_args
         self.assertIn("ZK8719", args[0])
-        self.assertIn("NIFTY2670722200PE", args[0])
-        self.assertIn("Market Exit: NIFTY2670722200PE", kwargs["reply_markup"].inline_keyboard[0][0].text)
+        self.assertIn("NIFTY2670722200PE", kwargs["reply_markup"].inline_keyboard[0][0].text)
 
     async def test_orders_command(self):
         # Mock client responses

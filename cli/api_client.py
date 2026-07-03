@@ -30,6 +30,7 @@ class KCLIClient:
 
     def __init__(self, accounts: list[dict]) -> None:
         self._accounts = accounts
+        self.accounts = accounts
         self._api_keys = [a.get("api_key", "") for a in accounts]
         # Eagerly init all accounts in parallel (restores saved sessions if available)
         def init_one(acct):

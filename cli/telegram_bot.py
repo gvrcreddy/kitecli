@@ -144,6 +144,7 @@ class KCLITelegramBot:
 
         msg_lines = [
             f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})",
+            "_*Format:* Symbol  •  Qty  •  Avg → LTP_",
             "👇 _Select a position below to Modify or Exit:_"
         ]
 
@@ -154,9 +155,10 @@ class KCLITelegramBot:
             avg = pos.get("average_price", 0.0)
             ltp = pos.get("last_price", 0.0)
 
-            # The entire row of data is contained in the interactive button
+            # Keep it under 45 chars to prevent mobile truncation
+            btn_text = f"🔹 {sym}  •  {qty}  •  {avg:.2f} → {ltp:.2f}"
             btn = InlineKeyboardButton(
-                f"🔹 {sym}  •  Qty: {qty}  •  Avg: {avg:.2f}  •  LTP: {ltp:.2f}",
+                btn_text,
                 callback_data=f"select_pos:{sym}:{api_key}:{qty}:{avg:.2f}:{ltp:.2f}"
             )
             keyboard_rows.append([btn])

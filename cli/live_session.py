@@ -287,6 +287,8 @@ class KCLILiveSession:
         self.websocket_connected = {a["api_key"]: False for a in accounts if a.get("api_key")}
         self.subscribed_tokens = set()
         self.ws_ltp_cache: dict[int, float] = {}
+        self._refresh_in_progress = False
+        self._refresh_pending = False
         # Throttle state for noisy per-account WebSocket close/error logging.
         self._ws_log_throttle = {}
 
@@ -1391,106 +1393,153 @@ class KCLILiveSession:
             self.subscribed_tokens.difference_update(to_unsubscribe)
 
     async def _trigger_immediate_refresh(self) -> None:
-        """Trigger an immediate fetch of positions, orders, margins, and indices from Zerodha."""
-        api_keys = [acct["api_key"] for acct in self.accounts]
+        """Trigger an immediate fetch of positions, orders, margins, and indices from Zerodha.
+        Uses a debounced non-overlapping loop to prevent concurrent API execution.
+        """
+        if getattr(self, "_refresh_in_progress", False):
+            self._refresh_pending = True
+            return
 
-        # Fetch positions, margins, orders, and indices concurrently.
-        positions_task = self._run_api_call(self.client.get_positions, api_keys)
-        margins_task   = self._run_api_call(self.client.get_margins, api_keys)
-        orders_task    = self._run_api_call(self.client.get_orders, api_keys)
-        indices_task   = self._run_api_call(self.client.get_market_indices)
-
-        response, margins_resp, orders_resp, indices_resp = await asyncio.gather(
-            positions_task, margins_task, orders_task, indices_task,
-            return_exceptions=True,
-        )
-
-        # Merge margin data into the positions response so the renderer
-        # can display it without a separate lookup.
-        if isinstance(margins_resp, dict):
-            margin_map = {m["api_key"]: m for m in margins_resp.get("accounts", [])}
-            self.margins_by_api_key = margin_map
-            if isinstance(response, dict):
-                for acct in response.get("accounts", []):
-                    key = acct.get("api_key", "")
-                    m = margin_map.get(key, {})
-                    acct["margin_net"]  = m.get("net")
-                    acct["margin_cash"] = m.get("cash")
-
-        if isinstance(response, dict):
-            # Re-apply cached real-time WebSocket LTPs to prevent regressing to stale REST data.
-            for acct in response.get("accounts", []):
-                for pos in acct.get("positions", []):
-                    pos_token = pos.get("instrument_token")
-                    if pos_token is not None:
-                        t_int = int(pos_token)
-                        if t_int in self.ws_ltp_cache:
-                            cached_ltp = self.ws_ltp_cache[t_int]
-                            pos["last_price"] = cached_ltp
-                            qty = pos.get("quantity", 0)
-                            if qty != 0:
-                                avg_price = pos.get("average_price", 0.0)
-                                pos["pnl"] = (cached_ltp - avg_price) * qty
-                                if avg_price > 0:
-                                    pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
-                                else:
-                                    pos["pnl_pct"] = 0.0
-                acct["total_pnl"] = sum(p.get("pnl", 0.0) for p in acct.get("positions", []))
-
-            self.last_positions_response = response
-            self._positions_version = getattr(self, "_positions_version", 0) + 1
-
-            self.active_positions = []
-            self.position_id_map = {}
-            pos_idx = 1
-            new_tokens = set()
-            for acct in response.get("accounts", []):
-                for pos in acct.get("positions", []):
-                    if pos.get("quantity", 0) != 0:
-                        pos["api_key"] = acct.get("api_key")
-                        pos["account_name"] = acct.get("name")
-                        # Annotate with lot size so the display layer can show lots.
-                        # get_nfo_lot_sizes() returns the kite_manager internal cache
-                        # after the first fetch — no repeated API calls.
-                        sym = pos.get("tradingsymbol", "")
-                        lot_size = self.client.get_nfo_lot_sizes().get(sym, 1)
-                        pos["lot_size"] = lot_size
-                        pos["lots"] = pos.get("quantity", 0) / lot_size
-                        self.active_positions.append(pos)
-                        self.position_id_map[pos_idx] = pos
-                        pos_idx += 1
-                        if pos.get("instrument_token"):
-                            new_tokens.add(int(pos["instrument_token"]))
-
-            self._update_subscriptions(new_tokens)
-
-            # Record position snapshots to database
-            if hasattr(self, "recorder"):
-                for acct in response.get("accounts", []):
-                    api_key = acct.get("api_key", "")
-                    user_id = self.api_key_to_user_id.get(api_key, "UNKNOWN")
-                    positions = acct.get("positions", [])
-                    self.recorder.enqueue_positions(positions, self.index_values, user_id)
-
-        if isinstance(orders_resp, dict):
-            self.last_orders_response = orders_resp
-            self._last_pending_text  = self._render_orders_pane(orders_resp, "orders_pending")
-            self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
-            if self.info_mode in ("orders_pending", "orders_executed"):
-                self._update_info_buffer(reset_scroll=False)
-
-        # Indices REST snapshot (WebSocket ticks keep these live thereafter).
+        self._refresh_in_progress = True
+        self._refresh_pending = False
         try:
-            if isinstance(indices_resp, dict) and indices_resp.get("status") == "success":
-                self.index_values["nifty"]  = indices_resp.get("nifty")
-                self.index_values["sensex"] = indices_resp.get("sensex")
-                self.index_values["vix"]    = indices_resp.get("vix")
-                self.market_indices_control.text = self._render_indices_html()
-            elif isinstance(indices_resp, dict):
-                msg = indices_resp.get("message", "Unknown error")
-                self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices: {msg}</style>")
-        except Exception as exc:
-            self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices Error: {exc}</style>")
+            while True:
+                api_keys = [acct["api_key"] for acct in self.accounts]
+
+                # Fetch positions, margins, orders, and indices concurrently.
+                positions_task = self._run_api_call(self.client.get_positions, api_keys)
+                margins_task   = self._run_api_call(self.client.get_margins, api_keys)
+                orders_task    = self._run_api_call(self.client.get_orders, api_keys)
+                indices_task   = self._run_api_call(self.client.get_market_indices)
+
+                response, margins_resp, orders_resp, indices_resp = await asyncio.gather(
+                    positions_task, margins_task, orders_task, indices_task,
+                    return_exceptions=True,
+                )
+
+                # Guard and carry-forward individual account failures to prevent empty sections on error
+                if isinstance(response, dict) and "accounts" in response:
+                    old_response = getattr(self, "last_positions_response", None)
+                    old_accounts_map = {}
+                    if isinstance(old_response, dict):
+                        old_accounts_map = {
+                            acct.get("api_key"): acct
+                            for acct in old_response.get("accounts", [])
+                        }
+                    
+                    for acct in response.get("accounts", []):
+                        api_key = acct.get("api_key")
+                        status = acct.get("status", "")
+                        # If this specific account failed REST fetch, carry forward its previous positions
+                        if status.startswith("error") or status == "unauthenticated":
+                            old_acct = old_accounts_map.get(api_key)
+                            if old_acct:
+                                acct["positions"] = old_acct.get("positions", [])
+                                acct["total_pnl"] = old_acct.get("total_pnl", 0.0)
+                                # Override the error status to keep it from clearing
+                                acct["status"] = old_acct.get("status", "success")
+
+                # Merge margin data into the positions response so the renderer
+                # can display it without a separate lookup.
+                if isinstance(margins_resp, dict):
+                    margin_map = {m["api_key"]: m for m in margins_resp.get("accounts", [])}
+                    # Keep old margin data if the current one has error or is missing
+                    for k, old_m in getattr(self, "margins_by_api_key", {}).items():
+                        if k not in margin_map or margin_map[k].get("status", "").startswith("error"):
+                            margin_map[k] = old_m
+                    self.margins_by_api_key = margin_map
+                    if isinstance(response, dict):
+                        for acct in response.get("accounts", []):
+                            key = acct.get("api_key", "")
+                            m = margin_map.get(key, {})
+                            acct["margin_net"]  = m.get("net")
+                            acct["margin_cash"] = m.get("cash")
+
+                if isinstance(response, dict):
+                    # Re-apply cached real-time WebSocket LTPs to prevent regressing to stale REST data.
+                    for acct in response.get("accounts", []):
+                        for pos in acct.get("positions", []):
+                            pos_token = pos.get("instrument_token")
+                            if pos_token is not None:
+                                t_int = int(pos_token)
+                                if t_int in self.ws_ltp_cache:
+                                    cached_ltp = self.ws_ltp_cache[t_int]
+                                    pos["last_price"] = cached_ltp
+                                    qty = pos.get("quantity", 0)
+                                    if qty != 0:
+                                        avg_price = pos.get("average_price", 0.0)
+                                        pos["pnl"] = (cached_ltp - avg_price) * qty
+                                        if avg_price > 0:
+                                            pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
+                                        else:
+                                            pos["pnl_pct"] = 0.0
+                        acct["total_pnl"] = sum(p.get("pnl", 0.0) for p in acct.get("positions", []))
+
+                    self.last_positions_response = response
+                    self._positions_version = getattr(self, "_positions_version", 0) + 1
+
+                    self.active_positions = []
+                    self.position_id_map = {}
+                    pos_idx = 1
+                    new_tokens = set()
+                    for acct in response.get("accounts", []):
+                        for pos in acct.get("positions", []):
+                            if pos.get("quantity", 0) != 0:
+                                pos["api_key"] = acct.get("api_key")
+                                pos["account_name"] = acct.get("name")
+                                # Annotate with lot size so the display layer can show lots.
+                                sym = pos.get("tradingsymbol", "")
+                                lot_size = self.client.get_nfo_lot_sizes().get(sym, 1)
+                                pos["lot_size"] = lot_size
+                                pos["lots"] = pos.get("quantity", 0) / lot_size
+                                self.active_positions.append(pos)
+                                self.position_id_map[pos_idx] = pos
+                                pos_idx += 1
+                                if pos.get("instrument_token"):
+                                    new_tokens.add(int(pos["instrument_token"]))
+
+                    self._update_subscriptions(new_tokens)
+
+                    # Record position snapshots to database
+                    if hasattr(self, "recorder"):
+                        for acct in response.get("accounts", []):
+                            api_key = acct.get("api_key", "")
+                            user_id = self.api_key_to_user_id.get(api_key, "UNKNOWN")
+                            positions = acct.get("positions", [])
+                            self.recorder.enqueue_positions(positions, self.index_values, user_id)
+
+                if isinstance(orders_resp, dict):
+                    self.last_orders_response = orders_resp
+                    self._last_pending_text  = self._render_orders_pane(orders_resp, "orders_pending")
+                    self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
+                    if self.info_mode in ("orders_pending", "orders_executed"):
+                        self._update_info_buffer(reset_scroll=False)
+
+                # Indices REST snapshot (WebSocket ticks keep these live thereafter).
+                try:
+                    if isinstance(indices_resp, dict) and indices_resp.get("status") == "success":
+                        self.index_values["nifty"]  = indices_resp.get("nifty")
+                        self.index_values["sensex"] = indices_resp.get("sensex")
+                        self.index_values["vix"]    = indices_resp.get("vix")
+                        self.market_indices_control.text = self._render_indices_html()
+                    elif isinstance(indices_resp, dict):
+                        msg = indices_resp.get("message", "Unknown error")
+                        self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices: {msg}</style>")
+                except Exception as exc:
+                    self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices Error: {exc}</style>")
+
+                # Force UI rendering updates on main thread
+                if hasattr(self, "app") and self.app and self.app.loop:
+                    self.app.loop.call_soon_threadsafe(self._update_display_and_invalidate)
+
+                # Debounce: check if a new request was queued during our run
+                if getattr(self, "_refresh_pending", False):
+                    self._refresh_pending = False
+                    continue
+                else:
+                    break
+        finally:
+            self._refresh_in_progress = False
 
     def resolve_symbol(self, input_sym: str) -> tuple[str | None, str | None, str | None]:
         """Resolve a symbol against current active positions.

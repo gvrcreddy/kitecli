@@ -75,6 +75,48 @@ def clean_option_symbol(symbol: str) -> str:
     return symbol
 
 
+class PrettyTable:
+    """ASCII table generator mimicking PrettyTable."""
+    def __init__(self) -> None:
+        self.field_names: list[str] = []
+        self.rows: list[list[str]] = []
+
+    def add_row(self, row: list[str]) -> None:
+        self.rows.append(row)
+
+    def get_string(self) -> str:
+        if not self.field_names:
+            return ""
+        # Calculate max widths
+        col_widths = [len(h) for h in self.field_names]
+        for row in self.rows:
+            for i, val in enumerate(row):
+                col_widths[i] = max(col_widths[i], len(str(val)))
+
+        # Border separator
+        border = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+        
+        lines = [border]
+        # Centered header row
+        header_row = "|" + "|".join(f" {h:^{col_widths[i]}} " for i, h in enumerate(self.field_names)) + "|"
+        lines.append(header_row)
+        lines.append(border)
+
+        # Left-align symbol (col 0), right-align other numeric columns
+        for row in self.rows:
+            parts = []
+            for i, val in enumerate(row):
+                val_str = str(val)
+                if i == 0:
+                    parts.append(f" {val_str:<{col_widths[i]}} ")
+                else:
+                    parts.append(f" {val_str:>{col_widths[i]}} ")
+            lines.append("|" + "|".join(parts) + "|")
+
+        lines.append(border)
+        return "\n".join(lines)
+
+
 class KCLITelegramBot:
     """Telegram Bot wrapper for KCLIClient."""
 
@@ -171,27 +213,41 @@ class KCLITelegramBot:
         positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
 
         pnl_sign = "+" if total_pnl >= 0 else ""
-        msg_lines = [
-            f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})",
-            "_*Format:* Symbol  •  Qty  •  Avg → LTP_",
-            "👇 _Select a position below to Modify or Exit:_"
-        ]
+        if not positions:
+            return f"✅ No active open positions for *{name}*.", []
+
+        # Construct beautiful ASCII PrettyTable
+        table = PrettyTable()
+        table.field_names = ["Symbol", "Qty", "Avg", "LTP"]
 
         keyboard_rows = []
+        current_row = []
         for pos in positions:
             sym = pos.get("tradingsymbol", "")
             qty = pos.get("quantity", 0)
             avg = pos.get("average_price", 0.0)
             ltp = pos.get("last_price", 0.0)
 
-            # Keep it under 45 chars to prevent mobile truncation
             display_sym = clean_option_symbol(sym)
-            btn_text = f"{display_sym}  •  {qty}  •  {avg:.2f} → {ltp:.2f}"
+            table.add_row([display_sym, str(qty), f"{avg:.2f}", f"{ltp:.2f}"])
+
             btn = InlineKeyboardButton(
-                btn_text,
+                display_sym,
                 callback_data=f"select_pos:{sym}:{api_key}:{qty}:{avg:.2f}:{ltp:.2f}"
             )
-            keyboard_rows.append([btn])
+            current_row.append(btn)
+            if len(current_row) == 2:
+                keyboard_rows.append(current_row)
+                current_row = []
+
+        if current_row:
+            keyboard_rows.append(current_row)
+
+        msg_lines = [
+            f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})",
+            f"```\n{table.get_string()}\n```",
+            "👇 _Select a position to Modify or Exit:_"
+        ]
         return "\n".join(msg_lines), keyboard_rows
 
     @restrict_user

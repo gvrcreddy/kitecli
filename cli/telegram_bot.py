@@ -125,7 +125,7 @@ class KCLITelegramBot:
             await update.message.reply_text(f"❌ Failed to fetch status: {exc}")
 
     def _format_positions_data(self) -> tuple[str, list[list[InlineKeyboardButton]]]:
-        """Fetch and format positions into a single message text and inline keyboard markup."""
+        """Fetch and format positions into a spacious row-wise layout with a compact selection grid."""
         api_keys = [acct["api_key"] for acct in self.client.accounts]
         pos_resp = self.client.get_positions(api_keys)
         accounts_data = pos_resp.get("accounts", [])
@@ -135,9 +135,14 @@ class KCLITelegramBot:
 
         msg_lines = []
         keyboard_rows = []
+        flat_active_positions = []
+        
+        # Color indicators for accounts
+        emojis = ["🟩", "🟦", "🟪", "🟧", "🟨", "🟥"]
         has_any_positions = False
+        pos_index = 1
 
-        for acct in accounts_data:
+        for idx_acct, acct in enumerate(accounts_data):
             name = acct.get("name", "Account")
             api_key = acct.get("api_key")
             total_pnl = acct.get("total_pnl", 0.0)
@@ -148,30 +153,48 @@ class KCLITelegramBot:
 
             has_any_positions = True
             pnl_sign = "+" if total_pnl >= 0 else ""
-            msg_lines.append(f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})")
-            msg_lines.append("`Symbol             Qty     Avg     LTP`")
-
+            acct_emoji = emojis[idx_acct % len(emojis)]
+            
+            msg_lines.append(f"{acct_emoji} *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})")
+            
             for pos in positions:
                 sym = pos.get("tradingsymbol", "")
                 qty = pos.get("quantity", 0)
                 avg = pos.get("average_price", 0.0)
                 ltp = pos.get("last_price", 0.0)
                 
-                # Table format columns: Symbol (18 left), Qty (5 right), Avg (7 right), LTP (7 right)
-                row_str = f"`{sym:<18} {qty:>5} {avg:>7.2f} {ltp:>7.2f}`"
-                msg_lines.append(row_str)
+                # Spacious row format
+                msg_lines.append(f"{pos_index}. *{sym}*")
+                msg_lines.append(f"   Qty: `{qty}` | Avg: `{avg:.2f}` | LTP: `{ltp:.2f}`")
                 
-                # Add inline keyboard button to select this position
-                keyboard_rows.append([
-                    InlineKeyboardButton(
-                        f"📍 {name} | {sym} ({qty})",
-                        callback_data=f"select_pos:{sym}:{api_key}:{qty}"
-                    )
-                ])
+                flat_active_positions.append({
+                    "index": pos_index,
+                    "symbol": sym,
+                    "api_key": api_key,
+                    "quantity": qty,
+                    "average_price": avg,
+                    "last_price": ltp
+                })
+                pos_index += 1
+                
             msg_lines.append("") # blank line between accounts
 
         if not has_any_positions:
             return "✅ No active open positions across any accounts.", []
+
+        # Create a grid of index number buttons (5 columns per row)
+        current_row = []
+        for p in flat_active_positions:
+            btn = InlineKeyboardButton(
+                str(p["index"]),
+                callback_data=f"select_pos:{p['symbol']}:{p['api_key']}:{p['quantity']}:{p['average_price']:.2f}:{p['last_price']:.2f}"
+            )
+            current_row.append(btn)
+            if len(current_row) == 5:
+                keyboard_rows.append(current_row)
+                current_row = []
+        if current_row:
+            keyboard_rows.append(current_row)
 
         return "\n".join(msg_lines), keyboard_rows
 
@@ -405,6 +428,8 @@ class KCLITelegramBot:
             symbol = data[1]
             api_key = data[2]
             qty = int(data[3])
+            avg = float(data[4]) if len(data) > 4 else 0.0
+            ltp = float(data[5]) if len(data) > 5 else 0.0
             
             acct_name = "Account"
             for acct in self.client.accounts:
@@ -415,7 +440,9 @@ class KCLITelegramBot:
             msg = (
                 f"🎯 *Selected Position:* `{symbol}`\n"
                 f"• *Account:* `{acct_name}`\n"
-                f"• *Current Qty:* `{qty}`\n\n"
+                f"• *Current Qty:* `{qty}`\n"
+                f"• *Average Price:* `{avg:.2f}`\n"
+                f"• *LTP:* `{ltp:.2f}`\n\n"
                 f"Choose an action:"
             )
             

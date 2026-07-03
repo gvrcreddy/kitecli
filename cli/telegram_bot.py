@@ -125,7 +125,7 @@ class KCLITelegramBot:
             await update.message.reply_text(f"❌ Failed to fetch status: {exc}")
 
     def _format_positions_data(self) -> tuple[str, list[list[InlineKeyboardButton]]]:
-        """Fetch and format positions into a spacious row-wise layout with a compact selection grid."""
+        """Fetch and format positions into clean aligned monospaced tables with symbol buttons."""
         api_keys = [acct["api_key"] for acct in self.client.accounts]
         pos_resp = self.client.get_positions(api_keys)
         accounts_data = pos_resp.get("accounts", [])
@@ -140,7 +140,6 @@ class KCLITelegramBot:
         # Color indicators for accounts
         emojis = ["🟩", "🟦", "🟪", "🟧", "🟨", "🟥"]
         has_any_positions = False
-        pos_index = 1
 
         for idx_acct, acct in enumerate(accounts_data):
             name = acct.get("name", "Account")
@@ -157,40 +156,44 @@ class KCLITelegramBot:
             
             msg_lines.append(f"{acct_emoji} *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})")
             
+            # Start code block for aligned monospace table
+            msg_lines.append("```")
+            header = f"{'Symbol':<18} {'Qty':>6} {'Avg':>7} {'LTP':>7}"
+            msg_lines.append(header)
+            
             for pos in positions:
                 sym = pos.get("tradingsymbol", "")
                 qty = pos.get("quantity", 0)
                 avg = pos.get("average_price", 0.0)
                 ltp = pos.get("last_price", 0.0)
                 
-                # Spacious row format
-                msg_lines.append(f"{pos_index}. *{sym}*")
-                msg_lines.append(f"   Qty: `{qty}` | Avg: `{avg:.2f}` | LTP: `{ltp:.2f}`")
+                row_str = f"{sym:<18} {qty:>6} {avg:>7.2f} {ltp:>7.2f}"
+                msg_lines.append(row_str)
                 
                 flat_active_positions.append({
-                    "index": pos_index,
                     "symbol": sym,
                     "api_key": api_key,
                     "quantity": qty,
                     "average_price": avg,
                     "last_price": ltp
                 })
-                pos_index += 1
-                
+            
+            # Close code block
+            msg_lines.append("```")
             msg_lines.append("") # blank line between accounts
 
         if not has_any_positions:
             return "✅ No active open positions across any accounts.", []
 
-        # Create a grid of index number buttons (5 columns per row)
+        # Create a 2-column grid of symbol buttons
         current_row = []
         for p in flat_active_positions:
             btn = InlineKeyboardButton(
-                str(p["index"]),
+                p["symbol"],
                 callback_data=f"select_pos:{p['symbol']}:{p['api_key']}:{p['quantity']}:{p['average_price']:.2f}:{p['last_price']:.2f}"
             )
             current_row.append(btn)
-            if len(current_row) == 5:
+            if len(current_row) == 2:
                 keyboard_rows.append(current_row)
                 current_row = []
         if current_row:

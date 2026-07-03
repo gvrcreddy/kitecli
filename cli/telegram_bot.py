@@ -125,7 +125,7 @@ class KCLITelegramBot:
             await update.message.reply_text(f"❌ Failed to fetch status: {exc}")
 
     def _format_account_positions(self, api_key: str) -> tuple[str, list[list[InlineKeyboardButton]]]:
-        """Fetch and format positions for a specific account into an interactive button table."""
+        """Fetch and format positions for a specific account into a clean monospaced table and separate matching buttons."""
         pos_resp = self.client.get_positions([api_key])
         accounts = pos_resp.get("accounts", [])
         if not accounts:
@@ -137,31 +137,43 @@ class KCLITelegramBot:
         positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
 
         pnl_sign = "+" if total_pnl >= 0 else ""
-        msg_text = f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})"
+        msg_lines = [f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})"]
 
         if not positions:
             return f"✅ No active open positions for *{name}*.", []
 
-        # Table header row button
-        keyboard_rows = [
-            [InlineKeyboardButton("Symbol  |  Qty  |  Avg  |  LTP", callback_data="noop")]
-        ]
+        # Format perfectly aligned monospace table inside a code block
+        msg_lines.append("```")
+        header = f"  {'Symbol':<18} {'Qty':>6} {'Avg':>7} {'LTP':>7}"
+        msg_lines.append(header)
+
+        keyboard_rows = []
+        current_row = []
         for pos in positions:
             sym = pos.get("tradingsymbol", "")
             qty = pos.get("quantity", 0)
             avg = pos.get("average_price", 0.0)
             ltp = pos.get("last_price", 0.0)
             
-            # Formatted readable row label with visual click indicator
-            label = f"🔹 {sym}  |  {qty}  |  {avg:.2f}  |  {ltp:.2f}"
-            keyboard_rows.append([
-                InlineKeyboardButton(
-                    label,
-                    callback_data=f"select_pos:{sym}:{api_key}:{qty}:{avg:.2f}:{ltp:.2f}"
-                )
-            ])
+            # Row string with neat pointer indicator (aligned perfectly with header)
+            row_str = f"> {sym:<18} {qty:>6} {avg:>7.2f} {ltp:>7.2f}"
+            msg_lines.append(row_str)
 
-        return msg_text, keyboard_rows
+            # Interactive button for this symbol
+            btn = InlineKeyboardButton(
+                f"🔹 {sym}",
+                callback_data=f"select_pos:{sym}:{api_key}:{qty}:{avg:.2f}:{ltp:.2f}"
+            )
+            current_row.append(btn)
+            if len(current_row) == 2:
+                keyboard_rows.append(current_row)
+                current_row = []
+
+        if current_row:
+            keyboard_rows.append(current_row)
+
+        msg_lines.append("```")
+        return "\n".join(msg_lines), keyboard_rows
 
     @restrict_user
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

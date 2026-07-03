@@ -142,37 +142,24 @@ class KCLITelegramBot:
         if not positions:
             return f"✅ No active open positions for *{name}*.", []
 
-        # Format perfectly aligned monospace table inside a code block
-        msg_lines.append("```")
-        header = f"  {'Symbol':<18} {'Qty':>6} {'Avg':>7} {'LTP':>7}"
-        msg_lines.append(header)
+        msg_lines = [
+            f"📊 *{name}* (P&L: {pnl_sign}₹{total_pnl:.2f})",
+            "👇 _Select a position below to Modify or Exit:_"
+        ]
 
         keyboard_rows = []
-        current_row = []
         for pos in positions:
             sym = pos.get("tradingsymbol", "")
             qty = pos.get("quantity", 0)
             avg = pos.get("average_price", 0.0)
             ltp = pos.get("last_price", 0.0)
-            
-            # Row string with neat pointer indicator (aligned perfectly with header)
-            row_str = f"> {sym:<18} {qty:>6} {avg:>7.2f} {ltp:>7.2f}"
-            msg_lines.append(row_str)
 
-            # Interactive button for this symbol
+            # The entire row of data is contained in the interactive button
             btn = InlineKeyboardButton(
-                f"🔹 {sym}",
+                f"🔹 {sym}  •  Qty: {qty}  •  Avg: {avg:.2f}  •  LTP: {ltp:.2f}",
                 callback_data=f"select_pos:{sym}:{api_key}:{qty}:{avg:.2f}:{ltp:.2f}"
             )
-            current_row.append(btn)
-            if len(current_row) == 2:
-                keyboard_rows.append(current_row)
-                current_row = []
-
-        if current_row:
-            keyboard_rows.append(current_row)
-
-        msg_lines.append("```")
+            keyboard_rows.append([btn])
         return "\n".join(msg_lines), keyboard_rows
 
     @restrict_user

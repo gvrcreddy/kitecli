@@ -424,7 +424,7 @@ class KCLITelegramBot:
                     InlineKeyboardButton("➕ Add More", callback_data=f"confirm_add_more:{symbol}:{api_key}:{qty}")
                 ],
                 [
-                    InlineKeyboardButton("🔙 Back to Positions", callback_data="back_to_positions")
+                    InlineKeyboardButton("🔙 Back to Positions", callback_data=f"back_to_positions:{api_key}")
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)

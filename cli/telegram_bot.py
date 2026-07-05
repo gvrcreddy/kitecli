@@ -529,18 +529,26 @@ class KCLITelegramBot:
         update: Update,
         context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Common logic to parse and place buy/sell orders."""
+        """Common logic to parse and place buy/sell orders, supporting optional @account routing."""
         args = context.args
         if not args or len(args) < 2:
             await update.message.reply_text(
                 f"❌ Invalid syntax. Use:\n"
-                f"`/{transaction_type.lower()} <SYMBOL> <QTY> [LIMIT_PRICE]`\n\n"
+                f"`/{transaction_type.lower()} <SYMBOL> <QTY> [LIMIT_PRICE] [@ACCOUNT_NAME]`\n\n"
                 f"_Examples:_\n"
-                f"• `/{transaction_type.lower()} NIFTY2670722200PE 50` (Market)\n"
-                f"• `/{transaction_type.lower()} NIFTY2670722200PE 50 85.20` (Limit)",
+                f"• `/{transaction_type.lower()} NIFTY2670722200PE 50` (Market, All Accounts)\n"
+                f"• `/{transaction_type.lower()} NIFTY2670722200PE 50 85.20 @ZK8719` (Limit, ZK8719 only)",
                 parse_mode="Markdown"
             )
             return
+
+        # Check for optional target account prefixed with '@'
+        target_account_name = None
+        for arg in args:
+            if arg.startswith("@") and len(arg) > 1:
+                target_account_name = arg[1:]
+                args = [a for a in args if a != arg]
+                break
 
         symbol = args[0].upper()
         try:
@@ -553,7 +561,6 @@ class KCLITelegramBot:
         order_type = "MARKET"
         if len(args) >= 3:
             try:
-                # Support both raw float and leading '@' price prefix
                 price_str = args[2].lstrip("@")
                 price = float(price_str)
                 order_type = "LIMIT"
@@ -566,6 +573,23 @@ class KCLITelegramBot:
         if len(symbol) <= 6:
             exchange = "NSE"
 
+        # Resolve target account
+        target_key = "ALL"
+        display_target = "ALL authenticated accounts"
+        if target_account_name:
+            resolved_acct = None
+            for acct in self.client.accounts:
+                if acct.get("name") == target_account_name or acct.get("api_key") == target_account_name:
+                    resolved_acct = acct
+                    break
+            if not resolved_acct:
+                await update.message.reply_text(
+                    f"❌ Account '{target_account_name}' not found in configuration."
+                )
+                return
+            target_key = resolved_acct["api_key"]
+            display_target = f"account *{resolved_acct.get('name', target_key)}*"
+
         confirm_text = (
             f"🛒 *Confirm {transaction_type} Order*\n\n"
             f"• *Symbol*: `{symbol}`\n"
@@ -575,9 +599,9 @@ class KCLITelegramBot:
         if price is not None:
             confirm_text += f"\n• *Price*: `{price:.2f}`"
 
-        confirm_text += "\n\nPlace this order across *ALL* authenticated accounts?"
+        confirm_text += f"\n\nPlace this order on {display_target}?"
 
-        callback_payload = f"do_place:{transaction_type}:{symbol}:{qty}:{order_type}:{exchange}"
+        callback_payload = f"do_place:{transaction_type}:{symbol}:{qty}:{order_type}:{exchange}:{target_key}"
         if price is not None:
             callback_payload += f":{price}"
 
@@ -887,11 +911,16 @@ class KCLITelegramBot:
             qty = int(data[3])
             ord_type = data[4]
             exchange = data[5]
-            price = float(data[6]) if len(data) > 6 else None
+            target_key = data[6]
+            price = float(data[7]) if len(data) > 7 else None
 
             await query.edit_message_text(f"⏳ Placing `{ord_type}` `{tx_type}` orders for `{symbol}`...")
             try:
-                api_keys = [acct["api_key"] for acct in self.client.accounts]
+                if target_key == "ALL":
+                    api_keys = [acct["api_key"] for acct in self.client.accounts]
+                else:
+                    api_keys = [target_key]
+
                 res = self.client.place_order(
                     api_keys=api_keys,
                     tradingsymbol=symbol,

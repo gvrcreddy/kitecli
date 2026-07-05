@@ -131,7 +131,7 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         args, kwargs = update.message.reply_text.call_args
         self.assertIn("Confirm BUY Order", args[0])
         self.assertIn("MARKET", args[0])
-        self.assertIn("do_place:BUY:NIFTY2670722200PE:50:MARKET:NFO", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+        self.assertIn("do_place:BUY:NIFTY2670722200PE:50:MARKET:NFO:ALL", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
 
     async def test_buy_command_limit(self):
         # Mock Update
@@ -149,7 +149,31 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         args, kwargs = update.message.reply_text.call_args
         self.assertIn("LIMIT", args[0])
         self.assertIn("85.20", args[0])
-        self.assertIn("do_place:BUY:NIFTY2670722200PE:50:LIMIT:NFO:85.2", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+        self.assertIn("do_place:BUY:NIFTY2670722200PE:50:LIMIT:NFO:ALL:85.2", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+
+    async def test_buy_command_single_account(self):
+        # Mock Update
+        update = MagicMock()
+        update.effective_chat.id = ALLOWED_CHAT_ID
+        update.message.reply_text = AsyncMock()
+
+        # Mock target account ZK8719
+        self.bot.client.accounts = [
+            {"name": "ZK8719", "api_key": "api_zk"}
+        ]
+
+        # Mock Context with command arguments including @ZK8719 target account
+        context = MagicMock()
+        context.args = ["NIFTY2670722200PE", "50", "85.20", "@ZK8719"]
+
+        await self.bot.cmd_buy(update, context)
+
+        update.message.reply_text.assert_called_once()
+        args, kwargs = update.message.reply_text.call_args
+        self.assertIn("LIMIT", args[0])
+        self.assertIn("85.20", args[0])
+        self.assertIn("ZK8719", args[0]) # Make sure resolved target shows in confirmation text
+        self.assertIn("do_place:BUY:NIFTY2670722200PE:50:LIMIT:NFO:api_zk:85.2", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
 
     async def test_init_command_manual_login(self):
         self.client.init_accounts.return_value = {

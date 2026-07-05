@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import re
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, BotCommand
@@ -152,6 +153,7 @@ class KCLITelegramBot:
         self.app.add_handler(CommandHandler("modify", self.cmd_modify))
         self.app.add_handler(CommandHandler("init", self.cmd_init))
         self.app.add_handler(CommandHandler("token", self.cmd_token))
+        self.app.add_handler(CommandHandler("kcli", self.cmd_kcli))
 
         # Inline button handlers
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
@@ -163,6 +165,7 @@ class KCLITelegramBot:
             BotCommand("status", "Check account connection status"),
             BotCommand("init", "Initialize account sessions and get login links"),
             BotCommand("token", "Complete login: /token <account_name> <token>"),
+            BotCommand("kcli", "Execute any kcli CLI command: /kcli <args>"),
             BotCommand("buy", "Place buy order: /buy <symbol> <qty> [price]"),
             BotCommand("sell", "Place sell order: /sell <symbol> <qty> [price]"),
             BotCommand("modify", "Modify pending order: /modify <order_id> <qty> <price>"),
@@ -324,6 +327,61 @@ class KCLITelegramBot:
                 f"❌ *{name}* login failed: {exc}",
                 parse_mode="Markdown"
             )
+
+    @restrict_user
+    async def cmd_kcli(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Run a kcli CLI command and return the output."""
+        args = context.args
+        
+        import os
+        import sys
+        import subprocess
+        
+        cli_main_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+        
+        env = os.environ.copy()
+        env["NO_COLOR"] = "1"
+        env["TERM"] = "dumb"
+        
+        arg_str = " ".join(args)
+        loading_msg = await update.message.reply_text(f"⏳ Executing `kcli {arg_str}`...")
+        
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, cli_main_path] + args,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=15.0
+            )
+            
+            output = result.stdout + result.stderr
+            if not output.strip():
+                output = "(No output returned by command)"
+                
+            await loading_msg.delete()
+            
+            if len(output) > 4000:
+                output = output[:3900] + "\n... (truncated due to length)"
+                
+            await update.message.reply_text(
+                f"💻 *kcli output:*\n```\n{output}\n```",
+                reply_markup=get_main_menu_keyboard(),
+                parse_mode="Markdown"
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
+            await update.message.reply_text("❌ Command execution timed out (exceeded 15 seconds).")
+        except Exception as exc:
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
+            await update.message.reply_text(f"❌ Execution failed: {exc}")
 
     def _format_account_positions(self, api_key: str) -> tuple[str, list[list[InlineKeyboardButton]]]:
         """Fetch and format positions for a specific account into a clean monospaced table and separate matching buttons."""

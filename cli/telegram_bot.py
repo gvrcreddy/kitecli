@@ -1,7 +1,7 @@
 import logging
 import re
 from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -156,6 +156,18 @@ class KCLITelegramBot:
         # Inline button handlers
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
 
+        # Register slash commands in the Bot command menu
+        await self.app.bot.set_my_commands([
+            BotCommand("positions", "View and manage active positions"),
+            BotCommand("orders", "View and cancel pending orders"),
+            BotCommand("status", "Check account connection status"),
+            BotCommand("init", "Initialize account sessions and get login links"),
+            BotCommand("token", "Complete login: /token <account_name> <token>"),
+            BotCommand("buy", "Place buy order: /buy <symbol> <qty> [price]"),
+            BotCommand("sell", "Place sell order: /sell <symbol> <qty> [price]"),
+            BotCommand("modify", "Modify pending order: /modify <order_id> <qty> <price>"),
+        ])
+
         logger.info("Initializing Telegram bot application...")
         await self.app.initialize()
         logger.info("Starting Telegram bot polling...")
@@ -179,7 +191,9 @@ class KCLITelegramBot:
             "*Core Commands:*\n"
             "• `/positions` (or `/pos`) - Display open positions & exit buttons\n"
             "• `/orders` - View pending orders & modify/cancel options\n"
-            "• `/status` - Check account authentication status\n\n"
+            "• `/status` - Check account authentication status\n"
+            "• `/init` - Initialize account sessions & get login links\n"
+            "• `/token <account> <token>` - Complete manual login\n\n"
             "*Trade Commands:*\n"
             "• `/buy <symbol> <qty> [price]` - Place a market or limit buy order\n"
             "• `/sell <symbol> <qty> [price]` - Place a market or limit sell order\n"

@@ -151,5 +151,45 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         self.assertIn("85.20", args[0])
         self.assertIn("do_place:BUY:NIFTY2670722200PE:50:LIMIT:NFO:85.2", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
 
+    async def test_init_command_manual_login(self):
+        self.client.init_accounts.return_value = {
+            "accounts": [
+                {
+                    "name": "ZK8719",
+                    "api_key": "api_zk",
+                    "auto_logged_in": False,
+                    "message": "Manual login required",
+                    "login_url": "http://mock_login_url"
+                }
+            ]
+        }
+        update = MagicMock()
+        update.effective_chat.id = ALLOWED_CHAT_ID
+        update.message.reply_text = AsyncMock()
+
+        await self.bot.cmd_init(update, MagicMock())
+
+        calls = [call[0][0] for call in update.message.reply_text.call_args_list]
+        self.assertTrue(any("requires manual authentication" in msg for msg in calls))
+
+    async def test_token_command(self):
+        self.bot.client.accounts = [
+            {"name": "ZK8719", "api_key": "api_zk"}
+        ]
+        self.client.complete_callback.return_value = {"status": "success"}
+
+        update = MagicMock()
+        update.effective_chat.id = ALLOWED_CHAT_ID
+        update.message.reply_text = AsyncMock()
+
+        context = MagicMock()
+        context.args = ["ZK8719", "mock_token_123"]
+
+        await self.bot.cmd_token(update, context)
+
+        self.client.complete_callback.assert_called_once_with("api_zk", "mock_token_123")
+        calls = [call[0][0] for call in update.message.reply_text.call_args_list]
+        self.assertTrue(any("authenticated successfully" in msg for msg in calls))
+
 if __name__ == "__main__":
     unittest.main()

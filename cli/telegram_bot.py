@@ -79,7 +79,7 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
     """Returns a persistent ReplyKeyboardMarkup containing the main slash commands."""
     keyboard = [
         ["/positions", "/orders"],
-        ["/status", "/help"]
+        ["/status", "/init"]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
@@ -150,6 +150,8 @@ class KCLITelegramBot:
         self.app.add_handler(CommandHandler("buy", self.cmd_buy))
         self.app.add_handler(CommandHandler("sell", self.cmd_sell))
         self.app.add_handler(CommandHandler("modify", self.cmd_modify))
+        self.app.add_handler(CommandHandler("init", self.cmd_init))
+        self.app.add_handler(CommandHandler("token", self.cmd_token))
 
         # Inline button handlers
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
@@ -209,6 +211,105 @@ class KCLITelegramBot:
             await update.message.reply_text("\n".join(msg_lines), reply_markup=get_main_menu_keyboard(), parse_mode="Markdown")
         except Exception as exc:
             await update.message.reply_text(f"❌ Failed to fetch status: {exc}")
+
+    @restrict_user
+    async def cmd_init(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Initialise accounts and attempt auto-login or provide manual login links."""
+        try:
+            loading_msg = await update.message.reply_text("⏳ Initialising accounts and checking session status...")
+            
+            # Auto-login or request logins
+            result = self.client.init_accounts(self.client.accounts)
+            accounts = result.get("accounts", [])
+            
+            for acct in accounts:
+                name = acct.get("name", "Account")
+                api_key = acct.get("api_key", "")
+                auto_logged_in = acct.get("auto_logged_in", False)
+                msg = acct.get("message", "")
+                login_url = acct.get("login_url", "")
+                
+                if auto_logged_in:
+                    await update.message.reply_text(
+                        f"✅ *{name}*: Session active / Auto-login successful!\n`{msg}`",
+                        reply_markup=get_main_menu_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    # Manual login needed
+                    instruction = (
+                        f"🔑 *{name}* requires manual authentication:\n\n"
+                        f"1. [Click here to Login]({login_url})\n"
+                        f"2. Copy the `request_token` from the redirect URL.\n"
+                        f"3. Send it back to the bot by replying with:\n"
+                        f"`/token {name} <token>`"
+                    )
+                    await update.message.reply_text(
+                        instruction,
+                        reply_markup=get_main_menu_keyboard(),
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+            await loading_msg.delete()
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Initialization failed: {exc}", reply_markup=get_main_menu_keyboard())
+
+    @restrict_user
+    async def cmd_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle request_token callback completion."""
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text(
+                "❌ Invalid format. Please use:\n`/token <account_name_or_api_key> <request_token>`",
+                parse_mode="Markdown"
+            )
+            return
+            
+        target_name = args[0]
+        request_token = args[1]
+        
+        target_account = None
+        for acct in self.client.accounts:
+            if acct.get("name") == target_name or acct.get("api_key") == target_name:
+                target_account = acct
+                break
+                
+        if not target_account:
+            await update.message.reply_text(
+                f"❌ Account '{target_name}' not found in configuration.",
+                parse_mode="Markdown"
+            )
+            return
+            
+        api_key = target_account.get("api_key")
+        name = target_account.get("name", api_key)
+        
+        loading_msg = await update.message.reply_text(f"⏳ Completing login for *{name}*...", parse_mode="Markdown")
+        
+        try:
+            resp = self.client.complete_callback(api_key, request_token.strip())
+            await loading_msg.delete()
+            if resp.get("status") == "error":
+                await update.message.reply_text(
+                    f"❌ *{name}* authentication failed: {resp.get('message', 'Callback failed')}",
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ *{name}* authenticated successfully! Session is now active.",
+                    reply_markup=get_main_menu_keyboard(),
+                    parse_mode="Markdown"
+                )
+        except Exception as exc:
+            if 'loading_msg' in locals():
+                try:
+                    await loading_msg.delete()
+                except Exception:
+                    pass
+            await update.message.reply_text(
+                f"❌ *{name}* login failed: {exc}",
+                parse_mode="Markdown"
+            )
 
     def _format_account_positions(self, api_key: str) -> tuple[str, list[list[InlineKeyboardButton]]]:
         """Fetch and format positions for a specific account into a clean monospaced table and separate matching buttons."""

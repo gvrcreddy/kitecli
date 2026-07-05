@@ -215,30 +215,30 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         calls = [call[0][0] for call in update.message.reply_text.call_args_list]
         self.assertTrue(any("authenticated successfully" in msg for msg in calls))
 
-    @patch("subprocess.run")
-    async def test_kcli_command(self, mock_run):
-        mock_res = MagicMock()
-        mock_res.stdout = "Positions: NIFTY"
-        mock_res.stderr = ""
-        mock_run.return_value = mock_res
+    async def test_kcli_command(self):
+        self.bot.client.accounts = [
+            {"name": "ZK8719", "api_key": "api_zk"}
+        ]
+        self.client.place_order.return_value = {
+            "results": [{"name": "ZK8719", "status": "success", "message": "Order placed successfully"}]
+        }
 
         update = MagicMock()
         update.effective_chat.id = ALLOWED_CHAT_ID
         update.message.reply_text = AsyncMock()
         
-        # mock reply_text returning a MagicMock that represents loading_msg
         loading_msg = MagicMock()
         loading_msg.delete = AsyncMock()
         update.message.reply_text.return_value = loading_msg
 
         context = MagicMock()
-        context.args = ["positions"]
+        context.args = ["account", "ZK8719", "&&", "sell", "NIFTY2670722200PE", "50"]
 
         await self.bot.cmd_kcli(update, context)
 
-        mock_run.assert_called_once()
+        self.client.place_order.assert_called_once()
         calls = [call[0][0] for call in update.message.reply_text.call_args_list]
-        self.assertTrue(any("Positions: NIFTY" in msg for msg in calls))
+        self.assertTrue(any("Order placed successfully" in msg for msg in calls))
 
 if __name__ == "__main__":
     unittest.main()

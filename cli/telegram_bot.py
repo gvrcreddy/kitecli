@@ -330,57 +330,164 @@ class KCLITelegramBot:
 
     @restrict_user
     async def cmd_kcli(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Run a kcli CLI command and return the output."""
-        args = context.args
+        """Run a TUI-like command (e.g. 'account ZK8719 && sell NIFTY2670722200PE 50' or 'exit 1') and return output."""
+        raw_text = " ".join(context.args).strip()
+        if not raw_text:
+            await update.message.reply_text("❌ Usage: `/kcli <TUI_commands>`\nExample: `/kcli account ZK8719 && sell NIFTY2670722200PE 50`", parse_mode="Markdown")
+            return
+            
+        loading_msg = await update.message.reply_text(f"⏳ Executing kcli command: `{raw_text}`...")
         
-        import os
-        import sys
-        import subprocess
+        # Split commands by '&&'
+        sub_commands = [c.strip() for c in raw_text.split("&&") if c.strip()]
         
-        cli_main_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
-        
-        env = os.environ.copy()
-        env["NO_COLOR"] = "1"
-        env["TERM"] = "dumb"
-        
-        arg_str = " ".join(args)
-        loading_msg = await update.message.reply_text(f"⏳ Executing `kcli {arg_str}`...")
+        selected_account_key = "ALL"
+        output_lines = []
         
         try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                [sys.executable, cli_main_path] + args,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=15.0
-            )
-            
-            output = result.stdout + result.stderr
-            if not output.strip():
-                output = "(No output returned by command)"
+            for sub_cmd in sub_commands:
+                parts = [p.strip() for p in sub_cmd.split() if p.strip()]
+                if not parts:
+                    continue
+                primary = parts[0].lower()
                 
+                # 1. Account selection: account <name>
+                if primary in ("account", "acct", "a"):
+                    if len(parts) < 2:
+                        raise ValueError("Usage: account <name|all>")
+                    target_name = parts[1]
+                    if target_name.lower() in ("none", "clear", "null", "all"):
+                        selected_account_key = "ALL"
+                        output_lines.append("Account selection cleared (targeting all accounts).")
+                    else:
+                        resolved_acct = None
+                        for acct in self.client.accounts:
+                            if acct.get("name") == target_name or acct.get("api_key") == target_name:
+                                resolved_acct = acct
+                                break
+                        if not resolved_acct:
+                            raise ValueError(f"Account '{target_name}' not found.")
+                        selected_account_key = resolved_acct["api_key"]
+                        output_lines.append(f"Selected account: {resolved_acct.get('name', selected_account_key)}")
+                
+                # 2. Buy/Sell: buy/sell <symbol> <qty> [price]
+                elif primary in ("buy", "sell"):
+                    if len(parts) < 3:
+                        raise ValueError(f"Usage: {primary} <symbol> <qty> [price]")
+                    symbol = parts[1].upper()
+                    
+                    try:
+                        qty = int(parts[2])
+                    except ValueError:
+                        raise ValueError("Quantity must be an integer.")
+                        
+                    price = None
+                    order_type = "MARKET"
+                    if len(parts) >= 4:
+                        try:
+                            price = float(parts[3])
+                            order_type = "LIMIT"
+                        except ValueError:
+                            raise ValueError("Price must be a valid number.")
+                            
+                    exchange = "NFO" if len(symbol) > 6 else "NSE"
+                    
+                    # Resolve api keys
+                    api_keys = [selected_account_key] if selected_account_key != "ALL" else [a["api_key"] for a in self.client.accounts]
+                    
+                    output_lines.append(f"Placing {order_type} {primary.upper()} for {symbol} (Qty: {qty})...")
+                    res = self.client.place_order(
+                        api_keys=api_keys,
+                        tradingsymbol=symbol,
+                        exchange=exchange,
+                        transaction_type=primary.upper(),
+                        quantity=qty,
+                        order_type=order_type,
+                        price=price
+                    )
+                    for r in res.get("results", []):
+                        icon = "✅" if r.get("status") == "success" else "❌"
+                        output_lines.append(f"  {icon} {r.get('name')}: {r.get('message', 'Success')}")
+                
+                # 3. Exit: exit <symbol|id> [price]
+                elif primary == "exit":
+                    if len(parts) < 2:
+                        raise ValueError("Usage: exit <symbol|id|all> [price]")
+                    target = parts[1]
+                    
+                    price = None
+                    if len(parts) >= 3:
+                        try:
+                            price = float(parts[2])
+                        except ValueError:
+                            raise ValueError("Price must be a valid number.")
+                            
+                    # Resolve exit targets
+                    api_keys = [selected_account_key] if selected_account_key != "ALL" else [a["api_key"] for a in self.client.accounts]
+                    
+                    symbol_to_exit = None
+                    if target.isdigit():
+                        pos_id = int(target)
+                        pos_resp = self.client.get_positions(api_keys)
+                        all_positions = []
+                        for acct in pos_resp.get("accounts", []):
+                            for p in acct.get("positions", []):
+                                if p.get("quantity", 0) != 0:
+                                    all_positions.append(p)
+                                    
+                        if pos_id <= 0 or pos_id > len(all_positions):
+                            raise ValueError(f"Position ID {pos_id} not found.")
+                        symbol_to_exit = all_positions[pos_id - 1]["tradingsymbol"]
+                        api_keys = [all_positions[pos_id - 1]["api_key"]]
+                    else:
+                        symbol_to_exit = target if target.lower() != "all" else None
+                        
+                    output_lines.append(f"Exiting position: {target} (Price: {price if price else 'MARKET'})...")
+                    res = self.client.exit_positions(
+                        api_keys=api_keys,
+                        symbol=symbol_to_exit,
+                        price=price
+                    )
+                    for r in res.get("results", []):
+                        icon = "✅" if r.get("status") == "success" else "❌"
+                        output_lines.append(f"  {icon} {r.get('name')}: {r.get('message', 'Success')}")
+
+                # 4. Status
+                elif primary == "status":
+                    res = self.client.get_status()
+                    output_lines.append("🔌 Account Status:")
+                    for acct in res.get("accounts", []):
+                        icon = "🟢" if acct.get("authenticated") else "🔴"
+                        output_lines.append(f"  {icon} {acct.get('name')}: {'Active' if acct.get('authenticated') else 'Inactive'}")
+
+                # 5. Positions / Pos
+                elif primary in ("positions", "pos"):
+                    res = self.client.get_positions([selected_account_key] if selected_account_key != "ALL" else None)
+                    for acct in res.get("accounts", []):
+                        output_lines.append(f"📊 Account: {acct.get('name')} (P&L: {acct.get('total_pnl', 0.0):.2f})")
+                        positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
+                        if not positions:
+                            output_lines.append("  No open positions.")
+                        else:
+                            for p in positions:
+                                sym = clean_option_symbol(p.get("tradingsymbol"))
+                                output_lines.append(f"  • {sym} | Qty: {p.get('quantity')} | Avg: {p.get('average_price'):.2f} | LTP: {p.get('last_price'):.2f}")
+                                
+                else:
+                    raise ValueError(f"Unsupported command '{primary}' in /kcli.")
+                    
             await loading_msg.delete()
+            final_output = "\n".join(output_lines)
+            if len(final_output) > 4000:
+                final_output = final_output[:3900] + "\n... (truncated)"
+            await update.message.reply_text(f"💻 *kcli output:*\n```\n{final_output}\n```", parse_mode="Markdown")
             
-            if len(output) > 4000:
-                output = output[:3900] + "\n... (truncated due to length)"
-                
-            await update.message.reply_text(
-                f"💻 *kcli output:*\n```\n{output}\n```",
-                reply_markup=get_main_menu_keyboard(),
-                parse_mode="Markdown"
-            )
-        except subprocess.TimeoutExpired:
-            try:
-                await loading_msg.delete()
-            except Exception:
-                pass
-            await update.message.reply_text("❌ Command execution timed out (exceeded 15 seconds).")
         except Exception as exc:
-            try:
-                await loading_msg.delete()
-            except Exception:
-                pass
+            if 'loading_msg' in locals():
+                try:
+                    await loading_msg.delete()
+                except Exception:
+                    pass
             await update.message.reply_text(f"❌ Execution failed: {exc}")
 
     def _format_account_positions(self, api_key: str) -> tuple[str, list[list[InlineKeyboardButton]]]:

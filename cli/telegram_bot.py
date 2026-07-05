@@ -17,9 +17,6 @@ from cli.api_client import KCLIClient
 logger = logging.getLogger("kcli.bot")
 
 # User ID to strictly restrict access to
-ALLOWED_CHAT_ID = 462942994
-
-
 def restrict_user(func):
     """Decorator to ensure only the allowed user can access the bot commands/actions."""
     async def wrapper(*args, **kwargs):
@@ -31,10 +28,14 @@ def restrict_user(func):
         elif len(args) == 2:
             update = args[0]
 
+        # Resolve the target chat_id from the bot instance (self is the first arg in method decorators)
+        bot_instance = args[0]
+        allowed_chat_id = getattr(bot_instance, "chat_id", None)
+
         if not update or not getattr(update, "effective_chat", None):
             return
         chat_id = update.effective_chat.id
-        if chat_id != ALLOWED_CHAT_ID:
+        if allowed_chat_id is None or chat_id != allowed_chat_id:
             logger.warning(f"Blocked unauthorized message/action from Chat ID: {chat_id}")
             # Silently ignore to avoid exposing the bot to scanners
             return
@@ -131,7 +132,7 @@ class PrettyTable:
 class KCLITelegramBot:
     """Telegram Bot wrapper for KCLIClient."""
 
-    def __init__(self, client: KCLIClient, token: str, chat_id: int = ALLOWED_CHAT_ID) -> None:
+    def __init__(self, client: KCLIClient, token: str, chat_id: int) -> None:
         self.client = client
         self.token = token
         self.chat_id = chat_id

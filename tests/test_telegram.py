@@ -5,7 +5,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Ensure project root is in path
 sys.path.append("/Users/vgolugur/Documents/Projects/kitecli")
 
-from cli.telegram_bot import KCLITelegramBot, restrict_user, ALLOWED_CHAT_ID
+from cli.telegram_bot import KCLITelegramBot, restrict_user
+
+# Test mock chat ID
+ALLOWED_CHAT_ID = 462942994
 
 class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
 
@@ -14,7 +17,7 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         self.client.accounts = [
             {"name": "ZK8719", "api_key": "api_zk", "user_id": "ZK8719"}
         ]
-        self.bot = KCLITelegramBot(self.client, token="fake_token")
+        self.bot = KCLITelegramBot(self.client, token="fake_token", chat_id=ALLOWED_CHAT_ID)
 
     async def test_security_gate_authorized(self):
         # Create an authorized mock Update
@@ -23,12 +26,12 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         
         called = False
         @restrict_user
-        async def mock_handler(up, ctx):
+        async def mock_handler(self_bot, up, ctx):
             nonlocal called
             called = True
             return True
 
-        await mock_handler(update, MagicMock())
+        await mock_handler(self.bot, update, MagicMock())
         self.assertTrue(called)
 
     async def test_security_gate_unauthorized(self):
@@ -38,12 +41,12 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         
         called = False
         @restrict_user
-        async def mock_handler(up, ctx):
+        async def mock_handler(self_bot, up, ctx):
             nonlocal called
             called = True
             return True
 
-        await mock_handler(update, MagicMock())
+        await mock_handler(self.bot, update, MagicMock())
         self.assertFalse(called)
 
     async def test_positions_command(self):

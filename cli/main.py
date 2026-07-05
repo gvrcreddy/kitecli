@@ -300,9 +300,16 @@ def bot_cmd(
             "  Please configure it in ~/.kcli/config.yaml under a `telegram:` section, or pass it via `--token`."
         )
         raise typer.Exit(code=1)
+
+    if not resolved_chat_id:
+        display_error(
+            "Authorized Telegram Chat ID not provided.\n"
+            "  Please configure it in ~/.kcli/config.yaml under `telegram: chat_id`, pass it via `--chat-id`, or set the `TELEGRAM_CHAT_ID` environment variable."
+        )
+        raise typer.Exit(code=1)
         
     try:
-        resolved_chat_id = int(resolved_chat_id) if resolved_chat_id else 462942994
+        resolved_chat_id = int(resolved_chat_id)
     except ValueError:
         display_error("Chat ID must be a numeric value.")
         raise typer.Exit(code=1)

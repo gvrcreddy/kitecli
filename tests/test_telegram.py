@@ -130,11 +130,12 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
 
         await self.bot.cmd_buy(update, context)
 
-        update.message.reply_text.assert_called_once()
-        args, kwargs = update.message.reply_text.call_args
-        self.assertIn("Confirm BUY Order", args[0])
+        self.assertEqual(update.message.reply_text.call_count, 2)
+        # Check confirmation call
+        args, kwargs = update.message.reply_text.call_args_list[1]
+        self.assertIn("Confirm BUY order", args[0])
         self.assertIn("MARKET", args[0])
-        self.assertIn("do_place:BUY:NIFTY2670722200PE:50:MARKET:NFO:ALL", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+        self.assertIn("do_exec_cmd:ALL:buy NIFTY2670722200PE 50", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
 
     async def test_buy_command_limit(self):
         # Mock Update
@@ -148,11 +149,12 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
 
         await self.bot.cmd_buy(update, context)
 
-        update.message.reply_text.assert_called_once()
-        args, kwargs = update.message.reply_text.call_args
-        self.assertIn("LIMIT", args[0])
+        self.assertEqual(update.message.reply_text.call_count, 2)
+        # Check confirmation call
+        args, kwargs = update.message.reply_text.call_args_list[1]
+        self.assertIn("Confirm BUY order", args[0])
         self.assertIn("85.20", args[0])
-        self.assertIn("do_place:BUY:NIFTY2670722200PE:50:LIMIT:NFO:ALL:85.2", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+        self.assertIn("do_exec_cmd:ALL:buy NIFTY2670722200PE 50 85.2", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
 
     async def test_buy_command_single_account(self):
         # Mock Update
@@ -171,12 +173,12 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
 
         await self.bot.cmd_buy(update, context)
 
-        update.message.reply_text.assert_called_once()
-        args, kwargs = update.message.reply_text.call_args
-        self.assertIn("LIMIT", args[0])
+        self.assertEqual(update.message.reply_text.call_count, 2)
+        # Check confirmation call
+        args, kwargs = update.message.reply_text.call_args_list[1]
+        self.assertIn("Confirm BUY order", args[0])
         self.assertIn("85.20", args[0])
-        self.assertIn("ZK8719", args[0]) # Make sure resolved target shows in confirmation text
-        self.assertIn("do_place:BUY:NIFTY2670722200PE:50:LIMIT:NFO:api_zk:85.2", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+        self.assertIn("do_exec_cmd:0:buy NIFTY2670722200PE 50 85.2", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
 
     async def test_init_command_manual_login(self):
         self.client.init_accounts.return_value = {
@@ -218,14 +220,8 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         calls = [call[0][0] for call in update.message.reply_text.call_args_list]
         self.assertTrue(any("authenticated successfully" in msg for msg in calls))
 
-    async def test_kcli_command(self):
-        self.bot.client.accounts = [
-            {"name": "ZK8719", "api_key": "api_zk"}
-        ]
-        self.client.place_order.return_value = {
-            "results": [{"name": "ZK8719", "status": "success", "message": "Order placed successfully"}]
-        }
-
+    async def test_cmd_command(self):
+        # 1. Test command parsing and confirmation prompt
         update = MagicMock()
         update.effective_chat.id = ALLOWED_CHAT_ID
         update.message.reply_text = AsyncMock()
@@ -237,11 +233,228 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
         context = MagicMock()
         context.args = ["account", "ZK8719", "&&", "sell", "NIFTY2670722200PE", "50"]
 
-        await self.bot.cmd_kcli(update, context)
+        await self.bot.cmd_cmd(update, context)
 
+        # It should send the confirmation message
+        update.message.reply_text.assert_any_call(
+            "Confirm SELL order of 50 NIFTY2670722200PE (MARKET) (NRML)?",
+            reply_markup=unittest.mock.ANY,
+            parse_mode="Markdown"
+        )
+
+        # 2. Test callback query for execution after confirmation
+        query = AsyncMock()
+        query.data = "do_exec_cmd:0:sell NIFTY2670722200PE 50"
+        query.message = MagicMock()
+        query.message.chat_id = ALLOWED_CHAT_ID
+        query.edit_message_text = AsyncMock()
+        
+        update_cb = MagicMock()
+        update_cb.callback_query = query
+        update_cb.effective_chat.id = ALLOWED_CHAT_ID
+        
+        # Mock place_order return value
+        self.client.place_order.return_value = {
+            "results": [
+                {"name": "ZK8719", "status": "success", "message": "Order placed successfully"}
+            ]
+        }
+
+        await self.bot.handle_callback(update_cb, context)
         self.client.place_order.assert_called_once()
-        calls = [call[0][0] for call in update.message.reply_text.call_args_list]
-        self.assertTrue(any("Order placed successfully" in msg for msg in calls))
+
+    async def test_interactive_limit_exit(self):
+        # 1. Test confirmation displays the price selection grid
+        query = AsyncMock()
+        query.data = f"confirm_exit_single:NIFTY2670722200PE:api_zk:50:105.00"
+        query.message = MagicMock()
+        query.message.chat_id = ALLOWED_CHAT_ID
+        query.edit_message_text = AsyncMock()
+        
+        update = MagicMock()
+        update.callback_query = query
+        update.effective_chat.id = ALLOWED_CHAT_ID
+        
+        await self.bot.handle_callback(update, MagicMock())
+        
+        # Should edit text with exit selection prompt and buttons
+        query.edit_message_text.assert_called_once()
+        args, kwargs = query.edit_message_text.call_args
+        self.assertIn("Exit Price Selection", args[0])
+        self.assertIn("105.00", args[0])
+        self.assertEqual(kwargs["parse_mode"], "Markdown")
+        
+        # Verify button callbacks contain the price (e.g. do_exit_single:NIFTY...:105.00)
+        buttons = kwargs["reply_markup"].inline_keyboard
+        self.assertIn("Limit @ 105.00 (LTP)", buttons[0][0].text)
+        self.assertIn("do_exit_single:NIFTY2670722200PE:0:105.00", buttons[0][0].callback_data)
+        
+        # 2. Test limit exit execution after callback selection
+        query_exec = AsyncMock()
+        query_exec.data = f"do_exit_single:NIFTY2670722200PE:0:105.00"
+        query_exec.message = MagicMock()
+        query_exec.message.chat_id = ALLOWED_CHAT_ID
+        query_exec.edit_message_text = AsyncMock()
+        
+        update_exec = MagicMock()
+        update_exec.callback_query = query_exec
+        update_exec.effective_chat.id = ALLOWED_CHAT_ID
+        
+        self.client.exit_positions.return_value = {
+            "results": [{"name": "ZK8719", "status": "success", "message": "Order placed successfully"}]
+        }
+        
+        await self.bot.handle_callback(update_exec, MagicMock())
+        self.client.exit_positions.assert_called_once_with(["api_zk"], tradingsymbol="NIFTY2670722200PE", price=105.00)
+        
+        # 3. Test Custom Price Prompt trigger (ForceReply message)
+        query_prompt = AsyncMock()
+        query_prompt.data = f"prompt_custom_price:NIFTY2670722200PE:0"
+        query_prompt.message = MagicMock()
+        query_prompt.message.chat_id = ALLOWED_CHAT_ID
+        query_prompt.message.reply_text = AsyncMock()
+        query_prompt.answer = AsyncMock()
+        
+        update_prompt = MagicMock()
+        update_prompt.callback_query = query_prompt
+        update_prompt.effective_chat.id = ALLOWED_CHAT_ID
+        
+        await self.bot.handle_callback(update_prompt, MagicMock())
+        query_prompt.message.reply_text.assert_called_once()
+        self.assertIn("Enter custom limit price for `NIFTY2670722200PE`", query_prompt.message.reply_text.call_args[0][0])
+        query_prompt.answer.assert_called_once()
+        
+        # 4. Test replying to ForceReply to execute limit order
+        msg_reply = MagicMock()
+        msg_reply.reply_to_message = MagicMock()
+        msg_reply.reply_to_message.text = "Enter custom limit price for `NIFTY2670722200PE` in reply to this message:"
+        msg_reply.text = "104.50"
+        msg_reply.reply_text = AsyncMock()
+        
+        update_msg = MagicMock()
+        update_msg.message = msg_reply
+        update_msg.effective_chat.id = ALLOWED_CHAT_ID
+        
+        self.client.get_positions.return_value = {
+            "accounts": [
+                {
+                    "api_key": "api_zk",
+                    "positions": [{"tradingsymbol": "NIFTY2670722200PE", "quantity": 50}]
+                }
+            ]
+        }
+        self.client.exit_positions.reset_mock()
+        self.client.exit_positions.return_value = {
+            "results": [{"name": "ZK8719", "status": "success", "message": "Order placed successfully"}]
+        }
+        
+        await self.bot.handle_message(update_msg, MagicMock())
+        self.client.exit_positions.assert_called_once_with(["api_zk"], tradingsymbol="NIFTY2670722200PE", price=104.50)
+
+    async def test_interactive_add_more(self):
+        # 1. Test confirmation displays the add more price selection grid
+        query = AsyncMock()
+        query.data = f"confirm_add_more:NIFTY2670722200PE:api_zk:50:105.00"
+        query.message = MagicMock()
+        query.message.chat_id = ALLOWED_CHAT_ID
+        query.edit_message_text = AsyncMock()
+        
+        update = MagicMock()
+        update.callback_query = query
+        update.effective_chat.id = ALLOWED_CHAT_ID
+        
+        await self.bot.handle_callback(update, MagicMock())
+        
+        # Should edit text with add more selection prompt and buttons
+        query.edit_message_text.assert_called_once()
+        args, kwargs = query.edit_message_text.call_args
+        self.assertIn("Add More Position Price Selection", args[0])
+        self.assertIn("105.00", args[0])
+        self.assertEqual(kwargs["parse_mode"], "Markdown")
+        
+        # Verify button callbacks contain the price (e.g. do_place_add:BUY:NIFTY...:50:NFO:0:105.00)
+        buttons = kwargs["reply_markup"].inline_keyboard
+        self.assertIn("Limit @ 105.00 (LTP)", buttons[0][0].text)
+        self.assertIn("do_place_add:BUY:NIFTY2670722200PE:50:NFO:0:105.00", buttons[0][0].callback_data)
+        
+        # 2. Test limit order execution for add more after callback selection
+        query_exec = AsyncMock()
+        query_exec.data = f"do_place_add:BUY:NIFTY2670722200PE:50:NFO:0:105.00"
+        query_exec.message = MagicMock()
+        query_exec.message.chat_id = ALLOWED_CHAT_ID
+        query_exec.edit_message_text = AsyncMock()
+        
+        update_exec = MagicMock()
+        update_exec.callback_query = query_exec
+        update_exec.effective_chat.id = ALLOWED_CHAT_ID
+        
+        self.client.place_order.reset_mock()
+        self.client.place_order.return_value = {
+            "results": [{"name": "ZK8719", "status": "success", "message": "Order placed successfully"}]
+        }
+        
+        await self.bot.handle_callback(update_exec, MagicMock())
+        self.client.place_order.assert_called_once_with(
+            api_keys=["api_zk"],
+            tradingsymbol="NIFTY2670722200PE",
+            exchange="NFO",
+            transaction_type="BUY",
+            quantity=50,
+            order_type="LIMIT",
+            price=105.00
+        )
+        
+        # 3. Test Custom Price Prompt trigger for Add More (ForceReply message)
+        query_prompt = AsyncMock()
+        query_prompt.data = f"prompt_custom_price_add:BUY:NIFTY2670722200PE:50:NFO:0"
+        query_prompt.message = MagicMock()
+        query_prompt.message.chat_id = ALLOWED_CHAT_ID
+        query_prompt.message.reply_text = AsyncMock()
+        query_prompt.answer = AsyncMock()
+        
+        update_prompt = MagicMock()
+        update_prompt.callback_query = query_prompt
+        update_prompt.effective_chat.id = ALLOWED_CHAT_ID
+        
+        await self.bot.handle_callback(update_prompt, MagicMock())
+        query_prompt.message.reply_text.assert_called_once()
+        self.assertIn("Enter custom limit price for adding `50` more to `NIFTY2670722200PE`", query_prompt.message.reply_text.call_args[0][0])
+        query_prompt.answer.assert_called_once()
+        
+        # 4. Test replying to ForceReply to execute limit order for Add More
+        msg_reply = MagicMock()
+        msg_reply.reply_to_message = MagicMock()
+        msg_reply.reply_to_message.text = "Enter custom limit price for adding `50` more to `NIFTY2670722200PE` (`BUY` segments: `NFO`):"
+        msg_reply.text = "104.50"
+        msg_reply.reply_text = AsyncMock()
+        
+        update_msg = MagicMock()
+        update_msg.message = msg_reply
+        update_msg.effective_chat.id = ALLOWED_CHAT_ID
+        
+        self.client.get_positions.return_value = {
+            "accounts": [
+                {
+                    "api_key": "api_zk",
+                    "positions": [{"tradingsymbol": "NIFTY2670722200PE", "quantity": 50}]
+                }
+            ]
+        }
+        self.client.place_order.reset_mock()
+        self.client.place_order.return_value = {
+            "results": [{"name": "ZK8719", "status": "success", "message": "Order placed successfully"}]
+        }
+        
+        await self.bot.handle_message(update_msg, MagicMock())
+        self.client.place_order.assert_called_once_with(
+            api_keys=["api_zk"],
+            tradingsymbol="NIFTY2670722200PE",
+            exchange="NFO",
+            transaction_type="BUY",
+            quantity=50,
+            order_type="LIMIT",
+            price=104.50
+        )
 
 if __name__ == "__main__":
     unittest.main()

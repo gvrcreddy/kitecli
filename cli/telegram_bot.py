@@ -12,6 +12,11 @@ from telegram.ext import (
     filters,
 )
 from cli.api_client import KCLIClient
+from cli.parser import (
+    parse_command_line, PlaceOrderCommand, ExitCommand,
+    CancelOrderCommand, ModifyOrderCommand
+)
+from cli.executor import ExecutionContext, execute_command
 
 # Configure logging
 logger = logging.getLogger("kcli.bot")
@@ -138,6 +143,24 @@ class KCLITelegramBot:
         self.chat_id = chat_id
         self.app = None
 
+    def _resolve_api_key(self, key_or_idx: str) -> str:
+        """Resolve a 32-character api_key from either a mock key, index, or the key itself."""
+        if key_or_idx.isdigit():
+            idx = int(key_or_idx)
+            if 0 <= idx < len(self.client.accounts):
+                return self.client.accounts[idx]["api_key"]
+        for acct in self.client.accounts:
+            if acct["api_key"] == key_or_idx or acct.get("name") == key_or_idx or acct.get("user_id") == key_or_idx:
+                return acct["api_key"]
+        return key_or_idx
+
+    def _get_acct_ref(self, api_key: str) -> str:
+        """Return the account index as a string if found, otherwise the api_key itself."""
+        for i, acct in enumerate(self.client.accounts):
+            if acct.get("api_key") == api_key:
+                return str(i)
+        return api_key
+
     async def start(self) -> None:
         """Start the Telegram bot loop."""
         self.app = ApplicationBuilder().token(self.token).build()
@@ -154,10 +177,13 @@ class KCLITelegramBot:
         self.app.add_handler(CommandHandler("modify", self.cmd_modify))
         self.app.add_handler(CommandHandler("init", self.cmd_init))
         self.app.add_handler(CommandHandler("token", self.cmd_token))
-        self.app.add_handler(CommandHandler("kcli", self.cmd_kcli))
+        self.app.add_handler(CommandHandler("kcli", self.cmd_cmd))
+        self.app.add_handler(CommandHandler("cmd", self.cmd_cmd))
+        self.app.add_handler(CommandHandler("cmd_kcli", self.cmd_cmd))
 
         # Inline button handlers
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
+        self.app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_message))
 
         # Register slash commands in the Bot command menu
         await self.app.bot.set_my_commands([
@@ -166,7 +192,7 @@ class KCLITelegramBot:
             BotCommand("status", "Check account connection status"),
             BotCommand("init", "Initialize account sessions and get login links"),
             BotCommand("token", "Complete login: /token <account_name> <token>"),
-            BotCommand("kcli", "Execute any kcli CLI command: /kcli <args>"),
+            BotCommand("cmd", "Execute any TUI command: /cmd <args>"),
             BotCommand("buy", "Place buy order: /buy <symbol> <qty> [price]"),
             BotCommand("sell", "Place sell order: /sell <symbol> <qty> [price]"),
             BotCommand("modify", "Modify pending order: /modify <order_id> <qty> <price>"),
@@ -329,159 +355,86 @@ class KCLITelegramBot:
                 parse_mode="Markdown"
             )
 
+    def serialize_cmd_to_text(self, cmd) -> str:
+        """Helper to serialize a Command object back to its string representation."""
+        if isinstance(cmd, PlaceOrderCommand):
+            parts = [cmd.action.lower(), cmd.symbol_or_id or "", cmd.quantity or ""]
+            if cmd.price is not None:
+                parts.append(str(cmd.price))
+            if cmd.product and cmd.product != "NRML":
+                if cmd.price is None:
+                    parts.append("0.0")  # Placeholder price
+                parts.append(cmd.product)
+            return " ".join([p for p in parts if p])
+        elif isinstance(cmd, ExitCommand):
+            parts = ["exit", cmd.target]
+            if cmd.price is not None:
+                parts.append(str(cmd.price))
+            return " ".join(parts)
+        elif isinstance(cmd, CancelOrderCommand):
+            return f"cancel {cmd.target}"
+        elif isinstance(cmd, ModifyOrderCommand):
+            return f"modify {cmd.order_id} {cmd.quantity} {cmd.price}"
+        return ""
+
     @restrict_user
-    async def cmd_kcli(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Run a TUI-like command (e.g. 'account ZK8719 && sell NIFTY2670722200PE 50' or 'exit 1') and return output."""
+    async def cmd_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Run a TUI-like command (e.g. 'account ZK8719 && sell NIFTY2670722200PE 50') and return output."""
         raw_text = " ".join(context.args).strip()
         if not raw_text:
-            await update.message.reply_text("❌ Usage: `/kcli <TUI_commands>`\nExample: `/kcli account ZK8719 && sell NIFTY2670722200PE 50`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Usage: `/cmd <TUI_commands>`\nExample: `/cmd account ZK8719 && sell NIFTY2670722200PE 50`", parse_mode="Markdown")
             return
             
-        loading_msg = await update.message.reply_text(f"⏳ Executing kcli command: `{raw_text}`...")
-        
-        # Split commands by '&&'
-        sub_commands = [c.strip() for c in raw_text.split("&&") if c.strip()]
-        
-        selected_account_key = "ALL"
-        output_lines = []
+        loading_msg = await update.message.reply_text(f"⏳ Executing command: `{raw_text}`...")
         
         try:
-            for sub_cmd in sub_commands:
-                parts = [p.strip() for p in sub_cmd.split() if p.strip()]
-                if not parts:
-                    continue
-                primary = parts[0].lower()
-                
-                # 1. Account selection: account <name>
-                if primary in ("account", "acct", "a"):
-                    if len(parts) < 2:
-                        raise ValueError("Usage: account <name|all>")
-                    target_name = parts[1]
-                    if target_name.lower() in ("none", "clear", "null", "all"):
-                        selected_account_key = "ALL"
-                        output_lines.append("Account selection cleared (targeting all accounts).")
-                    else:
-                        resolved_acct = None
-                        for acct in self.client.accounts:
-                            if acct.get("name") == target_name or acct.get("api_key") == target_name:
-                                resolved_acct = acct
-                                break
-                        if not resolved_acct:
-                            raise ValueError(f"Account '{target_name}' not found.")
-                        selected_account_key = resolved_acct["api_key"]
-                        output_lines.append(f"Selected account: {resolved_acct.get('name', selected_account_key)}")
-                
-                # 2. Buy/Sell: buy/sell <symbol> <qty> [price]
-                elif primary in ("buy", "sell"):
-                    if len(parts) < 3:
-                        raise ValueError(f"Usage: {primary} <symbol> <qty> [price]")
-                    symbol = parts[1].upper()
-                    
-                    try:
-                        qty = int(parts[2])
-                    except ValueError:
-                        raise ValueError("Quantity must be an integer.")
+            # Parse command(s)
+            parsed_cmds = parse_command_line(raw_text)
+            
+            # Fetch active positions to resolve position IDs
+            pos_resp = self.client.get_positions(None)
+            active_positions = []
+            position_id_map = {}
+            idx = 1
+            for acct in pos_resp.get("accounts", []):
+                for p in acct.get("positions", []):
+                    if p.get("quantity", 0) != 0:
+                        active_positions.append(p)
+                        position_id_map[idx] = p
+                        idx += 1
                         
-                    price = None
-                    order_type = "MARKET"
-                    if len(parts) >= 4:
-                        try:
-                            price = float(parts[3])
-                            order_type = "LIMIT"
-                        except ValueError:
-                            raise ValueError("Price must be a valid number.")
-                            
-                    exchange = "NFO" if len(symbol) > 6 else "NSE"
-                    
-                    # Resolve api keys
-                    api_keys = [selected_account_key] if selected_account_key != "ALL" else [a["api_key"] for a in self.client.accounts]
-                    
-                    output_lines.append(f"Placing {order_type} {primary.upper()} for {symbol} (Qty: {qty})...")
-                    res = self.client.place_order(
-                        api_keys=api_keys,
-                        tradingsymbol=symbol,
-                        exchange=exchange,
-                        transaction_type=primary.upper(),
-                        quantity=qty,
-                        order_type=order_type,
-                        price=price
-                    )
-                    for r in res.get("results", []):
-                        icon = "✅" if r.get("status") == "success" else "❌"
-                        output_lines.append(f"  {icon} {r.get('name')}: {r.get('message', 'Success')}")
-                
-                # 3. Exit: exit <symbol|id> [price]
-                elif primary == "exit":
-                    if len(parts) < 2:
-                        raise ValueError("Usage: exit <symbol|id|all> [price]")
-                    target = parts[1]
-                    
-                    price = None
-                    if len(parts) >= 3:
-                        try:
-                            price = float(parts[2])
-                        except ValueError:
-                            raise ValueError("Price must be a valid number.")
-                            
-                    # Resolve exit targets
-                    api_keys = [selected_account_key] if selected_account_key != "ALL" else [a["api_key"] for a in self.client.accounts]
-                    
-                    symbol_to_exit = None
-                    if target.isdigit():
-                        pos_id = int(target)
-                        pos_resp = self.client.get_positions(api_keys)
-                        all_positions = []
-                        for acct in pos_resp.get("accounts", []):
-                            for p in acct.get("positions", []):
-                                if p.get("quantity", 0) != 0:
-                                    all_positions.append(p)
-                                    
-                        if pos_id <= 0 or pos_id > len(all_positions):
-                            raise ValueError(f"Position ID {pos_id} not found.")
-                        symbol_to_exit = all_positions[pos_id - 1]["tradingsymbol"]
-                        api_keys = [all_positions[pos_id - 1]["api_key"]]
-                    else:
-                        symbol_to_exit = target if target.lower() != "all" else None
-                        
-                    output_lines.append(f"Exiting position: {target} (Price: {price if price else 'MARKET'})...")
-                    res = self.client.exit_positions(
-                        api_keys=api_keys,
-                        symbol=symbol_to_exit,
-                        price=price
-                    )
-                    for r in res.get("results", []):
-                        icon = "✅" if r.get("status") == "success" else "❌"
-                        output_lines.append(f"  {icon} {r.get('name')}: {r.get('message', 'Success')}")
-
-                # 4. Status
-                elif primary == "status":
-                    res = self.client.get_status()
-                    output_lines.append("🔌 Account Status:")
-                    for acct in res.get("accounts", []):
-                        icon = "🟢" if acct.get("authenticated") else "🔴"
-                        output_lines.append(f"  {icon} {acct.get('name')}: {'Active' if acct.get('authenticated') else 'Inactive'}")
-
-                # 5. Positions / Pos
-                elif primary in ("positions", "pos"):
-                    res = self.client.get_positions([selected_account_key] if selected_account_key != "ALL" else None)
-                    for acct in res.get("accounts", []):
-                        output_lines.append(f"📊 Account: {acct.get('name')} (P&L: {acct.get('total_pnl', 0.0):.2f})")
-                        positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
-                        if not positions:
-                            output_lines.append("  No open positions.")
-                        else:
-                            for p in positions:
-                                sym = clean_option_symbol(p.get("tradingsymbol"))
-                                output_lines.append(f"  • {sym} | Qty: {p.get('quantity')} | Avg: {p.get('average_price'):.2f} | LTP: {p.get('last_price'):.2f}")
-                                
+            # Execute commands sequentially in-process
+            exec_ctx = ExecutionContext(
+                client=self.client,
+                active_positions=active_positions,
+                position_id_map=position_id_map,
+                selected_account_key="ALL"
+            )
+            
+            output_lines = []
+            for cmd in parsed_cmds:
+                res = await execute_command(cmd, exec_ctx)
+                if res["status"] == "pending_confirmation":
+                    cmd_text = self.serialize_cmd_to_text(cmd)
+                    acct_ref = self._get_acct_ref(exec_ctx.selected_account_key)
+                    keyboard = [
+                        [
+                            InlineKeyboardButton("✅ Confirm", callback_data=f"do_exec_cmd:{acct_ref}:{cmd_text}"),
+                            InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")
+                        ]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await loading_msg.delete()
+                    await update.message.reply_text(res["message"], reply_markup=reply_markup, parse_mode="Markdown")
+                    return
                 else:
-                    raise ValueError(f"Unsupported command '{primary}' in /kcli.")
+                    output_lines.append(res["message"])
                     
             await loading_msg.delete()
             final_output = "\n".join(output_lines)
             if len(final_output) > 4000:
                 final_output = final_output[:3900] + "\n... (truncated)"
-            await update.message.reply_text(f"💻 *kcli output:*\n```\n{final_output}\n```", parse_mode="Markdown")
+            await update.message.reply_text(f"💻 *cmd output:*\n```\n{final_output}\n```", parse_mode="Markdown")
             
         except Exception as exc:
             if 'loading_msg' in locals():
@@ -522,9 +475,10 @@ class KCLITelegramBot:
             display_sym = clean_option_symbol(sym)
             table.add_row([display_sym, str(qty), f"{avg:.2f}", f"{ltp:.2f}"])
 
+            acct_ref = self._get_acct_ref(api_key)
             btn = InlineKeyboardButton(
                 display_sym,
-                callback_data=f"select_pos:{sym}:{api_key}:{qty}:{avg:.2f}:{ltp:.2f}"
+                callback_data=f"select_pos:{sym}:{acct_ref}:{qty}:{avg:.2f}:{ltp:.2f}"
             )
             current_row.append(btn)
             if len(current_row) == 2:
@@ -600,11 +554,12 @@ class KCLITelegramBot:
                         f"  *Price*: `{price}` | Status: `{status}`\n"
                     )
 
+                    acct_ref = self._get_acct_ref(api_key)
                     keyboard = [
                         [
                             InlineKeyboardButton(
                                 "Cancel Order",
-                                callback_data=f"confirm_cancel:{order_id}:{api_key}:{sym}"
+                                callback_data=f"confirm_cancel:{order_id}:{acct_ref}:{sym}"
                             ),
                             InlineKeyboardButton(
                                 "Modify Info",
@@ -658,69 +613,21 @@ class KCLITelegramBot:
                 args = [a for a in args if a != arg]
                 break
 
-        symbol = args[0].upper()
-        try:
-            qty = int(args[1])
-        except ValueError:
-            await update.message.reply_text("❌ Quantity must be an integer.")
-            return
+        symbol = args[0]
+        qty = args[1]
+        price = args[2] if len(args) >= 3 else None
 
-        price = None
-        order_type = "MARKET"
-        if len(args) >= 3:
-            try:
-                price_str = args[2].lstrip("@")
-                price = float(price_str)
-                order_type = "LIMIT"
-            except ValueError:
-                await update.message.reply_text("❌ Price must be a valid number.")
-                return
+        cmd_parts = [transaction_type.lower(), symbol, qty]
+        if price:
+            cmd_parts.append(price)
 
-        # Infer exchange (Nifty/Sensex options belong to NFO/BFO, indices/equities NSE)
-        exchange = "NFO"
-        if len(symbol) <= 6:
-            exchange = "NSE"
-
-        # Resolve target account
-        target_key = "ALL"
-        display_target = "ALL authenticated accounts"
+        cmd_str = " ".join(cmd_parts)
         if target_account_name:
-            resolved_acct = None
-            for acct in self.client.accounts:
-                if acct.get("name") == target_account_name or acct.get("api_key") == target_account_name:
-                    resolved_acct = acct
-                    break
-            if not resolved_acct:
-                await update.message.reply_text(
-                    f"❌ Account '{target_account_name}' not found in configuration."
-                )
-                return
-            target_key = resolved_acct["api_key"]
-            display_target = f"account *{resolved_acct.get('name', target_key)}*"
+            cmd_str = f"account {target_account_name} && {cmd_str}"
 
-        confirm_text = (
-            f"🛒 *Confirm {transaction_type} Order*\n\n"
-            f"• *Symbol*: `{symbol}`\n"
-            f"• *Quantity*: `{qty}`\n"
-            f"• *Type*: `{order_type}`"
-        )
-        if price is not None:
-            confirm_text += f"\n• *Price*: `{price:.2f}`"
-
-        confirm_text += f"\n\nPlace this order on {display_target}?"
-
-        callback_payload = f"do_place:{transaction_type}:{symbol}:{qty}:{order_type}:{exchange}:{target_key}"
-        if price is not None:
-            callback_payload += f":{price}"
-
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Confirm Order", callback_data=callback_payload),
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(confirm_text, reply_markup=reply_markup, parse_mode="Markdown")
+        # Delegate execution
+        context.args = cmd_str.split()
+        await self.cmd_cmd(update, context)
 
     @restrict_user
     async def cmd_modify(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -736,59 +643,9 @@ class KCLITelegramBot:
             )
             return
 
-        order_id = args[0]
-        try:
-            qty = int(args[1])
-        except ValueError:
-            await update.message.reply_text("❌ Quantity must be an integer.")
-            return
-
-        try:
-            price = float(args[2].lstrip("@"))
-        except ValueError:
-            await update.message.reply_text("❌ Price must be a valid number.")
-            return
-
-        # Find the order across accounts to determine api_key
-        api_keys = [acct["api_key"] for acct in self.client.accounts]
-        orders_resp = self.client.get_orders(api_keys)
-        accounts_data = orders_resp.get("accounts", [])
-
-        target_api_key = None
-        acct_name = ""
-        symbol = ""
-        for acct in accounts_data:
-            for o in acct.get("orders", []):
-                if o.get("order_id") == order_id:
-                    target_api_key = acct.get("api_key")
-                    acct_name = acct.get("name", "Account")
-                    symbol = o.get("tradingsymbol", "")
-                    break
-
-        if not target_api_key:
-            await update.message.reply_text(f"❌ Order `{order_id}` was not found in active pending orders.")
-            return
-
-        confirm_text = (
-            f"🔄 *Confirm Order Modification* | `{acct_name}`\n\n"
-            f"• *Symbol*: `{symbol}`\n"
-            f"• *Order ID*: `{order_id}`\n"
-            f"• *New Quantity*: `{qty}`\n"
-            f"• *New Price*: `{price:.2f}`\n\n"
-            f"Apply this modification?"
-        )
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "✅ Confirm Modify",
-                    callback_data=f"do_modify:{target_api_key}:{order_id}:{qty}:{price}"
-                ),
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(confirm_text, reply_markup=reply_markup, parse_mode="Markdown")
+        cmd_str = f"modify {args[0]} {args[1]} {args[2]}"
+        context.args = cmd_str.split()
+        await self.cmd_cmd(update, context)
 
     @restrict_user
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -799,9 +656,47 @@ class KCLITelegramBot:
         data = query.data.split(":")
         action = data[0]
 
-        if action == "select_pos":
+        if action == "do_exec_cmd":
+            acct_ref = data[1]
+            cmd_text = ":".join(data[2:])
+            await query.edit_message_text(f"⏳ Executing confirmed command: `{cmd_text}`...")
+            try:
+                parsed_cmds = parse_command_line(cmd_text)
+                for c in parsed_cmds:
+                    if hasattr(c, "confirmed"):
+                        c.confirmed = True
+                        
+                pos_resp = self.client.get_positions(None)
+                active_positions = []
+                position_id_map = {}
+                idx = 1
+                for acct in pos_resp.get("accounts", []):
+                    for p in acct.get("positions", []):
+                        if p.get("quantity", 0) != 0:
+                            active_positions.append(p)
+                            position_id_map[idx] = p
+                            idx += 1
+                            
+                selected_account_key = self._resolve_api_key(acct_ref)
+                exec_ctx = ExecutionContext(
+                    client=self.client,
+                    active_positions=active_positions,
+                    position_id_map=position_id_map,
+                    selected_account_key=selected_account_key
+                )
+                
+                output_lines = []
+                for c in parsed_cmds:
+                    res = await execute_command(c, exec_ctx)
+                    output_lines.append(res["message"])
+                    
+                await query.edit_message_text(f"💻 *Command Output:*\n```\n{'/'.join(output_lines)}\n```", parse_mode="Markdown")
+            except Exception as exc:
+                await query.edit_message_text(f"❌ Execution failed: {exc}")
+
+        elif action == "select_pos":
             symbol = data[1]
-            api_key = data[2]
+            api_key = self._resolve_api_key(data[2])
             qty = int(data[3])
             avg = float(data[4]) if len(data) > 4 else 0.0
             ltp = float(data[5]) if len(data) > 5 else 0.0
@@ -821,13 +716,14 @@ class KCLITelegramBot:
                 f"Choose an action:"
             )
             
+            acct_ref = self._get_acct_ref(api_key)
             keyboard = [
                 [
-                    InlineKeyboardButton("🚨 Exit Position", callback_data=f"confirm_exit_single:{symbol}:{api_key}:{qty}"),
-                    InlineKeyboardButton("➕ Add More", callback_data=f"confirm_add_more:{symbol}:{api_key}:{qty}")
+                    InlineKeyboardButton("🚨 Exit Position", callback_data=f"confirm_exit_single:{symbol}:{acct_ref}:{qty}:{ltp:.2f}"),
+                    InlineKeyboardButton("➕ Add More", callback_data=f"confirm_add_more:{symbol}:{acct_ref}:{qty}:{ltp:.2f}")
                 ],
                 [
-                    InlineKeyboardButton("🔙 Back to Positions", callback_data=f"back_to_positions:{api_key}")
+                    InlineKeyboardButton("🔙 Back to Positions", callback_data=f"back_to_positions:{acct_ref}")
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -835,29 +731,74 @@ class KCLITelegramBot:
 
         elif action == "confirm_exit_single":
             symbol = data[1]
-            api_key = data[2]
+            api_key = self._resolve_api_key(data[2])
             qty = int(data[3])
+            ltp = float(data[4]) if len(data) > 4 else 0.0
             
+            ltp_plus_0_1 = ltp * 1.001
+            ltp_minus_0_1 = ltp * 0.999
+            ltp_plus_0_5 = ltp * 1.005
+            ltp_minus_0_5 = ltp * 0.995
+
             confirm_text = (
-                f"🚨 *Market Exit Confirmation*\n\n"
-                f"Are you sure you want to exit position `{symbol}` (Qty: `{qty}`) at market price?"
+                f"🚨 *Exit Price Selection*\n\n"
+                f"Select an exit limit price or market price for `{symbol}` (Qty: `{qty}`):\n"
+                f"• *LTP:* `{ltp:.2f}`"
             )
+            acct_ref = self._get_acct_ref(api_key)
             keyboard = [
                 [
-                    InlineKeyboardButton("✅ Confirm Market Exit", callback_data=f"do_exit_single:{symbol}:{api_key}"),
+                    InlineKeyboardButton(f"Limit @ {ltp:.2f} (LTP)", callback_data=f"do_exit_single:{symbol}:{acct_ref}:{ltp:.2f}"),
+                ],
+                [
+                    InlineKeyboardButton(f"Limit @ {ltp_plus_0_1:.2f} (+0.1%)", callback_data=f"do_exit_single:{symbol}:{acct_ref}:{ltp_plus_0_1:.2f}"),
+                    InlineKeyboardButton(f"Limit @ {ltp_minus_0_1:.2f} (-0.1%)", callback_data=f"do_exit_single:{symbol}:{acct_ref}:{ltp_minus_0_1:.2f}"),
+                ],
+                [
+                    InlineKeyboardButton(f"Limit @ {ltp_plus_0_5:.2f} (+0.5%)", callback_data=f"do_exit_single:{symbol}:{acct_ref}:{ltp_plus_0_5:.2f}"),
+                    InlineKeyboardButton(f"Limit @ {ltp_minus_0_5:.2f} (-0.5%)", callback_data=f"do_exit_single:{symbol}:{acct_ref}:{ltp_minus_0_5:.2f}"),
+                ],
+                [
+                    InlineKeyboardButton("💬 Custom Price", callback_data=f"prompt_custom_price:{symbol}:{acct_ref}"),
+                    InlineKeyboardButton("🚨 Market Exit", callback_data=f"do_exit_single:{symbol}:{acct_ref}:market")
+                ],
+                [
                     InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_reply_markup(reply_markup=reply_markup)
+            await query.edit_message_text(confirm_text, reply_markup=reply_markup, parse_mode="Markdown")
+
+        elif action == "prompt_custom_price":
+            symbol = data[1]
+            api_key = self._resolve_api_key(data[2])
+            
+            from telegram import ForceReply
+            await query.message.reply_text(
+                f"Enter custom limit price for `{symbol}` in reply to this message:",
+                reply_markup=ForceReply(selective=True)
+            )
 
         elif action == "do_exit_single":
             symbol = data[1]
-            api_key = data[2]
-            await query.edit_message_text(f"⏳ Placing market exit order for `{symbol}`...")
+            api_key = self._resolve_api_key(data[2])
+            price = None
+            if len(data) > 3:
+                price_str = data[3]
+                if price_str != "market":
+                    try:
+                        price = float(price_str)
+                    except ValueError:
+                        price = None
+
+            if price is not None:
+                await query.edit_message_text(f"⏳ Placing limit exit order for `{symbol}` at `{price:.2f}`...")
+            else:
+                await query.edit_message_text(f"⏳ Placing market exit order for `{symbol}`...")
+                
             try:
-                res = self.client.exit_positions([api_key], tradingsymbol=symbol)
-                res_lines = [f"📊 *Market Exit Result:* `{symbol}`"]
+                res = self.client.exit_positions([api_key], tradingsymbol=symbol, price=price)
+                res_lines = [f"📊 *Exit Result:* `{symbol}`" + (f" @ `{price:.2f}`" if price is not None else " (Market)")]
                 for r in res.get("results", []):
                     name = r.get("name")
                     status = r.get("status")
@@ -871,39 +812,82 @@ class KCLITelegramBot:
 
         elif action == "confirm_add_more":
             symbol = data[1]
-            api_key = data[2]
+            api_key = self._resolve_api_key(data[2])
             qty = int(data[3])
+            ltp = float(data[4]) if len(data) > 4 else 0.0
             
             tx_type = "BUY" if qty > 0 else "SELL"
             abs_qty = abs(qty)
             exchange = "NFO" if len(symbol) > 6 else "NSE"
             
+            ltp_plus_0_1 = ltp * 1.001
+            ltp_minus_0_1 = ltp * 0.999
+            ltp_plus_0_5 = ltp * 1.005
+            ltp_minus_0_5 = ltp * 0.995
+
             confirm_text = (
-                f"➕ *Confirm Add More Position*\n\n"
-                f"• *Symbol*: `{symbol}`\n"
-                f"• *Current Qty*: `{qty}`\n"
-                f"• *Order*: `{tx_type}` `{abs_qty}` (Market)\n\n"
-                f"Place market order to increase position size?"
+                f"➕ *Add More Position Price Selection*\n\n"
+                f"Select order price to add `{abs_qty}` more to `{symbol}` (Current Qty: `{qty}`):\n"
+                f"• *LTP:* `{ltp:.2f}`"
             )
-            
-            callback_payload = f"do_place_add:{tx_type}:{symbol}:{abs_qty}:{exchange}:{api_key}"
+            acct_ref = self._get_acct_ref(api_key)
             keyboard = [
                 [
-                    InlineKeyboardButton("✅ Confirm Add More", callback_data=callback_payload),
+                    InlineKeyboardButton(f"Limit @ {ltp:.2f} (LTP)", callback_data=f"do_place_add:{tx_type}:{symbol}:{abs_qty}:{exchange}:{acct_ref}:{ltp:.2f}"),
+                ],
+                [
+                    InlineKeyboardButton(f"Limit @ {ltp_plus_0_1:.2f} (+0.1%)", callback_data=f"do_place_add:{tx_type}:{symbol}:{abs_qty}:{exchange}:{acct_ref}:{ltp_plus_0_1:.2f}"),
+                    InlineKeyboardButton(f"Limit @ {ltp_minus_0_1:.2f} (-0.1%)", callback_data=f"do_place_add:{tx_type}:{symbol}:{abs_qty}:{exchange}:{acct_ref}:{ltp_minus_0_1:.2f}"),
+                ],
+                [
+                    InlineKeyboardButton(f"Limit @ {ltp_plus_0_5:.2f} (+0.5%)", callback_data=f"do_place_add:{tx_type}:{symbol}:{abs_qty}:{exchange}:{acct_ref}:{ltp_plus_0_5:.2f}"),
+                    InlineKeyboardButton(f"Limit @ {ltp_minus_0_5:.2f} (-0.5%)", callback_data=f"do_place_add:{tx_type}:{symbol}:{abs_qty}:{exchange}:{acct_ref}:{ltp_minus_0_5:.2f}"),
+                ],
+                [
+                    InlineKeyboardButton("💬 Custom Price", callback_data=f"prompt_custom_price_add:{tx_type}:{symbol}:{abs_qty}:{exchange}:{acct_ref}"),
+                    InlineKeyboardButton("🚨 Market Order", callback_data=f"do_place_add:{tx_type}:{symbol}:{abs_qty}:{exchange}:{acct_ref}:market")
+                ],
+                [
                     InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_reply_markup(reply_markup=reply_markup)
+            await query.edit_message_text(confirm_text, reply_markup=reply_markup, parse_mode="Markdown")
+
+        elif action == "prompt_custom_price_add":
+            tx_type = data[1]
+            symbol = data[2]
+            abs_qty = data[3]
+            exchange = data[4]
+            acct_ref = data[5]
+            
+            from telegram import ForceReply
+            await query.message.reply_text(
+                f"Enter custom limit price for adding `{abs_qty}` more to `{symbol}` (`{tx_type}` segments: `{exchange}`):",
+                reply_markup=ForceReply(selective=True)
+            )
 
         elif action == "do_place_add":
             tx_type = data[1]
             symbol = data[2]
             qty = int(data[3])
             exchange = data[4]
-            api_key = data[5]
+            api_key = self._resolve_api_key(data[5])
             
-            await query.edit_message_text(f"⏳ Placing market order to add to `{symbol}`...")
+            price = None
+            if len(data) > 6:
+                price_str = data[6]
+                if price_str != "market":
+                    try:
+                        price = float(price_str)
+                    except ValueError:
+                        price = None
+
+            if price is not None:
+                await query.edit_message_text(f"⏳ Placing limit order to add to `{symbol}` at `{price:.2f}`...")
+            else:
+                await query.edit_message_text(f"⏳ Placing market order to add to `{symbol}`...")
+                
             try:
                 res = self.client.place_order(
                     api_keys=[api_key],
@@ -911,9 +895,10 @@ class KCLITelegramBot:
                     exchange=exchange,
                     transaction_type=tx_type,
                     quantity=qty,
-                    order_type="MARKET"
+                    order_type="LIMIT" if price is not None else "MARKET",
+                    price=price
                 )
-                res_lines = [f"📊 *Order Execution Result:* `{symbol}`"]
+                res_lines = [f"📊 *Order Placement Result:* `{symbol}`" + (f" @ `{price:.2f}`" if price is not None else " (Market)")]
                 for r in res.get("results", []):
                     name = r.get("name")
                     status = r.get("status")
@@ -926,7 +911,7 @@ class KCLITelegramBot:
                 await query.edit_message_text(f"❌ Order placement failed: {exc}")
 
         elif action == "back_to_positions":
-            api_key = data[1]
+            api_key = self._resolve_api_key(data[1])
             await query.edit_message_text("⏳ Reloading positions...")
             try:
                 msg_text, keyboard = self._format_account_positions(api_key)
@@ -971,17 +956,18 @@ class KCLITelegramBot:
 
         elif action == "confirm_cancel":
             order_id = data[1]
-            api_key = data[2]
+            api_key = self._resolve_api_key(data[2])
             symbol = data[3]
             confirm_text = (
                 f"🚨 *Cancel Order Confirmation*\n\n"
                 f"Cancel order `{order_id}` (`{symbol}`)?"
             )
+            acct_ref = self._get_acct_ref(api_key)
             keyboard = [
                 [
                     InlineKeyboardButton(
                         "✅ Yes, Cancel Order",
-                        callback_data=f"do_cancel:{order_id}:{api_key}"
+                        callback_data=f"do_cancel:{order_id}:{acct_ref}"
                     ),
                     InlineKeyboardButton("❌ No, Keep Pending", callback_data="cancel_action")
                 ]
@@ -991,7 +977,7 @@ class KCLITelegramBot:
 
         elif action == "do_cancel":
             order_id = data[1]
-            api_key = data[2]
+            api_key = self._resolve_api_key(data[2])
             await query.edit_message_text(f"⏳ Sending cancellation for `{order_id}`...")
             try:
                 res = self.client.cancel_order(api_key, order_id)
@@ -1019,7 +1005,7 @@ class KCLITelegramBot:
             qty = int(data[3])
             ord_type = data[4]
             exchange = data[5]
-            target_key = data[6]
+            target_key = self._resolve_api_key(data[6])
             price = float(data[7]) if len(data) > 7 else None
 
             await query.edit_message_text(f"⏳ Placing `{ord_type}` `{tx_type}` orders for `{symbol}`...")
@@ -1072,3 +1058,119 @@ class KCLITelegramBot:
 
         elif action == "cancel_action":
             await query.edit_message_text("❌ Action cancelled.")
+
+    @restrict_user
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle incoming text messages (e.g. replies to custom price prompts)."""
+        if not update.message or not update.message.reply_to_message:
+            return
+        
+        reply_text = update.message.reply_to_message.text
+        if not reply_text:
+            return
+            
+        # 1. Match custom exit price prompt
+        match_exit = re.search(r"Enter custom limit price for `([^`]+)`", reply_text)
+        if match_exit and "reply to this message:" in reply_text:
+            symbol = match_exit.group(1)
+            price_input = update.message.text.strip()
+            
+            try:
+                price = float(price_input)
+                if price <= 0:
+                    raise ValueError("Price must be positive")
+            except Exception:
+                await update.message.reply_text(f"❌ Invalid price: `{price_input}`. Please reply with a valid number.")
+                return
+
+            # Find position to get its api_key
+            pos_resp = self.client.get_positions(None)
+            api_key = None
+            for acct in pos_resp.get("accounts", []):
+                for p in acct.get("positions", []):
+                    if p.get("tradingsymbol") == symbol and p.get("quantity", 0) != 0:
+                        api_key = p.get("api_key") or acct.get("api_key")
+                        break
+                if api_key:
+                    break
+                    
+            if not api_key:
+                if self.client.accounts:
+                    api_key = self.client.accounts[0].get("api_key")
+                    
+            if not api_key:
+                await update.message.reply_text("❌ Failed to resolve account for this position.")
+                return
+                
+            await update.message.reply_text(f"⏳ Placing limit exit order for `{symbol}` at `{price:.2f}`...")
+            try:
+                res = self.client.exit_positions([api_key], tradingsymbol=symbol, price=price)
+                res_lines = [f"📊 *Limit Exit Result:* `{symbol}` @ `{price:.2f}`"]
+                for r in res.get("results", []):
+                    name = r.get("name")
+                    status = r.get("status")
+                    msg = r.get("message", "")
+                    icon = "✅" if status == "success" else "❌"
+                    res_lines.append(f"{icon} *{name}*: {msg}")
+
+                await update.message.reply_text("\n".join(res_lines), parse_mode="Markdown")
+            except Exception as exc:
+                await update.message.reply_text(f"❌ Limit exit execution failed: {exc}")
+            return
+
+        # 2. Match custom add more price prompt
+        match_add = re.search(r"Enter custom limit price for adding `([^`]+)` more to `([^`]+)` \(`([^`]+)` segments: `([^`]+)`\)", reply_text)
+        if match_add:
+            qty_str = match_add.group(1)
+            symbol = match_add.group(2)
+            tx_type = match_add.group(3)
+            exchange = match_add.group(4)
+            price_input = update.message.text.strip()
+            
+            try:
+                price = float(price_input)
+                if price <= 0:
+                    raise ValueError("Price must be positive")
+            except Exception:
+                await update.message.reply_text(f"❌ Invalid price: `{price_input}`. Please reply with a valid number.")
+                return
+
+            # Resolve api_key
+            pos_resp = self.client.get_positions(None)
+            api_key = None
+            for acct in pos_resp.get("accounts", []):
+                for p in acct.get("positions", []):
+                    if p.get("tradingsymbol") == symbol and p.get("quantity", 0) != 0:
+                        api_key = p.get("api_key") or acct.get("api_key")
+                        break
+                if api_key:
+                    break
+            if not api_key and self.client.accounts:
+                api_key = self.client.accounts[0].get("api_key")
+            if not api_key:
+                await update.message.reply_text("❌ Failed to resolve account for this position.")
+                return
+
+            await update.message.reply_text(f"⏳ Placing limit order to add to `{symbol}` at `{price:.2f}`...")
+            try:
+                res = self.client.place_order(
+                    api_keys=[api_key],
+                    tradingsymbol=symbol,
+                    exchange=exchange,
+                    transaction_type=tx_type,
+                    quantity=int(qty_str),
+                    order_type="LIMIT",
+                    price=price
+                )
+                res_lines = [f"📊 *Limit Order Result:* `{symbol}` @ `{price:.2f}`"]
+                for r in res.get("results", []):
+                    name = r.get("name")
+                    status = r.get("status")
+                    msg = r.get("message", "")
+                    icon = "✅" if status == "success" else "❌"
+                    res_lines.append(f"{icon} *{name}*: {msg}")
+
+                await update.message.reply_text("\n".join(res_lines), parse_mode="Markdown")
+            except Exception as exc:
+                await update.message.reply_text(f"❌ Limit order placement failed: {exc}")
+            return

@@ -533,6 +533,9 @@ class KiteAccountManager:
                 "validity": kite.VALIDITY_DAY,
             }
 
+            if order_type == "MARKET":
+                params["market_protection"] = 5.0
+
             if price is not None and price > 0:
                 params["price"] = price
             if trigger_price is not None and trigger_price > 0:
@@ -695,7 +698,10 @@ class KiteAccountManager:
         if price is not None:
             params["price"] = price
         if order_type is not None:
-            params["order_type"] = order_type.upper()
+            norm_type = order_type.upper()
+            params["order_type"] = norm_type
+            if norm_type == "MARKET":
+                params["market_protection"] = 5.0
         if trigger_price is not None:
             params["trigger_price"] = trigger_price
 

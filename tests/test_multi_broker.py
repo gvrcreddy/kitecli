@@ -155,12 +155,12 @@ class TestKotakAccountManagerInit(unittest.TestCase):
         from cli.kotak_manager import KotakAccountManager
         mgr = KotakAccountManager()
         mock_neo = MagicMock()
-        mock_neo.configuration.access_token = None
+        mock_neo.configuration.edit_token = None
 
-        with patch("cli.kotak_manager.NEOClient", return_value=mock_neo, create=True), \
+        with patch("cli.kotak_manager.NeoAPI", return_value=mock_neo, create=True), \
              patch("cli.kotak_manager._load_sessions", return_value={}):
             # Directly call init_account_kotak, patching the import
-            with patch.dict("sys.modules", {"neo_api_client": MagicMock(NEOClient=MagicMock(return_value=mock_neo))}):
+            with patch.dict("sys.modules", {"neo_api_client": MagicMock(NeoAPI=MagicMock(return_value=mock_neo))}):
                 mgr.init_account_kotak(
                     consumer_key="kotak_key_123",
                     consumer_secret="secret",
@@ -258,9 +258,9 @@ class TestApiClientBrokerRouting(unittest.TestCase):
         import cli.api_client as ac
 
         mock_neo_client = MagicMock()
-        mock_neo_client.configuration.access_token = None
+        mock_neo_client.configuration.edit_token = None
         mock_neo_module = MagicMock()
-        mock_neo_module.NEOClient.return_value = mock_neo_client
+        mock_neo_module.NeoAPI.return_value = mock_neo_client
 
         with _patch.dict(sys.modules, {"neo_api_client": mock_neo_module}), \
              _patch("cli.kotak_manager._load_sessions", return_value={}):

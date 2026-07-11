@@ -214,7 +214,7 @@ class KCLIClient:
 
     def get_positions(self, api_keys: list[str]) -> dict:
         """Fetch open positions for the given accounts in parallel."""
-        keys = api_keys or _kite_manager.get_all_api_keys()
+        keys = api_keys or [a.get("api_key") for a in self._accounts if a.get("api_key")]
 
         def fetch_one(api_key):
             mgr = _manager_for(api_key)
@@ -254,11 +254,10 @@ class KCLIClient:
     def get_status(self) -> dict:
         """Get authentication status for all accounts."""
         accounts = []
-        for api_key in _kite_manager.get_all_api_keys():
-            accounts.append(_kite_manager.get_account_info(api_key))
-        if _kotak_manager is not None:
-            for key in _kotak_manager.get_all_account_keys():
-                accounts.append(_kotak_manager.get_account_info(key))
+        for acct in self._accounts:
+            key = acct.get("api_key")
+            if key:
+                accounts.append(_manager_for(key).get_account_info(key))
         return {"accounts": accounts}
 
     def place_order(
@@ -274,7 +273,7 @@ class KCLIClient:
         product: str = "NRML",
     ) -> dict:
         """Place an order across specified accounts in parallel."""
-        keys = api_keys or _kite_manager.get_all_api_keys()
+        keys = api_keys or [a.get("api_key") for a in self._accounts if a.get("api_key")]
 
         def place_one(api_key):
             mgr = _manager_for(api_key)
@@ -330,7 +329,7 @@ class KCLIClient:
         price: float | None = None,
     ) -> dict:
         """Exit positions across specified accounts in parallel."""
-        keys = api_keys or _kite_manager.get_all_api_keys()
+        keys = api_keys or [a.get("api_key") for a in self._accounts if a.get("api_key")]
 
         def exit_one(api_key):
             mgr = _manager_for(api_key)
@@ -386,7 +385,7 @@ class KCLIClient:
 
     def get_orders(self, api_keys: list[str]) -> dict:
         """Fetch today's order book for specified accounts in parallel."""
-        keys = api_keys or _kite_manager.get_all_api_keys()
+        keys = api_keys or [a.get("api_key") for a in self._accounts if a.get("api_key")]
 
         def fetch_one(api_key):
             mgr = _manager_for(api_key)
@@ -466,7 +465,7 @@ class KCLIClient:
 
     def get_margins(self, api_keys: list[str]) -> dict:
         """Fetch equity margin summary for each account in parallel."""
-        keys = api_keys or _kite_manager.get_all_api_keys()
+        keys = api_keys or [a.get("api_key") for a in self._accounts if a.get("api_key")]
 
         def fetch_one(api_key):
             mgr = _manager_for(api_key)

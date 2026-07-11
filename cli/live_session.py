@@ -292,6 +292,11 @@ class KCLILiveSession:
         self.websocket_connected = {a["api_key"]: False for a in accounts if a.get("api_key")}
         self.subscribed_tokens = set()
         self.ws_ltp_cache: dict[int, float] = {}
+        # Symbol-based LTP cache for brokers without instrument_token (e.g. Kotak).
+        # Populated in _on_ticks when we match a tick's token to a known tradingsymbol.
+        self.ws_symbol_ltp_cache: dict[str, float] = {}
+        # Reverse map: instrument_token → tradingsymbol, built during _trigger_immediate_refresh
+        self.ws_token_to_symbol: dict[int, str] = {}
         self._refresh_in_progress = False
         self._refresh_pending = False
         # Throttle state for noisy per-account WebSocket close/error logging.
@@ -1080,10 +1085,20 @@ class KCLILiveSession:
                 "chain will use REST snapshots only (no live streaming)."
             )
 
-        # Connect WebSockets for all accounts
+        # Connect WebSockets only for accounts that support it (Zerodha).
+        # Kotak and other REST-only brokers skip this block; their position
+        # LTPs are updated via symbol-based matching in _on_ticks below.
         from kiteconnect import KiteTicker
         for acct in self.accounts:
             api_key = acct.get("api_key")
+            broker = acct.get("broker", "zerodha").lower()
+            # Skip non-Zerodha accounts — they have no WebSocket feed
+            if broker != "zerodha":
+                self.log_message(
+                    f"[#8b949e]Skipping WebSocket for @{acct.get('name')}:[/#] "
+                    f"broker={broker} (REST-only, prices via primary Zerodha ticker)."
+                )
+                continue
             access_token = self.client.get_access_token(api_key)
             # Skip accounts whose token we already know is bad — avoids the
             # reconnect storm of 403 handshakes.
@@ -1281,14 +1296,28 @@ class KCLILiveSession:
 
             # Cache the latest LTP.
             self.ws_ltp_cache[int(token)] = ltp
+            # Also cache by symbol for Kotak positions that have no instrument_token
+            sym = self.ws_token_to_symbol.get(int(token))
+            if sym:
+                self.ws_symbol_ltp_cache[sym] = ltp
 
             # Position tick → update the matching positions across all accounts.
+            # Zerodha positions: matched by instrument_token.
+            # Kotak positions: matched by tradingsymbol (via ws_token_to_symbol map).
             resp = getattr(self, "last_positions_response", None)
             if resp:
                 for acct in resp.get("accounts", []):
                     for pos in acct.get("positions", []):
                         pos_token = pos.get("instrument_token")
-                        if pos_token is not None and int(pos_token) == int(token):
+                        token_match = (
+                            pos_token is not None and int(pos_token) == int(token)
+                        )
+                        symbol_match = (
+                            pos_token is None
+                            and sym is not None
+                            and pos.get("tradingsymbol", "").upper() == sym.upper()
+                        )
+                        if token_match or symbol_match:
                             pos["last_price"] = ltp
                             # Recalculate P&L only for open positions (quantity != 0)
                             qty = pos.get("quantity", 0)
@@ -1465,8 +1494,12 @@ class KCLILiveSession:
                     for acct in response.get("accounts", []):
                         for pos in acct.get("positions", []):
                             pos_token = pos.get("instrument_token")
+                            sym = pos.get("tradingsymbol", "")
                             if pos_token is not None:
                                 t_int = int(pos_token)
+                                # Build reverse map for symbol-based tick matching (Kotak)
+                                if sym:
+                                    self.ws_token_to_symbol[t_int] = sym
                                 if t_int in self.ws_ltp_cache:
                                     cached_ltp = self.ws_ltp_cache[t_int]
                                     pos["last_price"] = cached_ltp
@@ -1478,6 +1511,18 @@ class KCLILiveSession:
                                             pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
                                         else:
                                             pos["pnl_pct"] = 0.0
+                            elif sym and sym in self.ws_symbol_ltp_cache:
+                                # Kotak position: apply cached LTP by symbol
+                                cached_ltp = self.ws_symbol_ltp_cache[sym]
+                                pos["last_price"] = cached_ltp
+                                qty = pos.get("quantity", 0)
+                                if qty != 0:
+                                    avg_price = pos.get("average_price", 0.0)
+                                    pos["pnl"] = (cached_ltp - avg_price) * qty
+                                    if avg_price > 0:
+                                        pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
+                                    else:
+                                        pos["pnl_pct"] = 0.0
                         acct["total_pnl"] = sum(p.get("pnl", 0.0) for p in acct.get("positions", []))
 
                     self.last_positions_response = response

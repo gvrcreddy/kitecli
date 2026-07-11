@@ -8,6 +8,8 @@ import pyotp
 import requests as http_requests
 from kiteconnect import KiteConnect
 
+from cli.base_manager import BaseBrokerManager
+
 logger = logging.getLogger(__name__)
 
 SESSIONS_FILE = Path.home() / ".kcli" / "sessions.json"
@@ -35,12 +37,51 @@ def _save_session(api_key: str, access_token: str) -> None:
         logger.error("Failed to save session for %s: %s", api_key[:8], exc)
 
 
-class KiteAccountManager:
+class KiteAccountManager(BaseBrokerManager):
     """Manages multiple KiteConnect instances keyed by api_key.
 
     Stores KiteConnect client objects, api_secrets, account names,
     and tracks authentication state for each registered account.
     """
+
+    # ── BaseBrokerManager identity ────────────────────────────────────────────
+
+    @property
+    def broker_name(self) -> str:
+        return "zerodha"
+
+    def supports_websocket(self) -> bool:
+        return True
+
+    # BaseBrokerManager abstract interface helpers (delegate to api_key methods)
+    def init_account(self, account_key: str, **credentials) -> str:  # type: ignore[override]
+        """ABC entry point — delegates to the api_key-based overload."""
+        return self._init_account_by_key(
+            api_key=account_key,
+            api_secret=credentials.get("api_secret", ""),
+            name=credentials.get("name", ""),
+            proxy=credentials.get("proxy"),
+        )
+
+    def auto_login(self, account_key: str, **credentials) -> bool:  # type: ignore[override]
+        """ABC entry point — delegates to the api_key-based auto_login."""
+        return self._auto_login_by_key(
+            api_key=account_key,
+            user_id=credentials.get("user_id", ""),
+            password=credentials.get("password", ""),
+            totp_secret=credentials.get("totp_secret", ""),
+        )
+
+    def get_all_account_keys(self) -> list[str]:
+        return self.get_all_api_keys()
+
+    def get_account_info(self, account_key: str) -> dict[str, Any]:  # type: ignore[override]
+        return self._get_account_info_by_key(account_key)
+
+    def get_access_token(self, account_key: str) -> str | None:  # type: ignore[override]
+        return self._get_access_token_by_key(account_key)
+
+    # ── internal init state ───────────────────────────────────────────────────
 
     def __init__(self) -> None:
         self._clients: dict[str, KiteConnect] = {}
@@ -50,50 +91,63 @@ class KiteAccountManager:
         self._proxies: dict[str, dict] = {}  # per-account proxy dicts for requests.Session
         self._nfo_lot_size_cache: dict[str, int] = {}  # fetched once, reused across calls
 
-    def init_account(self, api_key: str, api_secret: str, name: str = "", proxy: str = None) -> str:
-        """Initialize a KiteConnect instance and return the login URL.
+    # ── public init helpers (named with _by_key suffix to avoid ABC clash) ────
 
-        Args:
-            api_key: The Kite Connect API key.
-            api_secret: The Kite Connect API secret.
-            name: A human-readable name for the account.
-            proxy: Optional HTTP/HTTPS proxy string for routing requests.
-
-        Returns:
-            The Kite login URL for user authorization.
-        """
+    def _init_account_by_key(self, api_key: str, api_secret: str, name: str = "", proxy: str = None) -> str:
+        """Core account initialisation (used both directly and via ABC)."""
         proxies = {"http": proxy, "https": proxy} if proxy else None
         kite = KiteConnect(api_key=api_key, proxies=proxies)
         self._clients[api_key] = kite
         self._api_secrets[api_key] = api_secret
         self._account_names[api_key] = name or api_key
         self._authenticated[api_key] = False
-        # Store proxy dict so auto_login can also route via proxy
         self._proxies[api_key] = proxies or {}
 
-        # Try to restore session from saved token
         sessions = _load_sessions()
         saved_token = sessions.get(api_key)
         if saved_token:
             logger.info("Found saved session token for '%s' (api_key=%s…). Verifying...", name, api_key[:8])
             try:
                 kite.set_access_token(saved_token)
-                # Verify token by calling profile
                 kite.profile()
                 self._authenticated[api_key] = True
                 logger.info("Successfully restored valid session for '%s' (api_key=%s…)", name, api_key[:8])
             except Exception as exc:
                 logger.info(
                     "Saved session token for '%s' (api_key=%s…) is invalid or expired: %s",
-                    name,
-                    api_key[:8],
-                    exc,
+                    name, api_key[:8], exc,
                 )
                 self._authenticated[api_key] = False
 
         login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
         logger.info("Initialized account '%s' (api_key=%s…)", name, api_key[:8])
         return login_url
+
+    def _get_account_info_by_key(self, api_key: str) -> dict[str, Any]:
+        return {
+            "name": self._account_names.get(api_key, api_key),
+            "api_key": api_key,
+            "account_key": api_key,
+            "authenticated": self.is_authenticated(api_key),
+        }
+
+    def _get_access_token_by_key(self, api_key: str) -> str | None:
+        kite = self._clients.get(api_key)
+        if kite:
+            return getattr(kite, "access_token", None)
+        return None
+
+    def _auto_login_by_key(self, api_key: str, user_id: str, password: str, totp_secret: str) -> bool:
+        """Internal helper for auto_login; calls the public auto_login(api_key, ...) below."""
+        return self.auto_login_kite(api_key, user_id, password, totp_secret)
+
+    def init_account_kite(self, api_key: str, api_secret: str, name: str = "", proxy: str = None) -> str:
+        """Initialize a KiteConnect instance and return the login URL.
+
+        This is the Zerodha-specific entry point used by api_client.py.
+        The ABC ``init_account`` above delegates here via ``_init_account_by_key``.
+        """
+        return self._init_account_by_key(api_key=api_key, api_secret=api_secret, name=name, proxy=proxy)
 
     def complete_login(self, api_key: str, request_token: str) -> bool:
         """Complete the OAuth login flow by generating a session.
@@ -290,7 +344,7 @@ class KiteAccountManager:
         """Return a list of all registered api_keys."""
         return list(self._clients.keys())
 
-    def auto_login(
+    def auto_login_kite(
         self,
         api_key: str,
         user_id: str,
@@ -299,12 +353,8 @@ class KiteAccountManager:
     ) -> bool:
         """Automate the full Kite login flow using credentials + TOTP.
 
-        Steps:
-            1. POST user_id + password to Kite login endpoint.
-            2. Generate a TOTP code using the shared secret via pyotp.
-            3. POST the TOTP for two-factor authentication.
-            4. Visit the Kite Connect login URL to capture the request_token.
-            5. Exchange the request_token for an access_token.
+        This is the Zerodha-specific implementation.  The ABC ``auto_login``
+        above delegates here via ``_auto_login_by_key``.
 
         Args:
             api_key: The Kite Connect API key (must already be init'd).

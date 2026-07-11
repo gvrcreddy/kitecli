@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kitecli"
-version = "0.1.1"
-description = "Kite Connect CLI — Multi-account Zerodha trading positions viewer"
+version = "0.1.2"
+description = "KiteCLI — Multi-account, multi-broker trading positions viewer (Zerodha + Kotak Neo)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -35,6 +35,9 @@ server = [
 ]
 bot = [
     "python-telegram-bot>=20.0",
+]
+kotak = [
+    "neo-api-client>=1.0.0",
 ]
 dev = [
     "pytest>=8.0.0",

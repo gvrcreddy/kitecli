@@ -16,7 +16,9 @@ CONFIG_FILE = CONFIG_DIR / "config.yaml"
 DEFAULT_CONFIG = {
     "accounts": [
         {
+            # --- Zerodha account (default) ---
             "name": "Account 1",
+            "broker": "zerodha",          # optional; "zerodha" is the default
             "api_key": "your_api_key",
             "api_secret": "your_api_secret",
             "user_id": "your_zerodha_user_id",
@@ -30,6 +32,19 @@ DEFAULT_CONFIG = {
             # the first stream-capable account is chosen automatically.
             "primary": True,
         },
+        # --- Kotak Neo account (optional) ---
+        # Uncomment and fill in to add a Kotak Neo account.
+        # {
+        #     "name": "Kotak Account",
+        #     "broker": "kotak",
+        #     "consumer_key": "your_kotak_consumer_key",
+        #     "consumer_secret": "your_kotak_consumer_secret",
+        #     "mobile_number": "+919876543210",
+        #     "password": "your_kotak_password",
+        #     "mpin": "your_kotak_mpin",
+        #     "ucc": "your_kotak_ucc",
+        #     "totp_secret": "your_kotak_totp_secret",
+        # },
     ],
 }
 

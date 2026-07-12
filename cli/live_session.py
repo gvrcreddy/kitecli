@@ -974,40 +974,46 @@ class KCLILiveSession:
             name = result.get("name", api_key)
             detail = result.get("detail", "")
             if status == "valid":
-                # REST works, but that does NOT guarantee streaming works: the
-                # WebSocket can still reject this token with 403 "Authentication
-                # failed" (per api_key/app — e.g. no active streaming
-                # subscription). Probe the actual WS handshake so we only start
-                # tickers that will succeed and avoid a 403 reconnect storm.
-                access_token = self.client.get_access_token(api_key)
-                proxy_str = acct.get("proxy")
-                ws_status, ws_detail = await self._run_api_call(
-                    probe_ws_auth, api_key, access_token, proxy_str
-                )
-                if ws_status == "ok":
-                    self.log_message(f"[#00ff00]✓ Streaming OK:[/#] @{name}")
-                elif ws_status == "auth_failed":
-                    any_bad = True
-                    statuses[api_key] = "stream_forbidden"
-                    self.log_message(
-                        f"[#ff0000]✗ Streaming rejected:[/#] @{name} — "
-                        f"WebSocket auth failed ({ws_detail}). REST works, so the "
-                        f"token is valid but this api_key lacks streaming access. "
-                        f"Check the app's subscription on the Kite Connect dashboard."
+                broker = acct.get("broker", "zerodha").lower()
+                if broker != "zerodha":
+                    # Non-Zerodha accounts (e.g. Kotak) use their own WebSocket
+                    # feed — do not probe ws.kite.trade with a non-Zerodha token.
+                    self.log_message(f"[#00ff00]✓ Token OK:[/#] @{name}")
+                elif broker == "zerodha":
+                    # REST works, but that does NOT guarantee streaming works: the
+                    # WebSocket can still reject this token with 403 "Authentication
+                    # failed" (per api_key/app — e.g. no active streaming
+                    # subscription). Probe the actual WS handshake so we only start
+                    # tickers that will succeed and avoid a 403 reconnect storm.
+                    access_token = self.client.get_access_token(api_key)
+                    proxy_str = acct.get("proxy")
+                    ws_status, ws_detail = await self._run_api_call(
+                        probe_ws_auth, api_key, access_token, proxy_str
                     )
-                elif ws_status == "proxy_blocked":
-                    any_bad = True
-                    statuses[api_key] = "proxy_blocked"
-                    self.log_message(
-                        f"[#ff8700]⚠ Proxy blocked streaming:[/#] @{name} — "
-                        f"proxy refused the WebSocket tunnel ({ws_detail})."
-                    )
-                else:
-                    # Inconclusive probe — let the ticker try anyway.
-                    self.log_message(
-                        f"[#ff8700]⚠ Streaming check inconclusive:[/#] @{name} "
-                        f"({ws_detail}). Will attempt to connect."
-                    )
+                    if ws_status == "ok":
+                        self.log_message(f"[#00ff00]✓ Streaming OK:[/#] @{name}")
+                    elif ws_status == "auth_failed":
+                        any_bad = True
+                        statuses[api_key] = "stream_forbidden"
+                        self.log_message(
+                            f"[#ff0000]✗ Streaming rejected:[/#] @{name} — "
+                            f"WebSocket auth failed ({ws_detail}). REST works, so the "
+                            f"token is valid but this api_key lacks streaming access. "
+                            f"Check the app's subscription on the Kite Connect dashboard."
+                        )
+                    elif ws_status == "proxy_blocked":
+                        any_bad = True
+                        statuses[api_key] = "proxy_blocked"
+                        self.log_message(
+                            f"[#ff8700]⚠ Proxy blocked streaming:[/#] @{name} — "
+                            f"proxy refused the WebSocket tunnel ({ws_detail})."
+                        )
+                    else:
+                        # Inconclusive probe — let the ticker try anyway.
+                        self.log_message(
+                            f"[#ff8700]⚠ Streaming check inconclusive:[/#] @{name} "
+                            f"({ws_detail}). Will attempt to connect."
+                        )
             elif status == "no_token":
                 any_bad = True
                 self.log_message(f"[#ff8700]⚠ No token:[/#] @{name} — login required (run 'kcli init').")
@@ -1085,39 +1091,37 @@ class KCLILiveSession:
                 "chain will use REST snapshots only (no live streaming)."
             )
 
-        # Connect WebSockets only for accounts that support it (Zerodha).
-        # Kotak and other REST-only brokers skip this block; their position
-        # LTPs are updated via symbol-based matching in _on_ticks below.
-        from kiteconnect import KiteTicker
+        # Connect WebSockets for accounts that support it (Zerodha and Kotak).
         for acct in self.accounts:
             api_key = acct.get("api_key")
             broker = acct.get("broker", "zerodha").lower()
-            # Skip non-Zerodha accounts — they have no WebSocket feed
-            if broker != "zerodha":
-                self.log_message(
-                    f"[#8b949e]Skipping WebSocket for @{acct.get('name')}:[/#] "
-                    f"broker={broker} (REST-only, prices via primary Zerodha ticker)."
-                )
-                continue
             access_token = self.client.get_access_token(api_key)
-            # Skip accounts whose token we already know is bad — avoids the
-            # reconnect storm of 403 handshakes.
+
+            # Skip accounts whose token we already know is bad
             if token_statuses.get(api_key) not in (None, "valid"):
                 self.log_message(
                     f"[#ff8700]Skipping WebSocket for @{acct.get('name')}:[/#] "
                     f"token not valid ({token_statuses.get(api_key)})."
                 )
                 continue
-            if api_key and access_token:
+
+            if api_key and (access_token or broker == "kotak"):
                 try:
-                    # reconnect=True/reconnect_max_tries belong on KiteTicker()
-                    # constructor, not connect(). Max 50 tries (library default max
-                    # is 300; 50 gives ~15+ mins of exponential-backoff recovery).
-                    ticker = KiteTicker(
-                        api_key, access_token,
-                        reconnect=True,
-                        reconnect_max_tries=5,
-                    )
+                    if broker == "kotak":
+                        ticker = self.client.create_ticker(api_key)
+                        if not ticker:
+                            self.log_message(f"[#ff8700]Failed to create Kotak WebSocket ticker for @{acct.get('name')}[/#]")
+                            continue
+                    else:
+                        from kiteconnect import KiteTicker
+                        # reconnect=True/reconnect_max_tries belong on KiteTicker()
+                        # constructor, not connect(). Max 50 tries (library default max
+                        # is 300; 50 gives ~15+ mins of exponential-backoff recovery).
+                        ticker = KiteTicker(
+                            api_key, access_token,
+                            reconnect=True,
+                            reconnect_max_tries=5,
+                        )
 
                     ticker.on_connect = self._make_on_connect(api_key, ticker)
                     ticker.on_ticks = self._on_ticks
@@ -3596,7 +3600,7 @@ class KCLILiveSession:
     def _render_orders_pane(self, response: dict, mode: str) -> str:
         """Render pending or executed orders from a /api/orders response into plain text."""
         PENDING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED"}
-        EXECUTED_STATUSES = {"COMPLETE"}
+        EXECUTED_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
         filter_statuses = PENDING_STATUSES if mode == "orders_pending" else EXECUTED_STATUSES
         label = "PENDING ORDERS" if mode == "orders_pending" else "EXECUTED ORDERS (TODAY)"
 
@@ -3638,9 +3642,14 @@ class KCLILiveSession:
 
                     # Always show filled/total format (e.g. 0/910, 130/910, 910/910)
                     qty_desc = f"{filled}/{qty}"
+                    status_desc = status
+                    status_msg = o.get("status_message")
+                    if status_msg and status_msg != "--":
+                        status_desc = f"{status} ({status_msg})"
+
                     lines.append(
                         f"  [{oid[-6:]}] {tx} {sym} | {qty_desc} | "
-                        f"{otype} {price_desc} | {product} | {status}"
+                        f"{otype} {price_desc} | {product} | {status_desc}"
                     )
             lines.append("")
 

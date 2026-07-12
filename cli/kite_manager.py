@@ -1096,3 +1096,32 @@ class KiteAccountManager(BaseBrokerManager):
         except Exception as exc:
             logger.error("Yahoo Finance fallback failed: %s", exc)
             return {"status": "error", "message": f"Kite call had insufficient permission, and Yahoo fallback failed: {exc}"}
+
+    def get_ltp_and_tokens(self, api_key: str, symbols: list[str]) -> dict:
+        """Fetch LTP and instrument tokens for the given symbols using Zerodha ltp()."""
+        kite = self._clients.get(api_key)
+        if not kite:
+            return {}
+        try:
+            prefixed = []
+            for s in symbols:
+                if ":" not in s:
+                    if any(x in s for x in ["CE", "PE"]):
+                        prefixed.append(f"NFO:{s}")
+                    else:
+                        prefixed.append(f"NSE:{s}")
+                else:
+                    prefixed.append(s)
+            res = kite.ltp(prefixed)
+            normalized = {}
+            for k, v in res.items():
+                sym = k.split(":")[-1]
+                normalized[sym] = {
+                    "instrument_token": v.get("instrument_token"),
+                    "last_price": v.get("last_price"),
+                }
+            return normalized
+        except Exception as exc:
+            logger.warning("Failed to fetch LTP/tokens from Zerodha: %s", exc)
+            return {}
+

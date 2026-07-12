@@ -142,10 +142,10 @@ class TestKotakAccountManagerIsSubclass(unittest.TestCase):
         mgr = KotakAccountManager()
         self.assertEqual(mgr.broker_name, "kotak")
 
-    def test_no_websocket(self):
+    def test_supports_websocket(self):
         from cli.kotak_manager import KotakAccountManager
         mgr = KotakAccountManager()
-        self.assertFalse(mgr.supports_websocket())
+        self.assertTrue(mgr.supports_websocket())
 
 
 class TestKotakAccountManagerInit(unittest.TestCase):
@@ -214,7 +214,46 @@ class TestKotakPositionNormalisation(unittest.TestCase):
         self.assertEqual(pos["tradingsymbol"], "NIFTY24JAN21000CE")
         self.assertEqual(pos["quantity"], 50)
 
+    def test_positions_merge_holdings_average_price(self):
+        from cli.kotak_manager import KotakAccountManager
+        mgr = KotakAccountManager()
+        mock_neo = MagicMock()
+        
+        # Mock positions with detailed carry-forward fields
+        mock_neo.positions.return_value = {
+            "data": [
+                {
+                    "tok": "51441",
+                    "trdSym": "NIFTY2671425200CE",
+                    "cfSellQty": "1755",
+                    "cfSellAmt": "1755.00",
+                    "prod": "NRML",
+                    "exch": "NFO",
+                }
+            ]
+        }
+        
+        # Mock holdings showing the true averagePrice of 1.6926
+        mock_neo.holdings.return_value = {
+            "data": [
+                {
+                    "exchangeIdentifier": "51441",
+                    "quantity": -1755,
+                    "averagePrice": 1.6926,
+                }
+            ]
+        }
+        
+        mgr._clients["k1"] = mock_neo
+        mgr._authenticated["k1"] = True
 
+        positions = mgr.get_positions("k1")
+        self.assertEqual(len(positions), 1)
+        pos = positions[0]
+        self.assertEqual(pos["tradingsymbol"], "NIFTY2671425200CE")
+        self.assertEqual(pos["quantity"], -1755)
+        # Average price should be 1.6926 (from holdings), not 1.00 (from positions)
+        self.assertAlmostEqual(pos["average_price"], 1.6926)
 # ── api_client routing tests ──────────────────────────────────────────────────
 
 class TestApiClientBrokerRouting(unittest.TestCase):
@@ -273,6 +312,158 @@ class TestApiClientBrokerRouting(unittest.TestCase):
 
         mgr = ac._manager_for("kt_key")
         self.assertEqual(mgr.broker_name, "kotak")
+
+    def test_get_positions_resolves_kotak_tokens(self):
+        from unittest.mock import patch as _patch
+        import sys
+        import cli.api_client as ac
+
+        mock_neo_client = MagicMock()
+        mock_neo_client.configuration.edit_token = None
+        mock_neo_module = MagicMock()
+        mock_neo_module.NeoAPI.return_value = mock_neo_client
+        
+        # Mock Kotak positions returning one position without instrument_token
+        mock_neo_client.positions.return_value = {
+            "data": [
+                {
+                    "trdSym": "NIFTY2671425200CE",
+                    "netQty": "-1755",
+                    "avgPrice": "1.0",
+                    "ltp": "1.0",
+                    "realizedPL": "0.0",
+                    "prod": "NRML",
+                    "exch": "NFO",
+                }
+            ]
+        }
+
+        # Mock Zerodha client ltp call
+        self.mock_kite.ltp.return_value = {
+            "NFO:NIFTY2671425200CE": {
+                "instrument_token": 98765,
+                "last_price": 142.5
+            }
+        }
+
+        with _patch.dict(sys.modules, {"neo_api_client": mock_neo_module}), \
+             _patch("cli.kotak_manager._load_sessions", return_value={}):
+            client = ac.KCLIClient([
+                {
+                    "name": "ZK",
+                    "broker": "zerodha",
+                    "api_key": "zk_key",
+                    "api_secret": "secret",
+                },
+                {
+                    "name": "KotakAcc",
+                    "broker": "kotak",
+                    "consumer_key": "kt_key",
+                    "consumer_secret": "secret",
+                }
+            ])
+            # Pretend both are authenticated
+            ac._account_manager_map["zk_key"]._authenticated["zk_key"] = True
+            ac._account_manager_map["kt_key"]._authenticated["kt_key"] = True
+
+            # Call get_positions
+            res = client.get_positions(["zk_key", "kt_key"])
+            
+            # Find the Kotak account result
+            kotak_res = next(a for a in res["accounts"] if a["api_key"] == "kt_key")
+            self.assertEqual(len(kotak_res["positions"]), 1)
+            pos = kotak_res["positions"][0]
+            
+            # Assertions on resolved values
+            self.assertEqual(pos["instrument_token"], 98765)
+            self.assertEqual(pos["last_price"], 142.5)
+            self.assertAlmostEqual(pos["pnl"], -248332.5)
+
+    def test_kotak_place_order_transaction_type_mapping_and_errors(self):
+        from cli.kotak_manager import KotakAccountManager
+        mgr = KotakAccountManager()
+        mock_neo = MagicMock()
+        mgr._clients["k1"] = mock_neo
+        mgr._authenticated["k1"] = True
+
+        # Test successful order placement maps transaction type
+        mock_neo.place_order.return_value = {"nOrdNo": "123456"}
+        order_ids = mgr.place_order(
+            api_key="k1",
+            tradingsymbol="NIFTY26JUL26200CE",
+            exchange="NFO",
+            transaction_type="BUY",
+            quantity=100,
+            order_type="LIMIT",
+            price=1.0,
+            product="NRML"
+        )
+        self.assertEqual(order_ids, ["123456"])
+        # Verify it mapped "BUY" to "B" when calling place_order
+        mock_neo.place_order.assert_called_with(
+            exchange_segment="NFO",
+            product="NRML",
+            price="1.0",
+            order_type="L",
+            quantity="100",
+            validity="DAY",
+            trading_symbol="NIFTY26JUL26200CE",
+            transaction_type="B",
+            amo="NO",
+            disclosed_quantity="0",
+            market_protection="0",
+            pf="N",
+            trigger_price="0",
+            tag=None
+        )
+
+        # Test that returning an SDK-level error dictionary raises a RuntimeError
+        mock_neo.place_order.return_value = {"Error": "Some validation error"}
+        with self.assertRaises(RuntimeError) as ctx:
+            mgr.place_order(
+                api_key="k1",
+                tradingsymbol="NIFTY26JUL26200CE",
+                exchange="NFO",
+                transaction_type="BUY",
+                quantity=100,
+                order_type="LIMIT",
+                price=1.0,
+                product="NRML"
+            )
+        self.assertIn("Some validation error", str(ctx.exception))
+
+        # Test that returning a backend-level error dictionary raises a RuntimeError
+        mock_neo.place_order.return_value = {"stCode": 100008, "errMsg": "unauthorized", "stat": "Not_Ok"}
+        with self.assertRaises(RuntimeError) as ctx:
+            mgr.place_order(
+                api_key="k1",
+                tradingsymbol="NIFTY26JUL26200CE",
+                exchange="NFO",
+                transaction_type="BUY",
+                quantity=100,
+                order_type="LIMIT",
+                price=1.0,
+                product="NRML"
+            )
+        self.assertIn("unauthorized", str(ctx.exception))
+        self.assertIn("100008", str(ctx.exception))
+
+        # Test that returning 'No Data' (code 5203) does not raise any exceptions
+        mock_neo.place_order.return_value = {"stCode": 5203, "errMsg": "No Data", "stat": "Not_Ok"}
+        # This should return a list with an empty order_id (from fallback str(resp)) or similar, but not raise an error
+        try:
+            mgr.place_order(
+                api_key="k1",
+                tradingsymbol="NIFTY26JUL26200CE",
+                exchange="NFO",
+                transaction_type="BUY",
+                quantity=100,
+                order_type="LIMIT",
+                price=1.0,
+                product="NRML"
+            )
+        except Exception as exc:
+            self.fail(f"place_order raised an exception on No Data: {exc}")
 
 
 if __name__ == "__main__":

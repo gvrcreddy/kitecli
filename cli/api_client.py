@@ -82,6 +82,7 @@ class KCLIClient:
                     ucc=acct.get("ucc", ""),
                     name=acct.get("name", ""),
                     totp_secret=acct.get("totp_secret", ""),
+                    proxy=acct.get("proxy"),
                 )
                 _account_manager_map[account_key] = mgr
                 # Ensure api_key field is populated for downstream code
@@ -127,6 +128,7 @@ class KCLIClient:
                     ucc=acct.get("ucc", ""),
                     name=name,
                     totp_secret=acct.get("totp_secret", ""),
+                    proxy=acct.get("proxy"),
                 )
                 _account_manager_map[account_key] = mgr
                 acct.setdefault("api_key", account_key)
@@ -229,12 +231,11 @@ class KCLIClient:
                 }
             try:
                 positions = mgr.get_positions(api_key)
-                total_pnl = sum(p.get("pnl", 0.0) for p in positions)
                 return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "positions": positions,
-                    "total_pnl": total_pnl,
+                    "total_pnl": 0.0,
                     "status": "success",
                 }
             except Exception as exc:
@@ -248,6 +249,53 @@ class KCLIClient:
 
         with ThreadPoolExecutor(max_workers=max(1, len(keys))) as executor:
             results = list(executor.map(fetch_one, keys))
+
+        # Check if there are any positions needing instrument_token/LTP resolution
+        symbols_to_resolve = set()
+        for res in results:
+            if res.get("status") == "success":
+                for pos in res.get("positions", []):
+                    if not pos.get("instrument_token") and pos.get("tradingsymbol"):
+                        symbols_to_resolve.add(pos["tradingsymbol"])
+
+        if symbols_to_resolve:
+            # Find the first available authenticated Zerodha account
+            zerodha_api_key = None
+            for key in self._api_keys:
+                if self.is_authenticated(key):
+                    zerodha_api_key = key
+                    break
+
+            if zerodha_api_key:
+                try:
+                    ltp_map = self.get_ltp_and_tokens(zerodha_api_key, list(symbols_to_resolve))
+                    if ltp_map:
+                        for res in results:
+                            if res.get("status") == "success":
+                                for pos in res.get("positions", []):
+                                    if not pos.get("instrument_token") and pos.get("tradingsymbol"):
+                                        sym = pos["tradingsymbol"]
+                                        if sym in ltp_map:
+                                            pos["instrument_token"] = ltp_map[sym].get("instrument_token")
+                                            ltp = ltp_map[sym].get("last_price")
+                                            if ltp is not None:
+                                                pos["last_price"] = ltp
+                                                qty = pos.get("quantity", 0)
+                                                avg = pos.get("average_price", 0.0)
+                                                pnl = (ltp - avg) * qty if qty != 0 else pos.get("realised", 0.0)
+                                                pos["pnl"] = pnl
+                                                pos["unrealised"] = (ltp - avg) * qty if qty != 0 else 0.0
+                                                if avg > 0 and qty != 0:
+                                                    pos["pnl_pct"] = (pnl / (avg * abs(qty))) * 100
+                                                else:
+                                                    pos["pnl_pct"] = 0.0
+                except Exception:
+                    pass
+
+        # Calculate final total_pnl for each account
+        for res in results:
+            if res.get("status") == "success":
+                res["total_pnl"] = sum(p.get("pnl", 0.0) for p in res.get("positions", []))
 
         return {"accounts": results}
 
@@ -486,6 +534,13 @@ class KCLIClient:
         """Get the access token for an authenticated account."""
         return _manager_for(api_key).get_access_token(api_key)
 
+    def create_ticker(self, api_key: str):
+        """Create a WebSocket ticker for the broker associated with api_key."""
+        mgr = _manager_for(api_key)
+        if hasattr(mgr, "create_ticker"):
+            return mgr.create_ticker(api_key)
+        return None
+
     def check_token(self, api_key: str) -> dict:
         """Validate an account's access token. Returns status/detail dict."""
         # check_token is Zerodha-specific (kite.profile()). For non-Zerodha accounts
@@ -502,3 +557,11 @@ class KCLIClient:
             "status": "valid" if authenticated else "no_token",
             "detail": "authenticated" if authenticated else "not authenticated",
         }
+
+    def get_ltp_and_tokens(self, api_key: str, symbols: list[str]) -> dict:
+        """Fetch LTP and instrument tokens for the given symbols using the designated manager."""
+        mgr = _manager_for(api_key)
+        if hasattr(mgr, "get_ltp_and_tokens"):
+            return mgr.get_ltp_and_tokens(api_key, symbols)
+        return {}
+

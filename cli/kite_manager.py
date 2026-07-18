@@ -97,6 +97,14 @@ class KiteAccountManager(BaseBrokerManager):
         """Core account initialisation (used both directly and via ABC)."""
         proxies = {"http": proxy, "https": proxy} if proxy else None
         kite = KiteConnect(api_key=api_key, proxies=proxies)
+        
+        # Increase connection pool size and timeouts to support slow proxies
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
+        kite.reqsession.mount("https://", adapter)
+        kite.reqsession.mount("http://", adapter)
+        kite.timeout = 25
+
         self._clients[api_key] = kite
         self._api_secrets[api_key] = api_secret
         self._account_names[api_key] = name or api_key
@@ -106,18 +114,9 @@ class KiteAccountManager(BaseBrokerManager):
         sessions = _load_sessions()
         saved_token = sessions.get(api_key)
         if saved_token:
-            logger.info("Found saved session token for '%s' (api_key=%s…). Verifying...", name, api_key[:8])
-            try:
-                kite.set_access_token(saved_token)
-                kite.profile()
-                self._authenticated[api_key] = True
-                logger.info("Successfully restored valid session for '%s' (api_key=%s…)", name, api_key[:8])
-            except Exception as exc:
-                logger.info(
-                    "Saved session token for '%s' (api_key=%s…) is invalid or expired: %s",
-                    name, api_key[:8], exc,
-                )
-                self._authenticated[api_key] = False
+            logger.debug("Found saved session token for '%s' (api_key=%s…). Assuming valid.", name, api_key[:8])
+            kite.set_access_token(saved_token)
+            self._authenticated[api_key] = True
 
         login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
         logger.info("Initialized account '%s' (api_key=%s…)", name, api_key[:8])
@@ -374,6 +373,11 @@ class KiteAccountManager(BaseBrokerManager):
         # Build a requests.Session and apply the per-account proxy so that
         # login and 2FA calls also flow through the proxy (not just KiteConnect SDK calls).
         session = http_requests.Session()
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
         account_proxies = self._proxies.get(api_key, {})
         if account_proxies:
             session.proxies.update(account_proxies)
@@ -384,6 +388,7 @@ class KiteAccountManager(BaseBrokerManager):
             login_resp = session.post(
                 "https://kite.zerodha.com/api/login",
                 data={"user_id": user_id, "password": password},
+                timeout=25,
             )
             login_data = login_resp.json()
 
@@ -411,6 +416,7 @@ class KiteAccountManager(BaseBrokerManager):
                     "user_id": user_id,
                     "twofa_type": "totp",
                 },
+                timeout=25,
             )
             twofa_data = twofa_resp.json()
 
@@ -434,24 +440,19 @@ class KiteAccountManager(BaseBrokerManager):
 
             for hop in range(1, 11):
                 logger.info("Auto-login hop %d: %s", hop, current_url)
-                try:
-                    resp = session.get(current_url, allow_redirects=False)
-                except http_requests.exceptions.RequestException as exc:
-                    logger.warning("Network error/unreachable during redirect hop %d: %s", hop, exc)
-                    # Check if the url itself contained the token before network error
-                    parsed = urlparse(current_url)
-                    query_params = parse_qs(parsed.query)
-                    token = query_params.get("request_token", [None])[0]
-                    if token:
-                        request_token = token
-                    break
 
-                # Check if current_url already contains the request_token
+                # Check if current_url already contains the request_token BEFORE requesting it
                 parsed = urlparse(current_url)
                 query_params = parse_qs(parsed.query)
                 token = query_params.get("request_token", [None])[0]
                 if token:
                     request_token = token
+                    break
+
+                try:
+                    resp = session.get(current_url, allow_redirects=False, timeout=25)
+                except http_requests.exceptions.RequestException as exc:
+                    logger.warning("Network error/unreachable during redirect hop %d: %s", hop, exc)
                     break
 
                 location = resp.headers.get("Location")
@@ -465,21 +466,14 @@ class KiteAccountManager(BaseBrokerManager):
 
                 current_url = location
 
-                # Check if target redirect URL contains the request_token
-                parsed = urlparse(current_url)
-                query_params = parse_qs(parsed.query)
-                token = query_params.get("request_token", [None])[0]
-                if token:
-                    request_token = token
-                    break
-
                 # If target URL is not a Zerodha domain (e.g. localhost or client app domain),
                 # do not actually request it (it may not be reachable or could trigger external side-effects),
                 # and we've already checked if it has the request_token.
                 parsed_loc = urlparse(current_url)
                 if parsed_loc.netloc and not parsed_loc.netloc.endswith(".zerodha.com") and "zerodha.com" not in parsed_loc.netloc:
                     logger.info("Reached non-Zerodha redirect target: %s", current_url)
-                    break
+                    # We will extract the token at the start of the next iteration
+                    pass
 
             if not request_token:
                 logger.error("Could not extract request_token from redirect chain for %s", user_id)
@@ -1064,38 +1058,7 @@ class KiteAccountManager(BaseBrokerManager):
                     except Exception as exc:
                         logger.warning("Kite indices fetch failed for api_key=%s…: %s", api_key[:8], exc)
 
-        # 2. Fallback to Yahoo Finance chart API (in parallel)
-        try:
-            logger.info("Fetching indices from Yahoo Finance fallback...")
-            import requests as http_requests
-            headers = {"User-Agent": "Mozilla/5.0"}
-            from concurrent.futures import ThreadPoolExecutor
-
-            symbols = {
-                "nifty": "^NSEI",
-                "sensex": "^BSESN",
-                "vix": "^INDIAVIX",
-            }
-
-            def fetch_symbol_price(item):
-                name, code = item
-                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}?interval=1m&range=1d"
-                resp = http_requests.get(url, headers=headers, timeout=5)
-                price = resp.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
-                return name, float(price)
-
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                results = dict(executor.map(fetch_symbol_price, symbols.items()))
-
-            return {
-                "status": "success",
-                "nifty": results["nifty"],
-                "sensex": results["sensex"],
-                "vix": results["vix"],
-            }
-        except Exception as exc:
-            logger.error("Yahoo Finance fallback failed: %s", exc)
-            return {"status": "error", "message": f"Kite call had insufficient permission, and Yahoo fallback failed: {exc}"}
+        return {"status": "error", "message": "All authenticated Zerodha account indices fetches failed."}
 
     def get_ltp_and_tokens(self, api_key: str, symbols: list[str]) -> dict:
         """Fetch LTP and instrument tokens for the given symbols using Zerodha ltp()."""

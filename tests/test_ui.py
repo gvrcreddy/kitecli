@@ -94,5 +94,27 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
         mock_run_coroutine.assert_called_once()
         self.session.log_message.assert_any_call("Triggering manual WebSocket and REST reconnection...")
 
+    @patch("cli.live_session.KCLILiveSession._update_info_buffer")
+    def test_info_pane_tabs(self, mock_update_buffer):
+        self.session.info_mode = "orders_pending"
+        fragments = self.session._get_tab_bar_text()
+        
+        self.assertEqual(fragments[1][0], "class:tab.active")
+        self.assertEqual(fragments[1][1], " Pending ")
+        self.assertEqual(fragments[3][0], "class:tab.inactive")
+        self.assertEqual(fragments[3][1], " Executed ")
+        
+        click_handler_oc = fragments[5][2]
+        
+        from prompt_toolkit.mouse_events import MouseEventType
+        mock_event = MagicMock()
+        mock_event.event_type = MouseEventType.MOUSE_UP
+        
+        click_handler_oc(mock_event)
+        
+        self.assertEqual(self.session.info_mode, "oc")
+        mock_update_buffer.assert_called_once()
+        self.session.app.invalidate.assert_called_once()
+
 if __name__ == "__main__":
     unittest.main()

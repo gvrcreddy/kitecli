@@ -386,6 +386,10 @@ class KCLILiveSession:
             "divider": "bg:#21262d fg:#30363d",
             "divider.dragging": "bg:#0969da fg:#ffffff bold",
             "market_indices": "bg:#161b22",
+            "tab_bar": "bg:#161b22",
+            "tab.active": "bg:#1f6feb fg:#ffffff bold",
+            "tab.inactive": "bg:#21262d fg:#8b949e",
+            "tab.separator": "fg:#30363d",
             # Quick action bar
             "quickaction": "bg:#161b22 fg:#8b949e",
             "quickaction.hint": "bg:#161b22 fg:#484f58 italic",
@@ -946,6 +950,62 @@ class KCLILiveSession:
 
         return [(status_style, status_label, _header_click_handler)]
 
+    def _get_tab_bar_text(self):
+        """Build clickable, styled text fragments for the info pane tabs."""
+        def make_click_handler(mode):
+            def handler(*args, **kwargs):
+                from prompt_toolkit.mouse_events import MouseEventType
+                mouse_event = None
+                if len(args) == 2:
+                    mouse_event = args[1]
+                elif len(args) == 1:
+                    mouse_event = args[0]
+                
+                if mouse_event and mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self.info_mode = mode
+                    self._update_info_buffer()
+                    if hasattr(self, "app") and self.app:
+                        self.app.invalidate()
+            return handler
+
+        fragments = []
+        
+        # Tiny spacing for visual margin
+        fragments.append(("", " "))
+        
+        # Tab 1: Pending
+        fragments.append((
+            "class:tab.active" if self.info_mode == "orders_pending" else "class:tab.inactive",
+            " Pending ",
+            make_click_handler("orders_pending")
+        ))
+        fragments.append(("", " "))
+        
+        # Tab 2: Executed
+        fragments.append((
+            "class:tab.active" if self.info_mode == "orders_executed" else "class:tab.inactive",
+            " Executed ",
+            make_click_handler("orders_executed")
+        ))
+        fragments.append(("", " "))
+        
+        # Tab 3: OC (Option Chain)
+        fragments.append((
+            "class:tab.active" if self.info_mode == "oc" else "class:tab.inactive",
+            " OC ",
+            make_click_handler("oc")
+        ))
+        fragments.append(("", " "))
+        
+        # Tab 4: Advisor
+        fragments.append((
+            "class:tab.active" if self.info_mode == "advisor" else "class:tab.inactive",
+            " Advisor ",
+            make_click_handler("advisor")
+        ))
+        
+        return fragments
+
     async def reconnect_websockets(self) -> None:
         """Close existing WebSocket connections and start fresh ones, updating the UI."""
         self.log_message("[#58a6ff]Closing existing WebSocket connections...[/#]")
@@ -983,72 +1043,85 @@ class KCLILiveSession:
         self.log_message("Running token diagnostics...")
         statuses: dict[str, str] = {}
         any_bad = False
-        for acct in self.accounts:
+
+        async def diagnose_account(acct):
             api_key = acct.get("api_key")
+            name = acct.get("name", api_key)
             if not api_key:
-                continue
+                return api_key, "no_token", name, "", acct, [], False
+
+            logs = []
+            is_bad = False
+            broker = acct.get("broker", "zerodha").lower()
+            
+            # Fast path for Zerodha: try WebSocket auth first
+            if broker == "zerodha":
+                access_token = self.client.get_access_token(api_key)
+                if not access_token:
+                    logs.append(f"[#ff8700]⚠ No token:[/#] @{name} — login required (run 'kcli init').")
+                    return api_key, "no_token", name, "no access token", acct, logs, True
+                
+                proxy_str = acct.get("proxy")
+                ws_status, ws_detail = await self._run_api_call(
+                    probe_ws_auth, api_key, access_token, proxy_str
+                )
+                
+                if ws_status == "ok":
+                    logs.append(f"[#00ff00]✓ Streaming OK:[/#] @{name}")
+                    return api_key, "valid", name, "", acct, logs, False
+                elif ws_status == "proxy_blocked":
+                    logs.append(f"[#ff8700]⚠ Proxy blocked streaming:[/#] @{name} — proxy refused the WebSocket tunnel ({ws_detail}).")
+                    return api_key, "proxy_blocked", name, ws_detail, acct, logs, True
+            
+            # If we are here, either it's Kotak, or Zerodha WS failed. 
+            # Fallback to the full REST check_token to find out exactly why.
             try:
                 result = await self._run_api_call(self.client.check_token, api_key)
             except Exception as exc:
-                result = {"name": acct.get("name", api_key), "status": "error",
-                          "detail": str(exc)}
+                result = {"name": name, "status": "error", "detail": str(exc)}
+            
             status = result.get("status", "error")
-            statuses[api_key] = status
-            name = result.get("name", api_key)
             detail = result.get("detail", "")
+            
             if status == "valid":
-                broker = acct.get("broker", "zerodha").lower()
                 if broker != "zerodha":
-                    # Non-Zerodha accounts (e.g. Kotak) use their own WebSocket
-                    # feed — do not probe ws.kite.trade with a non-Zerodha token.
-                    self.log_message(f"[#00ff00]✓ Token OK:[/#] @{name}")
-                elif broker == "zerodha":
-                    # REST works, but that does NOT guarantee streaming works: the
-                    # WebSocket can still reject this token with 403 "Authentication
-                    # failed" (per api_key/app — e.g. no active streaming
-                    # subscription). Probe the actual WS handshake so we only start
-                    # tickers that will succeed and avoid a 403 reconnect storm.
-                    access_token = self.client.get_access_token(api_key)
-                    proxy_str = acct.get("proxy")
-                    ws_status, ws_detail = await self._run_api_call(
-                        probe_ws_auth, api_key, access_token, proxy_str
+                    logs.append(f"[#00ff00]✓ Token OK:[/#] @{name}")
+                else:
+                    # Zerodha REST is valid, but we already know WS failed from the fast-path above!
+                    is_bad = True
+                    status = "stream_forbidden"
+                    logs.append(
+                        f"[#ff0000]✗ Streaming rejected:[/#] @{name} — "
+                        f"WebSocket auth failed. REST works, so the "
+                        f"token is valid but this api_key lacks streaming access. "
+                        f"Check the app's subscription on the Kite Connect dashboard."
                     )
-                    if ws_status == "ok":
-                        self.log_message(f"[#00ff00]✓ Streaming OK:[/#] @{name}")
-                    elif ws_status == "auth_failed":
-                        any_bad = True
-                        statuses[api_key] = "stream_forbidden"
-                        self.log_message(
-                            f"[#ff0000]✗ Streaming rejected:[/#] @{name} — "
-                            f"WebSocket auth failed ({ws_detail}). REST works, so the "
-                            f"token is valid but this api_key lacks streaming access. "
-                            f"Check the app's subscription on the Kite Connect dashboard."
-                        )
-                    elif ws_status == "proxy_blocked":
-                        any_bad = True
-                        statuses[api_key] = "proxy_blocked"
-                        self.log_message(
-                            f"[#ff8700]⚠ Proxy blocked streaming:[/#] @{name} — "
-                            f"proxy refused the WebSocket tunnel ({ws_detail})."
-                        )
-                    else:
-                        # Inconclusive probe — let the ticker try anyway.
-                        self.log_message(
-                            f"[#ff8700]⚠ Streaming check inconclusive:[/#] @{name} "
-                            f"({ws_detail}). Will attempt to connect."
-                        )
             elif status == "no_token":
-                any_bad = True
-                self.log_message(f"[#ff8700]⚠ No token:[/#] @{name} — login required (run 'kcli init').")
+                is_bad = True
+                logs.append(f"[#ff8700]⚠ No token:[/#] @{name} — login required (run 'kcli init').")
             elif status == "expired":
-                any_bad = True
-                self.log_message(f"[#ff8700]⚠ Token expired:[/#] @{name} — re-login (run 'kcli init'). {detail}")
+                is_bad = True
+                logs.append(f"[#ff8700]⚠ Token expired:[/#] @{name} — re-login (run 'kcli init'). {detail}")
             elif status == "forbidden":
-                any_bad = True
-                self.log_message(f"[#ff0000]✗ Forbidden:[/#] @{name} — token rejected / no streaming entitlement. {detail}")
+                is_bad = True
+                logs.append(f"[#ff0000]✗ Forbidden:[/#] @{name} — token rejected / no streaming entitlement. {detail}")
             else:
+                is_bad = True
+                logs.append(f"[#ff0000]✗ Token check failed:[/#] @{name} — {detail}")
+
+            return api_key, status, name, detail, acct, logs, is_bad
+
+        tasks = [diagnose_account(acct) for acct in self.accounts]
+        results = await asyncio.gather(*tasks)
+
+        for api_key, status, name, detail, acct, logs, is_bad in results:
+            if not api_key:
+                continue
+            statuses[api_key] = status
+            for log_msg in logs:
+                self.log_message(log_msg)
+            if is_bad:
                 any_bad = True
-                self.log_message(f"[#ff0000]✗ Token check failed:[/#] @{name} — {detail}")
 
         if any_bad:
             self.log_message(
@@ -1090,15 +1163,16 @@ class KCLILiveSession:
     async def _initial_fetch_and_connect(self) -> None:
         """Initial fetch of data and connect all WebSockets."""
         self.log_message("Initializing connections and fetching data...")
+        
+        # Fire off REST data fetch in the background so it doesn't block WebSockets
+        if hasattr(self, "app") and self.app and self.app.loop:
+            asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+        
         try:
-            await self._trigger_immediate_refresh()
-        except Exception as exc:
-            self.log_message(f"[#ff0000]Initial fetch failed:[/#] {exc}")
-
-        # Diagnose token validity up front. The same api_key/access_token pair is
-        # used for the WebSocket ticker, so a REST 403/expired here explains the
-        # "1006 / 403 Forbidden" handshake failures.
-        token_statuses = await self._diagnose_tokens()
+            token_statuses = await self._diagnose_tokens()
+        except Exception as e:
+            self.log_message(f"[#ff0000]Initial task failed:[/#] {e}")
+            token_statuses = {}
 
         # Choose the primary streaming account (used for index + option-chain
         # streaming). Index/OC ticks are subscribed only on this account.
@@ -1115,7 +1189,7 @@ class KCLILiveSession:
             )
 
         # Connect WebSockets for accounts that support it (Zerodha and Kotak).
-        for acct in self.accounts:
+        for idx, acct in enumerate(self.accounts):
             api_key = acct.get("api_key")
             broker = acct.get("broker", "zerodha").lower()
             access_token = self.client.get_access_token(api_key)
@@ -1127,6 +1201,9 @@ class KCLILiveSession:
                     f"token not valid ({token_statuses.get(api_key)})."
                 )
                 continue
+
+            if idx > 0:
+                await asyncio.sleep(0.2)
 
             if api_key and (access_token or broker == "kotak"):
                 try:
@@ -4021,6 +4098,18 @@ class KCLILiveSession:
             get_vertical_scroll=lambda win: self._info_control.buffer.document.cursor_position_row,
         )
 
+        # Define tab bar control and window for the info pane
+        self.tab_bar_control = FormattedTextControl(
+            text=self._get_tab_bar_text,
+            focusable=False,
+        )
+        self.tab_bar_window = Window(
+            content=self.tab_bar_control,
+            height=1,
+            wrap_lines=False,
+            style="class:tab_bar",
+        )
+
         def make_scroll_handler(window, control):
             original_handler = control.mouse_handler
             def scroll_mouse_handler(mouse_event):
@@ -4136,12 +4225,11 @@ class KCLILiveSession:
 
         @kb.add("tab")
         def _tab(event):
-            """Cycle focus: input -> positions -> logs -> info pane -> input."""
+            """Cycle focus: input -> positions -> info pane -> input."""
             cur = event.app.layout.current_control
             cycle = [
                 self.input_field.control,
                 self.positions_control,
-                self._logs_control,
                 self._info_control,
             ]
             try:
@@ -4151,26 +4239,34 @@ class KCLILiveSession:
                 nxt = self.input_field.control
             event.app.layout.focus(nxt)
 
-        # F1/F2/F3 — switch info pane content
+        # Ctrl+1/2/3/4 & F1-F4 — switch info pane content
+        @kb.add("c-1")
         @kb.add("f1")
-        def _f1(event):
+        def _c1(event):
             self.info_mode = "orders_pending"
             self._update_info_buffer()
+            event.app.invalidate()
 
+        @kb.add("c-2")
         @kb.add("f2")
-        def _f2(event):
+        def _c2(event):
             self.info_mode = "orders_executed"
             self._update_info_buffer()
+            event.app.invalidate()
 
+        @kb.add("c-3")
         @kb.add("f3")
-        def _f3(event):
+        def _c3(event):
             self.info_mode = "oc"
             self._update_info_buffer()
+            event.app.invalidate()
 
+        @kb.add("c-4")
         @kb.add("f4")
-        def _f4(event):
+        def _c4(event):
             self.info_mode = "advisor"
             self._update_info_buffer()
+            event.app.invalidate()
 
         # Ctrl+Left/Right — adjust left/right pane split
         @kb.add("c-left")
@@ -4183,17 +4279,6 @@ class KCLILiveSession:
             self.left_width_pct = min(80, self.left_width_pct + 5)
             event.app.invalidate()
 
-        # Ctrl+Up/Down — adjust log pane height within left half
-        @kb.add("c-up")
-        def _shrink_log(event):
-            self.log_height_lines = max(4, self.log_height_lines - 2)
-            event.app.invalidate()
-
-        @kb.add("c-down")
-        def _grow_log(event):
-            self.log_height_lines = min(30, self.log_height_lines + 2)
-            event.app.invalidate()
-
         # Build dividers
         self.vertical_divider = Window(
             content=FormattedTextControl(
@@ -4201,15 +4286,6 @@ class KCLILiveSession:
                 focusable=False,
             ),
             width=1,
-            style="class:divider",
-        )
-
-        self.horizontal_divider = Window(
-            content=FormattedTextControl(
-                text="━" * 250,
-                focusable=False,
-            ),
-            height=1,
             style="class:divider",
         )
 
@@ -4221,15 +4297,7 @@ class KCLILiveSession:
                 self.vertical_divider.style = "class:divider.dragging"
                 self.app.invalidate()
 
-        def h_divider_mouse_handler(mouse_event):
-            from prompt_toolkit.mouse_events import MouseEventType
-            if mouse_event.event_type == MouseEventType.MOUSE_DOWN:
-                self.dragging_horizontal = True
-                self.horizontal_divider.style = "class:divider.dragging"
-                self.app.invalidate()
-
         self.vertical_divider.content.mouse_handler = v_divider_mouse_handler
-        self.horizontal_divider.content.mouse_handler = h_divider_mouse_handler
 
         # Monkey-patch MouseHandlers.__init__ to wrap with DragInterceptDict
         original_init = MouseHandlers.__init__
@@ -4240,32 +4308,27 @@ class KCLILiveSession:
 
         # ── Dynamic Layout ─────────────────────────────────────────
         # DynamicContainer rebuilds the body on each render using current
-        # self.left_width_pct and self.log_height_lines values.
+        # self.left_width_pct value.
         def _build_body():
             self._update_positions_display()
             lw = self.left_width_pct           # left weight (20-80)
             rw = 100 - lw                      # right weight
 
             return VSplit([
-                # ── LEFT half: Positions (scrollable) + Logs (scrollable) ──
-                HSplit([
-                    Frame(
-                        title="Active Positions (Live Ticks) [Tab: focus]",
-                        body=self.positions_window,
-                        style=self._get_frame_style(self.positions_window),
-                    ),
-                    self.horizontal_divider,
-                    Frame(
-                        title="Status Logs [Tab: focus] [Ctrl+↑↓: resize]",
-                        body=self.logs_window,
-                        style=self._get_frame_style(self.logs_window),
-                    ),
-                ], width=D(weight=lw)),
-                self.vertical_divider,
-                # ── RIGHT half: Info Pane (scrollable) ──
+                # ── LEFT half: Positions (scrollable) ──
                 Frame(
-                    title="[F1] Pending  [F2] Executed  [F3] Option Chain  [F4] Advisor  [Ctrl+←→: resize]",
+                    title="Active Positions (Live Ticks) [Tab: focus]",
+                    body=self.positions_window,
+                    style=self._get_frame_style(self.positions_window),
+                    width=D(weight=lw),
+                ),
+                self.vertical_divider,
+                # ── RIGHT half: Info Pane with clickable tabs (scrollable) ──
+                Frame(
+                    title="",
                     body=HSplit([
+                        self.tab_bar_window,
+                        Window(height=1, char="─", style="class:divider"),
                         Window(
                             content=self.market_indices_control,
                             height=1,

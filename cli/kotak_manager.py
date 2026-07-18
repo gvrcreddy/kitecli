@@ -148,6 +148,9 @@ class KotakAccountManager(BaseBrokerManager):
         self._authenticated: dict[str, bool] = {}
         # consumer_key → stored credentials for re-auth
         self._credentials: dict[str, dict] = {}
+        import threading as _threading
+        self._auth_lock = _threading.Lock()
+        self._last_login_time: dict[str, float] = {}
 
     # ── account lifecycle ──────────────────────────────────────────────────────
 
@@ -255,7 +258,10 @@ class KotakAccountManager(BaseBrokerManager):
             def _do_req(h):
                 req_kwargs = {}
                 if _proxies:
-                    req_kwargs["proxies"] = _proxies
+                    # Kotak Neo static IP whitelisting is only enforced on order APIs
+                    url_lower = u_with_params.lower()
+                    if "/order/" in url_lower and any(x in url_lower for x in ["/place", "/modify", "/cancel"]):
+                        req_kwargs["proxies"] = _proxies
 
                 logger.debug("Kotak REST [%s] requesting: %s", method, u_with_params)
                 logger.debug("Kotak REST headers: %s", {k: v[:15] + '...' if len(str(v)) > 15 else v for k, v in h.items()})
@@ -355,100 +361,91 @@ class KotakAccountManager(BaseBrokerManager):
         sessions = _load_sessions()
         saved_session = sessions.get(f"kotak:{consumer_key}")
         if saved_session and isinstance(saved_session, dict):
-            logger.info(
-                "Found saved Kotak session for '%s' (key=%s…). Verifying...",
-                name, consumer_key[:8],
-            )
-            try:
-                client.configuration.edit_token = saved_session.get("edit_token")
-                client.configuration.edit_sid = saved_session.get("edit_sid")
-                client.configuration.edit_rid = saved_session.get("edit_rid")
-                client.configuration.serverId = saved_session.get("serverId")
-                client.configuration.data_center = saved_session.get("data_center")
-                client.configuration.base_url = saved_session.get("base_url")
-
-                # Verify token liveness
-                limits_resp = client.limits()
-                _check_neo_error(limits_resp)
-                self._authenticated[consumer_key] = True
-                logger.info(
-                    "Restored valid Kotak session for '%s' (key=%s…)", name, consumer_key[:8]
-                )
-            except Exception as exc:
-                logger.info(
-                    "Saved Kotak token for '%s' (key=%s…) expired: %s. Will attempt auto-login.",
-                    name, consumer_key[:8], exc,
-                )
-                self._authenticated[consumer_key] = False
+            logger.debug("Found saved Kotak session for '%s' (key=%s…). Assuming valid.", name, consumer_key[:8])
+            client.configuration.edit_token = saved_session.get("edit_token")
+            client.configuration.edit_sid = saved_session.get("edit_sid")
+            client.configuration.edit_rid = saved_session.get("edit_rid")
+            client.configuration.serverId = saved_session.get("serverId")
+            client.configuration.data_center = saved_session.get("data_center")
+            client.configuration.base_url = saved_session.get("base_url")
+            
+            self._authenticated[consumer_key] = True
 
         if not self._authenticated.get(consumer_key):
-            logger.info("No valid Kotak session found for '%s' (key=%s…). Attempting auto-login...", name, consumer_key[:8])
-            try:
-                self.auto_login(consumer_key)
-            except Exception as e:
-                logger.error("Auto-login failed for Kotak account '%s': %s", name, e)
+            logger.debug("No valid Kotak session found for '%s' (key=%s…).", name, consumer_key[:8])
 
         return ""  # no login URL for Kotak
 
     def auto_login(self, account_key: str, **_kwargs) -> bool:
         """Perform TOTP-based auto-login for the Kotak account."""
-        creds = self._credentials.get(account_key, {})
-        totp_secret = creds.get("totp_secret", "")
-        mobile_number = creds.get("mobile_number", "")
-        mpin = creds.get("mpin", "")
-        ucc = creds.get("ucc", "")
+        import time
+        with self._auth_lock:
+            # Debounce: if we just logged in within the last 15 seconds, skip re-login.
+            # This prevents concurrent threads from hammering the login endpoint when
+            # multiple requests see a 100008 (session expired) error simultaneously.
+            last_login = self._last_login_time.get(account_key, 0.0)
+            if time.time() - last_login < 15.0:
+                logger.info("Kotak auto-login skipped for key=%s… (debounced)", account_key[:8])
+                return True
 
-        if not (mobile_number and ucc and mpin and totp_secret):
-            logger.warning(
-                "Kotak auto-login skipped for key=%s…: incomplete credentials",
-                account_key[:8],
-            )
-            return False
+            creds = self._credentials.get(account_key, {})
+            totp_secret = creds.get("totp_secret", "")
+            mobile_number = creds.get("mobile_number", "")
+            mpin = creds.get("mpin", "")
+            ucc = creds.get("ucc", "")
 
-        client = self._clients.get(account_key)
-        if not client:
-            return False
+            if not (mobile_number and ucc and mpin and totp_secret):
+                logger.warning(
+                    "Kotak auto-login skipped for key=%s…: incomplete credentials",
+                    account_key[:8],
+                )
+                return False
 
-        try:
-            totp_code = pyotp.TOTP(totp_secret).now()
-            logger.info("Kotak login: sending login request for key=%s…", account_key[:8])
+            client = self._clients.get(account_key)
+            if not client:
+                return False
 
-            # Step 1: Initiate login
-            login_resp = client.totp_login(
-                mobile_number=mobile_number,
-                ucc=ucc,
-                totp=totp_code,
-            )
-            logger.debug("Kotak login resp: %s", login_resp)
-            if isinstance(login_resp, dict) and "Error" in login_resp:
-                raise RuntimeError(f"TOTP login failed: {login_resp}")
+            try:
+                totp_code = pyotp.TOTP(totp_secret).now()
+                logger.info("Kotak login: sending login request for key=%s…", account_key[:8])
 
-            # Step 2: 2FA validation with MPIN
-            session_resp = client.totp_validate(mpin=mpin)
-            logger.debug("Kotak 2FA resp: %s", session_resp)
-            if isinstance(session_resp, dict) and "Error" in session_resp:
-                raise RuntimeError(f"MPIN validation failed: {session_resp}")
+                # Step 1: Initiate login
+                login_resp = client.totp_login(
+                    mobile_number=mobile_number,
+                    ucc=ucc,
+                    totp=totp_code,
+                )
+                logger.debug("Kotak login resp: %s", login_resp)
+                if isinstance(login_resp, dict) and "Error" in login_resp:
+                    raise RuntimeError(f"TOTP login failed: {login_resp}")
 
-            # Persist token
-            conf = client.configuration
-            if getattr(conf, "edit_token", None):
-                session_data = {
-                    "edit_token": conf.edit_token,
-                    "edit_sid": conf.edit_sid,
-                    "edit_rid": conf.edit_rid,
-                    "serverId": conf.serverId,
-                    "data_center": conf.data_center,
-                    "base_url": conf.base_url,
-                }
-                _save_session(f"kotak:{account_key}", session_data)
+                # Step 2: 2FA validation with MPIN
+                session_resp = client.totp_validate(mpin=mpin)
+                logger.debug("Kotak 2FA resp: %s", session_resp)
+                if isinstance(session_resp, dict) and "Error" in session_resp:
+                    raise RuntimeError(f"MPIN validation failed: {session_resp}")
 
-            self._authenticated[account_key] = True
-            logger.info("Kotak auto-login successful for key=%s…", account_key[:8])
-            return True
+                # Persist token
+                conf = client.configuration
+                if getattr(conf, "edit_token", None):
+                    session_data = {
+                        "edit_token": conf.edit_token,
+                        "edit_sid": conf.edit_sid,
+                        "edit_rid": conf.edit_rid,
+                        "serverId": conf.serverId,
+                        "data_center": conf.data_center,
+                        "base_url": conf.base_url,
+                    }
+                    _save_session(f"kotak:{account_key}", session_data)
 
-        except Exception as exc:
-            logger.error(
-                "Kotak auto-login failed for key=%s…: %s", account_key[:8], exc, exc_info=True
+                self._authenticated[account_key] = True
+                self._last_login_time[account_key] = time.time()
+                logger.info("Kotak auto-login successful for key=%s…", account_key[:8])
+                return True
+
+            except Exception as exc:
+                logger.error(
+                    "Kotak auto-login failed for key=%s…: %s", account_key[:8], exc, exc_info=True
             )
             self._authenticated[account_key] = False
             return False

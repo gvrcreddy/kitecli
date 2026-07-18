@@ -1061,9 +1061,8 @@ class KCLILiveSession:
                     logs.append(f"[#ff8700]⚠ No token:[/#] @{name} — login required (run 'kcli init').")
                     return api_key, "no_token", name, "no access token", acct, logs, True
                 
-                proxy_str = acct.get("proxy")
                 ws_status, ws_detail = await self._run_api_call(
-                    probe_ws_auth, api_key, access_token, proxy_str
+                    probe_ws_auth, api_key, access_token, None
                 )
                 
                 if ws_status == "ok":
@@ -1229,10 +1228,10 @@ class KCLILiveSession:
                     ticker.on_close = self._make_on_close(api_key)
                     ticker.on_error = self._make_on_error(api_key)
 
-                    # Parse proxy if configured for this account
+                    # Parse proxy if configured for this account (Zerodha WS does not require IP whitelisting, direct is faster)
                     proxy_str = acct.get("proxy")
                     proxy_dict = None
-                    if proxy_str:
+                    if broker != "zerodha" and proxy_str:
                         from urllib.parse import urlparse
                         try:
                             p_str = proxy_str if "://" in proxy_str else f"http://{proxy_str}"

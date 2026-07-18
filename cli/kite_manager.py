@@ -111,6 +111,30 @@ class KiteAccountManager(BaseBrokerManager):
         self._authenticated[api_key] = False
         self._proxies[api_key] = proxies or {}
 
+        # Monkeypatch reqsession.request to bypass proxy for all non-order endpoints
+        orig_request = kite.reqsession.request
+        def proxied_request(method, url, *args, **kwargs):
+            method_upper = method.upper()
+            url_lower = url.lower()
+            # Only apply proxies for order placement, modification, or cancellation
+            is_order_api = (
+                method_upper in ("POST", "PUT", "DELETE") and
+                ("/orders" in url_lower or "/gtt" in url_lower)
+            )
+            if not is_order_api:
+                # Remove proxies for both the individual request kwargs and session-level config
+                kwargs["proxies"] = {}
+                orig_proxies = kite.reqsession.proxies
+                kite.reqsession.proxies = {}
+                try:
+                    return orig_request(method, url, *args, **kwargs)
+                finally:
+                    kite.reqsession.proxies = orig_proxies
+            else:
+                return orig_request(method, url, *args, **kwargs)
+
+        kite.reqsession.request = proxied_request
+
         sessions = _load_sessions()
         saved_token = sessions.get(api_key)
         if saved_token:
@@ -378,10 +402,9 @@ class KiteAccountManager(BaseBrokerManager):
         session.mount("https://", adapter)
         session.mount("http://", adapter)
 
-        account_proxies = self._proxies.get(api_key, {})
-        if account_proxies:
-            session.proxies.update(account_proxies)
-            logger.info("auto_login: using proxy for %s (api_key=%s…)", user_id, api_key[:8])
+        # Zerodha login does not enforce whitelisting, direct is faster and more reliable
+        # session.proxies.update(account_proxies)
+        # logger.info("auto_login: using proxy for %s (api_key=%s…)", user_id, api_key[:8])
 
         try:
             # Step 1: Login with user_id + password

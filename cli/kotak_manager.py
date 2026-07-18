@@ -39,6 +39,26 @@ def _patched_thread_init(self, *args, **kwargs):
     _orig_thread_init(self, *args, **kwargs)
 _threading.Thread.__init__ = _patched_thread_init
 
+import builtins as _builtins
+_orig_print = _builtins.print
+_sdk_logger = logging.getLogger("kotak_sdk_print")
+
+def _safe_print(*args, **kwargs):
+    try:
+        import inspect
+        frame = inspect.currentframe().f_back
+        if frame:
+            mod_name = frame.f_globals.get("__name__", "")
+            if mod_name and ("neo_api_client" in mod_name or "neo_api" in mod_name):
+                # Suppress SDK print pollution and redirect to debug logs
+                _sdk_logger.debug("SDK print suppressed: %s", " ".join(str(a) for a in args))
+                return
+    except Exception:
+        pass
+    _orig_print(*args, **kwargs)
+
+_builtins.print = _safe_print
+
 from cli.base_manager import BaseBrokerManager
 
 logger = logging.getLogger(__name__)
@@ -65,7 +85,7 @@ def _check_neo_error(resp: Any) -> None:
 
         # 2. Backend server-level errors
         stat = str(resp.get("stat", "")).upper()
-        if stat in ("NOT_OK", "FAIL", "ERROR"):
+        if stat in ("NOT_OK", "FAIL", "ERROR") or "ERROR" in stat:
             err_msg = resp.get("errMsg") or resp.get("desc") or resp.get("message") or "Unknown Kotak API error"
             st_code = resp.get("stCode") or resp.get("stcode")
             # If the error is simply 'No Data' (empty order book or positions), do not raise an exception
@@ -209,37 +229,91 @@ class KotakAccountManager(BaseBrokerManager):
 
         client = NeoAPI(environment="prod", consumer_key=consumer_key)
 
-        # Inject proxy into the SDK's REST client so every HTTP call
-        # (login, order placement, positions, etc.) routes through the proxy.
-        if proxy:
-            import requests as _req
-            import json as _json
-            import re as _re
-            from six.moves.urllib.parse import urlencode as _urlencode
-            _proxies = {"http": proxy, "https": proxy}
-            _orig_request = client.api_client.rest_client.request
+        import requests as _req
+        import json as _json
+        import re as _re
+        from six.moves.urllib.parse import urlencode as _urlencode
+        _proxies = {"http": proxy, "https": proxy} if proxy else None
+        _orig_request = client.api_client.rest_client.request
 
-            def _proxied_request(method, url, query_params=None, headers=None, body=None):
-                method = method.upper()
-                headers = headers or {}
-                if 'Content-Type' not in headers:
-                    headers['Content-Type'] = 'application/json'
+        def _proxied_request(method, url, query_params=None, headers=None, body=None):
+            method = method.upper()
+            headers = headers or {}
+            if 'Content-Type' not in headers:
+                headers['Content-Type'] = 'application/json'
+
+            u = url
+            if query_params:
+                u_with_params = u
+                if '?' not in u:
+                    u_with_params += '?' + _urlencode(query_params)
+                else:
+                    pass
+            else:
+                u_with_params = u
+
+            def _do_req(h):
+                req_kwargs = {}
+                if _proxies:
+                    req_kwargs["proxies"] = _proxies
+
+                logger.debug("Kotak REST [%s] requesting: %s", method, u_with_params)
+                logger.debug("Kotak REST headers: %s", {k: v[:15] + '...' if len(str(v)) > 15 else v for k, v in h.items()})
+
                 if method in ['POST', 'PUT', 'PATCH', 'DELETE']:
-                    if query_params:
-                        url += '?' + _urlencode(query_params)
-                    if _re.search('json', headers['Content-Type'], _re.IGNORECASE):
+                    if _re.search('json', h['Content-Type'], _re.IGNORECASE):
                         request_body = _json.dumps(body) if body is not None else None
-                        return _req.post(url=url, headers=headers, data=request_body, proxies=_proxies)
-                    elif _re.search('x-www-form-urlencoded', headers['Content-Type'], _re.IGNORECASE):
+                        return _req.post(url=u_with_params, headers=h, data=request_body, **req_kwargs)
+                    elif _re.search('x-www-form-urlencoded', h['Content-Type'], _re.IGNORECASE):
                         request_body = {"jData": _json.dumps(body)} if body is not None else {}
-                        return _req.post(url=url, headers=headers, data=request_body, proxies=_proxies)
+                        return _req.post(url=u_with_params, headers=h, data=request_body, **req_kwargs)
                 elif method == 'GET':
-                    if query_params:
-                        url += '?' + _urlencode(query_params)
-                    return _req.get(url=url, headers=headers, proxies=_proxies)
-                return _orig_request(method, url, query_params=query_params, headers=headers, body=body)
+                    return _req.get(url=u_with_params, headers=h, **req_kwargs)
+                return _orig_request(method, url, query_params=query_params, headers=h, body=body)
 
-            client.api_client.rest_client.request = _proxied_request
+            resp = _do_req(headers)
+            logger.info("Kotak REST %s %s → status %s", method, u_with_params, resp.status_code)
+            try:
+                logger.debug("Kotak REST response body: %s", resp.json())
+            except Exception:
+                logger.debug("Kotak REST response body (raw): %s", resp.text[:200])
+
+            # Check for IP mismatch error (stCode 1037) or Session expired (stCode 100008)
+            try:
+                resp_json = resp.json()
+                if isinstance(resp_json, dict):
+                    st_code = resp_json.get("stCode")
+                    err_msg = str(resp_json.get("errMsg", "")).lower()
+                    if (
+                        st_code == 1037 or 
+                        st_code == 100008 or 
+                        "session ip" in err_msg or 
+                        "unauthorized" in err_msg
+                    ):
+                        logger.info("Kotak session invalid (stCode=%s, msg='%s') for account '%s'. Triggering auto-login...", st_code, resp_json.get("errMsg"), name)
+                        if self.auto_login(consumer_key):
+                            # Update headers with new credentials
+                            headers["Sid"] = client.configuration.edit_sid
+                            headers["Auth"] = client.configuration.edit_token
+                            if isinstance(query_params, dict):
+                                if "sId" in query_params:
+                                    query_params["sId"] = client.configuration.serverId
+                                if "sid" in query_params:
+                                    query_params["sid"] = client.configuration.edit_sid
+                            logger.info("Retrying request after successful auto-login...")
+                            resp = _do_req(headers)
+                            logger.info("Kotak REST retry %s %s → status %s", method, u_with_params, resp.status_code)
+                            try:
+                                logger.debug("Kotak REST retry response body: %s", resp.json())
+                            except Exception:
+                                logger.debug("Kotak REST retry response body (raw): %s", resp.text[:200])
+            except Exception as e:
+                logger.debug("Failed to check response for session validity: %s", e)
+
+            return resp
+
+        client.api_client.rest_client.request = _proxied_request
+        if proxy:
             logger.info("Kotak account '%s': HTTP proxy enabled (%s…)", name, proxy[:20])
 
             # Also monkeypatch websocket-client (used by Kotak Neo WebSocket) to route over the proxy.
@@ -302,10 +376,17 @@ class KotakAccountManager(BaseBrokerManager):
                 )
             except Exception as exc:
                 logger.info(
-                    "Saved Kotak token for '%s' (key=%s…) expired: %s",
+                    "Saved Kotak token for '%s' (key=%s…) expired: %s. Will attempt auto-login.",
                     name, consumer_key[:8], exc,
                 )
                 self._authenticated[consumer_key] = False
+
+        if not self._authenticated.get(consumer_key):
+            logger.info("No valid Kotak session found for '%s' (key=%s…). Attempting auto-login...", name, consumer_key[:8])
+            try:
+                self.auto_login(consumer_key)
+            except Exception as e:
+                logger.error("Auto-login failed for Kotak account '%s': %s", name, e)
 
         return ""  # no login URL for Kotak
 
@@ -675,11 +756,22 @@ class KotakAccountManager(BaseBrokerManager):
         }
         kotak_transaction_type = transaction_type_map.get(transaction_type, transaction_type)
 
+        # Resolve option lot size to align split legs
+        from cli.api_client import _kite_manager
+        lot_size = _kite_manager.get_nfo_lot_sizes().get(tradingsymbol, 1)
+
         KOTAK_FREEZE_LIMIT = 1800
+        if lot_size > 1:
+            freeze_limit = (KOTAK_FREEZE_LIMIT // lot_size) * lot_size
+            if freeze_limit == 0:
+                freeze_limit = lot_size
+        else:
+            freeze_limit = KOTAK_FREEZE_LIMIT
+
         legs: list[int] = []
         remaining = quantity
         while remaining > 0:
-            leg_qty = min(remaining, KOTAK_FREEZE_LIMIT)
+            leg_qty = min(remaining, freeze_limit)
             legs.append(leg_qty)
             remaining -= leg_qty
 
@@ -856,10 +948,12 @@ class KotakTicker:
     MODE_QUOTE = "quote"
     MODE_FULL = "full"
 
-    def __init__(self, api_key: str, access_token: str | None, client: Any) -> None:
+    def __init__(self, api_key: str, access_token: str | None, client: Any, reconnect: bool = True, reconnect_max_tries: int = 50) -> None:
         self.api_key = api_key
         self.access_token = access_token
         self.client = client
+        self.reconnect = reconnect
+        self.reconnect_max_tries = reconnect_max_tries
 
         self.on_connect = None
         self.on_ticks = None
@@ -867,8 +961,14 @@ class KotakTicker:
         self.on_close = None
         self.on_error = None
 
+        self._reconnect_attempt = 0
+        self._stop_reconnect = False
+        self._reconnect_timer = None
+        self._reconnect_lock = _threading.Lock()
+
     def connect(self, **kwargs) -> None:
         """Register callbacks and connect the Kotak Neo WebSocket threads."""
+        self._stop_reconnect = False
         self.client.on_open = self._on_open
         self.client.on_message = self._on_message
         self.client.on_error = self._on_error
@@ -881,10 +981,17 @@ class KotakTicker:
         except Exception as e:
             logger.error("Failed to connect Kotak Neo order feed: %s", e)
             if self.on_error:
-                self.on_error(self, 0, str(e))
+                error_str = str(e).lower()
+                code = 403 if ("unauthorized" in error_str or "auth" in error_str or "session" in error_str or "token" in error_str) else 0
+                self.on_error(self, code, str(e))
 
     def close(self) -> None:
         """Disconnect and clean up Kotak Neo WebSocket connections."""
+        self._stop_reconnect = True
+        with self._reconnect_lock:
+            if self._reconnect_timer:
+                self._reconnect_timer.cancel()
+                self._reconnect_timer = None
         logger.info("Closing Kotak Neo WebSocket (api_key=%s…)...", self.api_key[:8])
         neo_ws = getattr(self.client, "NeoWebSocket", None)
         if neo_ws:
@@ -917,6 +1024,7 @@ class KotakTicker:
 
     def _on_open(self, message: Any = None) -> None:
         logger.info("Kotak Neo WebSocket connected: %s", message or "Session opened")
+        self._reconnect_attempt = 0
         if self.on_connect:
             self.on_connect(self, None)
 
@@ -924,11 +1032,76 @@ class KotakTicker:
         logger.info("Kotak Neo WebSocket closed: %s", message or "Session closed")
         if self.on_close:
             self.on_close(self, 1000, str(message or "Closed"))
+        if self.reconnect and not self._stop_reconnect:
+            self._trigger_reconnect()
 
     def _on_error(self, error: Any) -> None:
-        logger.error("Kotak Neo WebSocket error: %s", error)
+        error_str = str(error).lower()
+        code = 403 if ("unauthorized" in error_str or "auth" in error_str or "session" in error_str or "token" in error_str) else 0
+        logger.error("Kotak Neo WebSocket error: %s (mapped code=%s)", error, code)
         if self.on_error:
-            self.on_error(self, 0, str(error))
+            self.on_error(self, code, str(error))
+        
+        # Trigger reconnection if it's not a permanent auth failure (403)
+        if self.reconnect and not self._stop_reconnect and code != 403:
+            self._trigger_reconnect()
+
+    def _trigger_reconnect(self) -> None:
+        with self._reconnect_lock:
+            if self._stop_reconnect:
+                return
+            if self._reconnect_timer:
+                return
+            
+            if self._reconnect_attempt >= self.reconnect_max_tries:
+                logger.error("Kotak Neo WS: Max reconnect attempts (%s) reached. Stopping.", self.reconnect_max_tries)
+                return
+            
+            # Exponential backoff delay
+            delay = min(2 ** (self._reconnect_attempt + 1), 60)
+            self._reconnect_attempt += 1
+            logger.info("Kotak Neo WS: Connection lost. Scheduling reconnect attempt %s/%s in %s seconds...",
+                        self._reconnect_attempt, self.reconnect_max_tries, delay)
+            
+            self._reconnect_timer = _threading.Timer(delay, self._run_reconnect)
+            self._reconnect_timer.daemon = True
+            self._reconnect_timer.start()
+
+    def _run_reconnect(self) -> None:
+        with self._reconnect_lock:
+            self._reconnect_timer = None
+            if self._stop_reconnect:
+                return
+        
+        logger.info("Kotak Neo WS: Attempting reconnection now...")
+        try:
+            # First, clean up sockets
+            neo_ws = getattr(self.client, "NeoWebSocket", None)
+            if neo_ws:
+                if getattr(neo_ws, "hsWebsocket", None):
+                    try:
+                        neo_ws.hsWebsocket.close()
+                    except Exception:
+                        pass
+                if getattr(neo_ws, "hsiWebsocket", None):
+                    try:
+                        neo_ws.hsiWebsocket.close()
+                    except Exception:
+                        pass
+                neo_ws.is_hsw_open = 0
+                neo_ws.is_hsi_open = 0
+            
+            # Re-register open/message/error/close hooks on client in case they got cleared
+            self.client.on_open = self._on_open
+            self.client.on_message = self._on_message
+            self.client.on_error = self._on_error
+            self.client.on_close = self._on_close
+            
+            # Reconnect by subscribing to orderfeed
+            self.client.subscribe_to_orderfeed()
+        except Exception as e:
+            logger.error("Kotak Neo WS: Reconnection attempt failed: %s", e)
+            self._trigger_reconnect()
 
     def _on_message(self, message: Any) -> None:
         if not isinstance(message, dict):
@@ -1008,6 +1181,9 @@ class KotakTicker:
                     "status": status,
                     "status_message": str(data.get("rejRsn", data.get("status_message", ""))),
                 }
+
+                if not norm_data["order_id"] and not norm_data["tradingsymbol"]:
+                    return
 
                 if self.on_order_update:
                     self.on_order_update(self, norm_data)

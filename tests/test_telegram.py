@@ -456,5 +456,67 @@ class TestTelegramBot(unittest.IsolatedAsyncioTestCase):
             price=104.50
         )
 
+    async def test_interactive_limit_exit_with_account_routing(self):
+        # Test replying to a custom limit price exit prompt with @account specified
+        msg_reply = MagicMock()
+        msg_reply.reply_to_message = MagicMock()
+        msg_reply.reply_to_message.text = "Enter custom limit price for `NIFTY2670722200PE` under `@WVV135` in reply to this message:"
+        msg_reply.text = "104.50"
+        msg_reply.reply_text = AsyncMock()
+        
+        update_msg = MagicMock()
+        update_msg.message = msg_reply
+        update_msg.effective_chat.id = ALLOWED_CHAT_ID
+        
+        # Two accounts holding the same position
+        self.bot.client.accounts = [
+            {"name": "ZK8719", "api_key": "api_zk"},
+            {"name": "WVV135", "api_key": "api_wvv"}
+        ]
+        
+        self.client.exit_positions.reset_mock()
+        self.client.exit_positions.return_value = {
+            "results": [{"name": "WVV135", "status": "success", "message": "Order placed successfully"}]
+        }
+        
+        await self.bot.handle_message(update_msg, MagicMock())
+        # Should be routed strictly to WVV135 ("api_wvv") instead of defaulting to ZK8719
+        self.client.exit_positions.assert_called_once_with(["api_wvv"], tradingsymbol="NIFTY2670722200PE", price=104.50)
+
+    async def test_interactive_add_more_with_account_routing(self):
+        # Test replying to a custom limit price add prompt with @account specified
+        msg_reply = MagicMock()
+        msg_reply.reply_to_message = MagicMock()
+        msg_reply.reply_to_message.text = "Enter custom limit price for adding `50` more to `NIFTY2670722200PE` under `@WVV135` (`BUY` segments: `NFO`):"
+        msg_reply.text = "104.50"
+        msg_reply.reply_text = AsyncMock()
+        
+        update_msg = MagicMock()
+        update_msg.message = msg_reply
+        update_msg.effective_chat.id = ALLOWED_CHAT_ID
+        
+        # Two accounts holding the same position
+        self.bot.client.accounts = [
+            {"name": "ZK8719", "api_key": "api_zk"},
+            {"name": "WVV135", "api_key": "api_wvv"}
+        ]
+        
+        self.client.place_order.reset_mock()
+        self.client.place_order.return_value = {
+            "results": [{"name": "WVV135", "status": "success", "message": "Order placed successfully"}]
+        }
+        
+        await self.bot.handle_message(update_msg, MagicMock())
+        # Should be routed strictly to WVV135 ("api_wvv") instead of defaulting to ZK8719
+        self.client.place_order.assert_called_once_with(
+            api_keys=["api_wvv"],
+            tradingsymbol="NIFTY2670722200PE",
+            exchange="NFO",
+            transaction_type="BUY",
+            quantity=50,
+            order_type="LIMIT",
+            price=104.50
+        )
+
 if __name__ == "__main__":
     unittest.main()

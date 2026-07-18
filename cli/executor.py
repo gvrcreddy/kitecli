@@ -201,7 +201,7 @@ async def execute_command(cmd: Any, context: ExecutionContext) -> dict:
 
         res = context.client.exit_positions(
             api_keys=api_keys,
-            symbol=symbol,
+            tradingsymbol=symbol,
             price=cmd.price
         )
 

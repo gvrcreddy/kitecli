@@ -24,3 +24,18 @@ These rules apply to all AI agents working on the `kitecli` repository. Follow t
     *   Do not replace the header fragments with a plain string; keep the HTML/fragment structure intact for mouse click routing.
 *   **Buffer Scroll Movement**:
     *   Use prompt-toolkit's native cursor movement (`cursor_up()` and `cursor_down()`) on the underlying pane buffers instead of modifying scroll values directly. This prevents scroll snapping and locks.
+
+## 4. Multi-Broker Integration & TUI Quirks
+*   **Kotak Neo Session Retries**:
+    *   When intercepting `100008` (unauthorized) or `"unauthorized"` body responses to trigger auto-login retries, you MUST update both the request headers (`Sid`, `Auth`) and the URL query parameters (`sId`, `sid`) to keep them in sync. Mismatches will result in recurring 401s from the Kotak Neo gateway.
+*   **Kotak Static IP Whitelisting**:
+    *   Kotak Neo enforces strict static IP whitelisting ONLY on order placement APIs (place, modify, cancel). Limits and positions APIs are exempt. If limits/positions succeed but order placement returns `unauthorized`, verify if the proxy configured in `config.yaml` is whitelisted on the developer portal.
+*   **TUI Ctrl+R History Search**:
+    *   The `SearchToolbar` must be instantiated before the `TextArea` and passed directly into the `search_field` constructor argument. Dynamic assignment of `TextArea.search_field` is not supported by prompt-toolkit.
+*   **Immediate UI Refresh**:
+    *   Successful order placement (`execute_order`) and position exits (`execute_exit`) must explicitly trigger TUI refresh (`_trigger_immediate_refresh`) to ensure immediate rendering, as WebSocket order update ticks are not guaranteed or can be delayed on certain brokers (e.g. Kotak).
+*   **Kotak Neo WebSocket Error Mapping**:
+    *   When returning errors from `KotakTicker._on_error`, you MUST map auth-related errors to code `403` so that the live session's `on_error` handler knows to cleanly stop reconnection and avoid auth-rate-limiting, while letting ordinary connection drops trigger exponential backoff.
+*   **Throttled TUI Logging for REST Refresh**:
+    *   REST refresh failures caught in `_trigger_immediate_refresh` must be logged to the Status Logs pane using `_ws_should_log` with a 30s minimum interval to avoid spamming the user interface.
+

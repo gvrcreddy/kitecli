@@ -117,11 +117,9 @@ def display_positions(accounts_data: list[dict]) -> None:
         table.add_column("Avg Price", justify="right")
         table.add_column("LTP", justify="right")
         table.add_column("P&L", justify="right")
-        table.add_column("P&L %", justify="right")
 
         for pos in positions:
             pnl = float(pos.get("pnl", 0))
-            pnl_pct = float(pos.get("pnl_pct", 0))
             style = _pnl_style(pnl)
 
             table.add_row(
@@ -130,7 +128,6 @@ def display_positions(accounts_data: list[dict]) -> None:
                 _format_currency(float(pos.get("average_price", 0))),
                 _format_currency(float(pos.get("last_price", 0))),
                 Text(_format_currency(pnl), style=style),
-                Text(_format_pnl_pct(pnl_pct), style=style),
             )
 
         panel = Panel(
@@ -233,11 +230,9 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
         table.add_column("Avg Price", justify="right")
         table.add_column("LTP", justify="right")
         table.add_column("P&L", justify="right")
-        table.add_column("P&L %", justify="right")
 
         for pos in positions:
             pnl = float(pos.get("pnl", 0))
-            pnl_pct = float(pos.get("pnl_pct", 0))
             style = _pnl_style(pnl)
 
             symbol = str(pos.get("tradingsymbol", ""))
@@ -260,7 +255,6 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
                 _format_currency(float(pos.get("average_price", 0))),
                 _format_currency(float(pos.get("last_price", 0))),
                 Text(_format_currency(pnl), style=style),
-                Text(_format_pnl_pct(pnl_pct), style=style),
             )
 
 

@@ -399,6 +399,8 @@ class KCLITelegramBot:
             for acct in pos_resp.get("accounts", []):
                 for p in acct.get("positions", []):
                     if p.get("quantity", 0) != 0:
+                        p["api_key"] = acct.get("api_key")
+                        p["account_name"] = acct.get("name")
                         active_positions.append(p)
                         position_id_map[idx] = p
                         idx += 1
@@ -453,6 +455,13 @@ class KCLITelegramBot:
 
         acct = accounts[0]
         name = acct.get("name", "Account")
+        status = acct.get("status", "success")
+        if status == "unauthenticated":
+            return f"🔴 *{name}*: Not authenticated. Run `/init` to log in.", []
+        if isinstance(status, str) and status.startswith("error"):
+            err_msg = status.split("error: ", 1)[-1]
+            return f"⚠️ *{name}*: Failed to fetch positions ({err_msg}).", []
+
         total_pnl = acct.get("total_pnl", 0.0)
         positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
 
@@ -503,14 +512,16 @@ class KCLITelegramBot:
             has_any = False
             for api_key in api_keys:
                 msg_text, keyboard = self._format_account_positions(api_key)
-                if keyboard:  # Only send messages for accounts with active positions
+                if keyboard or msg_text.startswith("🔴") or msg_text.startswith("⚠️"):
                     has_any = True
-                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
                     await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
             
             if not has_any:
                 await update.message.reply_text("✅ No active open positions across any accounts.", reply_markup=get_main_menu_keyboard())
         except Exception as exc:
+            import traceback
+            traceback.print_exc()
             await update.message.reply_text(f"❌ Error fetching positions: {exc}")
 
     @restrict_user
@@ -530,7 +541,7 @@ class KCLITelegramBot:
                 # Filter pending orders
                 pending = [
                     o for o in orders 
-                    if o.get("status") in ("OPEN", "TRIGGER PENDING", "AMO SUBMITTED")
+                    if o.get("status") in ("OPEN", "TRIGGER PENDING", "AMO SUBMITTED", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED")
                 ]
 
                 if not pending:
@@ -673,6 +684,8 @@ class KCLITelegramBot:
                 for acct in pos_resp.get("accounts", []):
                     for p in acct.get("positions", []):
                         if p.get("quantity", 0) != 0:
+                            p["api_key"] = acct.get("api_key")
+                            p["account_name"] = acct.get("name")
                             active_positions.append(p)
                             position_id_map[idx] = p
                             idx += 1
@@ -772,10 +785,15 @@ class KCLITelegramBot:
         elif action == "prompt_custom_price":
             symbol = data[1]
             api_key = self._resolve_api_key(data[2])
+            acct_name = "Account"
+            for acct in self.client.accounts:
+                if acct.get("api_key") == api_key:
+                    acct_name = acct.get("name", "Account")
+                    break
             
             from telegram import ForceReply
             await query.message.reply_text(
-                f"Enter custom limit price for `{symbol}` in reply to this message:",
+                f"Enter custom limit price for `{symbol}` under `@{acct_name}` in reply to this message:",
                 reply_markup=ForceReply(selective=True)
             )
 
@@ -860,10 +878,16 @@ class KCLITelegramBot:
             abs_qty = data[3]
             exchange = data[4]
             acct_ref = data[5]
+            api_key = self._resolve_api_key(acct_ref)
+            acct_name = "Account"
+            for acct in self.client.accounts:
+                if acct.get("api_key") == api_key:
+                    acct_name = acct.get("name", "Account")
+                    break
             
             from telegram import ForceReply
             await query.message.reply_text(
-                f"Enter custom limit price for adding `{abs_qty}` more to `{symbol}` (`{tx_type}` segments: `{exchange}`):",
+                f"Enter custom limit price for adding `{abs_qty}` more to `{symbol}` under `@{acct_name}` (`{tx_type}` segments: `{exchange}`):",
                 reply_markup=ForceReply(selective=True)
             )
 
@@ -1070,9 +1094,10 @@ class KCLITelegramBot:
             return
             
         # 1. Match custom exit price prompt
-        match_exit = re.search(r"Enter custom limit price for `([^`]+)`", reply_text)
+        match_exit = re.search(r"Enter custom limit price for `([^`]+)`(?: under `@([^`]+)`)?", reply_text)
         if match_exit and "reply to this message:" in reply_text:
             symbol = match_exit.group(1)
+            acct_name = match_exit.group(2)
             price_input = update.message.text.strip()
             
             try:
@@ -1083,16 +1108,22 @@ class KCLITelegramBot:
                 await update.message.reply_text(f"❌ Invalid price: `{price_input}`. Please reply with a valid number.")
                 return
 
-            # Find position to get its api_key
-            pos_resp = self.client.get_positions(None)
+            # Resolve api_key using acct_name, fallback to positions lookup if name is not present
             api_key = None
-            for acct in pos_resp.get("accounts", []):
-                for p in acct.get("positions", []):
-                    if p.get("tradingsymbol") == symbol and p.get("quantity", 0) != 0:
-                        api_key = p.get("api_key") or acct.get("api_key")
+            if acct_name:
+                for acct in self.client.accounts:
+                    if acct.get("name") == acct_name or acct.get("api_key") == acct_name:
+                        api_key = acct.get("api_key")
                         break
-                if api_key:
-                    break
+            else:
+                pos_resp = self.client.get_positions(None)
+                for acct in pos_resp.get("accounts", []):
+                    for p in acct.get("positions", []):
+                        if p.get("tradingsymbol") == symbol and p.get("quantity", 0) != 0:
+                            api_key = p.get("api_key") or acct.get("api_key")
+                            break
+                    if api_key:
+                        break
                     
             if not api_key:
                 if self.client.accounts:
@@ -1119,12 +1150,13 @@ class KCLITelegramBot:
             return
 
         # 2. Match custom add more price prompt
-        match_add = re.search(r"Enter custom limit price for adding `([^`]+)` more to `([^`]+)` \(`([^`]+)` segments: `([^`]+)`\)", reply_text)
+        match_add = re.search(r"Enter custom limit price for adding `([^`]+)` more to `([^`]+)`(?: under `@([^`]+)`)? \(`([^`]+)` segments: `([^`]+)`\)", reply_text)
         if match_add:
             qty_str = match_add.group(1)
             symbol = match_add.group(2)
-            tx_type = match_add.group(3)
-            exchange = match_add.group(4)
+            acct_name = match_add.group(3)
+            tx_type = match_add.group(4)
+            exchange = match_add.group(5)
             price_input = update.message.text.strip()
             
             try:
@@ -1135,16 +1167,22 @@ class KCLITelegramBot:
                 await update.message.reply_text(f"❌ Invalid price: `{price_input}`. Please reply with a valid number.")
                 return
 
-            # Resolve api_key
-            pos_resp = self.client.get_positions(None)
+            # Resolve api_key using acct_name, fallback to positions lookup if name is not present
             api_key = None
-            for acct in pos_resp.get("accounts", []):
-                for p in acct.get("positions", []):
-                    if p.get("tradingsymbol") == symbol and p.get("quantity", 0) != 0:
-                        api_key = p.get("api_key") or acct.get("api_key")
+            if acct_name:
+                for acct in self.client.accounts:
+                    if acct.get("name") == acct_name or acct.get("api_key") == acct_name:
+                        api_key = acct.get("api_key")
                         break
-                if api_key:
-                    break
+            else:
+                pos_resp = self.client.get_positions(None)
+                for acct in pos_resp.get("accounts", []):
+                    for p in acct.get("positions", []):
+                        if p.get("tradingsymbol") == symbol and p.get("quantity", 0) != 0:
+                            api_key = p.get("api_key") or acct.get("api_key")
+                            break
+                    if api_key:
+                        break
             if not api_key and self.client.accounts:
                 api_key = self.client.accounts[0].get("api_key")
             if not api_key:

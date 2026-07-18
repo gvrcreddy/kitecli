@@ -9,7 +9,7 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout.containers import DynamicContainer, HSplit, VSplit, Window
+from prompt_toolkit.layout.containers import DynamicContainer, HSplit, VSplit, Window, WindowAlign
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.dimension import Dimension as D
@@ -19,6 +19,8 @@ from prompt_toolkit.widgets import Frame, TextArea
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.history import InMemoryHistory, FileHistory
 from collections import UserDict
+from prompt_toolkit.widgets import SearchToolbar
+from prompt_toolkit.search import start_search, SearchDirection
 from prompt_toolkit.filters import has_focus
 from prompt_toolkit.data_structures import Point
 
@@ -299,6 +301,8 @@ class KCLILiveSession:
         self.ws_token_to_symbol: dict[int, str] = {}
         self._refresh_in_progress = False
         self._refresh_pending = False
+        self.rest_error_count = 0
+        self.account_rest_failed = {a["api_key"]: False for a in accounts if a.get("api_key")}
         # Throttle state for noisy per-account WebSocket close/error logging.
         self._ws_log_throttle = {}
 
@@ -885,10 +889,38 @@ class KCLILiveSession:
         self._update_header_display()
 
     def _update_header_display(self) -> None:
-        """Update the header text and style based on WebSocket status."""
+        """Update the header by invalidating TUI redraw state."""
+        if hasattr(self, "app") and self.app:
+            self.app.invalidate()
+
+    def _get_left_header_text(self) -> list[tuple[str, str]]:
+        """Build the left-aligned header text dynamically based on columns."""
         total = len(self.accounts)
-        connected = sum(1 for k in getattr(self, "websocket_connected", {}).values() if k)
-        
+        now = datetime.now().strftime("%H:%M:%S")
+
+        total_cols = 100
+        if hasattr(self, "app") and self.app and hasattr(self.app, "output") and self.app.output:
+            try:
+                cols = self.app.output.get_size().columns
+                if isinstance(cols, int):
+                    total_cols = cols
+            except Exception:
+                pass
+
+        if total_cols >= 120:
+            left_str = f" 🪁 KiteCLI Live │ Last Update: {now} │ Accounts: {total} │ Ctrl+C: Quit │ Escape: Deselect"
+        elif total_cols >= 95:
+            left_str = f" 🪁 KiteCLI Live │ {now} │ Accounts: {total}"
+        else:
+            left_str = f" 🪁 Live │ {now}"
+
+        return [("", left_str)]
+
+    def _get_right_header_text(self) -> list[tuple[str, str] | tuple[str, str, callable]]:
+        """Build the right-aligned health indicator text."""
+        total = len(self.accounts)
+        good_count = sum(1 for acct in self.accounts if self.is_account_healthy(acct.get("api_key")))
+
         def _header_click_handler(*args, **kwargs):
             from prompt_toolkit.mouse_events import MouseEventType
             mouse_event = None
@@ -898,30 +930,21 @@ class KCLILiveSession:
                 mouse_event = args[0]
             
             if mouse_event and mouse_event.event_type == MouseEventType.MOUSE_UP:
-                self.log_message("Triggering manual WebSocket reconnection...")
+                self.log_message("Triggering manual WebSocket and REST reconnection...")
                 if hasattr(self, "app") and self.app and self.app.loop:
                     asyncio.run_coroutine_threadsafe(self.reconnect_websockets(), self.app.loop)
 
-        if connected == total:
+        if good_count == total:
             status_style = "fg:#00ff00 bold"
-            status_label = "WebSockets Active"
-        elif connected > 0:
+            status_label = "● Health: Good "
+        elif good_count > 0:
             status_style = "fg:#ff8700 bold"
-            status_label = f"WebSockets Partial ({connected}/{total})"
+            status_label = f"● Health: Partial ({good_count}/{total}) "
         else:
             status_style = "fg:#ff0000 bold"
-            status_label = "WebSockets Inactive"
+            status_label = f"● Health: Critical ({good_count}/{total}) "
 
-        now = datetime.now().strftime("%H:%M:%S")
-        
-        frags = [
-            ("", "🪁 KiteCLI Live │ "),
-            (status_style, status_label, _header_click_handler),
-            ("", f" │ Last Update: {now} │ Accounts: {total} │ Ctrl+C: Quit │ Escape: Deselect"),
-        ]
-        self.header_control.text = frags
-        if hasattr(self, "app") and self.app:
-            self.app.invalidate()
+        return [(status_style, status_label, _header_click_handler)]
 
     async def reconnect_websockets(self) -> None:
         """Close existing WebSocket connections and start fresh ones, updating the UI."""
@@ -1163,6 +1186,12 @@ class KCLILiveSession:
             if acct.get("api_key") == api_key:
                 return acct.get("name", api_key)
         return api_key
+
+    def is_account_healthy(self, api_key: str) -> bool:
+        """Return True if the account REST fetches are passing and WebSocket ticker is connected."""
+        rest_ok = not getattr(self, "account_rest_failed", {}).get(api_key, False)
+        ws_ok = getattr(self, "websocket_connected", {}).get(api_key, False)
+        return rest_ok and ws_ok
 
     def _make_on_connect(self, api_key: str, ticker):
         def on_connect(ws, response):
@@ -1443,6 +1472,8 @@ class KCLILiveSession:
         try:
             while True:
                 api_keys = [acct["api_key"] for acct in self.accounts]
+                errors_this_cycle = 0
+                cycle_failed_keys = set()
 
                 # Fetch positions, margins, orders, and indices concurrently.
                 positions_task = self._run_api_call(self.client.get_positions, api_keys)
@@ -1455,8 +1486,14 @@ class KCLILiveSession:
                     return_exceptions=True,
                 )
 
-                # Guard and carry-forward individual account failures to prevent empty sections on error
-                if isinstance(response, dict) and "accounts" in response:
+                # 1. Process positions response
+                if isinstance(response, BaseException):
+                    errors_this_cycle += 1
+                    for k in api_keys:
+                        cycle_failed_keys.add(k)
+                    if self._ws_should_log("rest_err:positions", min_interval=30.0):
+                        self.log_message(f"[#ff8700]Positions fetch failed:[/#] {self._clean_error(str(response))}")
+                elif isinstance(response, dict) and "accounts" in response:
                     old_response = getattr(self, "last_positions_response", None)
                     old_accounts_map = {}
                     if isinstance(old_response, dict):
@@ -1470,6 +1507,11 @@ class KCLILiveSession:
                         status = acct.get("status", "")
                         # If this specific account failed REST fetch, carry forward its previous positions
                         if status.startswith("error") or status == "unauthenticated":
+                            errors_this_cycle += 1
+                            cycle_failed_keys.add(api_key)
+                            if self._ws_should_log(f"rest_err:positions:{api_key}", min_interval=30.0):
+                                err_detail = status.split("error:")[-1].strip() if "error:" in status else status
+                                self.log_message(f"[#ff8700]@{acct.get('name')} positions fetch failed:[/#] {self._clean_error(err_detail)}")
                             old_acct = old_accounts_map.get(api_key)
                             if old_acct:
                                 acct["positions"] = old_acct.get("positions", [])
@@ -1477,10 +1519,26 @@ class KCLILiveSession:
                                 # Override the error status to keep it from clearing
                                 acct["status"] = old_acct.get("status", "success")
 
-                # Merge margin data into the positions response so the renderer
-                # can display it without a separate lookup.
-                if isinstance(margins_resp, dict):
+                # 2. Process margins response
+                if isinstance(margins_resp, BaseException):
+                    errors_this_cycle += 1
+                    for k in api_keys:
+                        cycle_failed_keys.add(k)
+                    if self._ws_should_log("rest_err:margins", min_interval=30.0):
+                        self.log_message(f"[#ff8700]Margins fetch failed:[/#] {self._clean_error(str(margins_resp))}")
+                elif isinstance(margins_resp, dict):
                     margin_map = {m["api_key"]: m for m in margins_resp.get("accounts", [])}
+                    # Check for individual account errors in margins response
+                    for m in margins_resp.get("accounts", []):
+                        api_key = m.get("api_key")
+                        status = m.get("status", "")
+                        if status.startswith("error") or status == "unauthenticated":
+                            errors_this_cycle += 1
+                            cycle_failed_keys.add(api_key)
+                            if self._ws_should_log(f"rest_err:margins:{api_key}", min_interval=30.0):
+                                err_detail = status.split("error:")[-1].strip() if "error:" in status else status
+                                self.log_message(f"[#ff8700]@{self._get_account_name(api_key)} margins fetch failed:[/#] {self._clean_error(err_detail)}")
+                    
                     # Keep old margin data if the current one has error or is missing
                     for k, old_m in getattr(self, "margins_by_api_key", {}).items():
                         if k not in margin_map or margin_map[k].get("status", "").startswith("error"):
@@ -1562,7 +1620,37 @@ class KCLILiveSession:
                             positions = acct.get("positions", [])
                             self.recorder.enqueue_positions(positions, self.index_values, user_id)
 
-                if isinstance(orders_resp, dict):
+                # 3. Process orders response
+                if isinstance(orders_resp, BaseException):
+                    errors_this_cycle += 1
+                    for k in api_keys:
+                        cycle_failed_keys.add(k)
+                    if self._ws_should_log("rest_err:orders", min_interval=30.0):
+                        self.log_message(f"[#ff8700]Orders fetch failed:[/#] {self._clean_error(str(orders_resp))}")
+                elif isinstance(orders_resp, dict) and "accounts" in orders_resp:
+                    old_orders_response = getattr(self, "last_orders_response", None)
+                    old_orders_map = {}
+                    if isinstance(old_orders_response, dict):
+                        old_orders_map = {
+                            acct.get("api_key"): acct
+                            for acct in old_orders_response.get("accounts", [])
+                        }
+                    
+                    for acct in orders_resp.get("accounts", []):
+                        api_key = acct.get("api_key")
+                        status = acct.get("status", "")
+                        # If this specific account failed REST fetch, carry forward its previous orders
+                        if status.startswith("error") or status == "unauthenticated":
+                            errors_this_cycle += 1
+                            cycle_failed_keys.add(api_key)
+                            if self._ws_should_log(f"rest_err:orders:{api_key}", min_interval=30.0):
+                                err_detail = status.split("error:")[-1].strip() if "error:" in status else status
+                                self.log_message(f"[#ff8700]@{acct.get('name')} orders fetch failed:[/#] {self._clean_error(err_detail)}")
+                            old_acct = old_orders_map.get(api_key)
+                            if old_acct:
+                                acct["orders"] = old_acct.get("orders", [])
+                                acct["status"] = old_acct.get("status", "success")
+
                     self.last_orders_response = orders_resp
                     self._last_pending_text  = self._render_orders_pane(orders_resp, "orders_pending")
                     self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
@@ -1571,20 +1659,33 @@ class KCLILiveSession:
 
                 # Indices REST snapshot (WebSocket ticks keep these live thereafter).
                 try:
-                    if isinstance(indices_resp, dict) and indices_resp.get("status") == "success":
+                    if isinstance(indices_resp, BaseException):
+                        errors_this_cycle += 1
+                        if self._ws_should_log("rest_err:indices", min_interval=30.0):
+                            self.log_message(f"[#ff8700]Indices fetch failed:[/#] {self._clean_error(str(indices_resp))}")
+                    elif isinstance(indices_resp, dict) and indices_resp.get("status") == "success":
                         self.index_values["nifty"]  = indices_resp.get("nifty")
                         self.index_values["sensex"] = indices_resp.get("sensex")
                         self.index_values["vix"]    = indices_resp.get("vix")
                         self.market_indices_control.text = self._render_indices_html()
                     elif isinstance(indices_resp, dict):
+                        errors_this_cycle += 1
                         msg = indices_resp.get("message", "Unknown error")
                         self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices: {msg}</style>")
                 except Exception as exc:
                     self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices Error: {exc}</style>")
 
+                # Update failed REST keys status
+                for k in api_keys:
+                    self.account_rest_failed[k] = (k in cycle_failed_keys)
+
+                # Update count of REST errors
+                self.rest_error_count = errors_this_cycle
+
                 # Force UI rendering updates on main thread
                 if hasattr(self, "app") and self.app and self.app.loop:
                     self.app.loop.call_soon_threadsafe(self._update_display_and_invalidate)
+                    self.app.loop.call_soon_threadsafe(self._update_header_display)
 
                 # Debounce: check if a new request was queued during our run
                 if getattr(self, "_refresh_pending", False):
@@ -1885,6 +1986,7 @@ class KCLILiveSession:
             
             # Print individual results
             results = response.get("results", [])
+            has_success = False
             for res in results:
                 name = res.get("name", "Unknown")
                 status = res.get("status", "error")
@@ -1892,12 +1994,17 @@ class KCLILiveSession:
                 legs = res.get("legs", 1)
                 ord_id = res.get("order_id")
                 if status == "success":
+                    has_success = True
                     if legs > 1:
                         self.log_message(f"[#00ff00]✓ {name}:[/#] Split into {legs} legs. IDs: {ord_id}")
                     else:
                         self.log_message(f"[#00ff00]✓ {name}:[/#] Placed. ID: {ord_id}")
                 else:
                     self.log_message(f"[#ff0000]✗ {name}:[/#] Failed — {msg}")
+
+            if has_success:
+                if hasattr(self, "app") and self.app and self.app.loop:
+                    asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
 
         except KCLIClientError as exc:
             self.log_message(f"[#ff0000]Order Execution Failed:[/#] {exc}")
@@ -1926,6 +2033,7 @@ class KCLILiveSession:
 
             # Print exit results
             results = response.get("results", [])
+            has_success = False
             for res in results:
                 name = res.get("name", "Unknown")
                 status = res.get("status", "error")
@@ -1933,6 +2041,7 @@ class KCLILiveSession:
                 placed = res.get("orders_placed", [])
                 
                 if status == "success":
+                    has_success = True
                     if placed:
                         symbols_exited = ", ".join(f"{item.get('tradingsymbol')} ({item.get('quantity')})" for item in placed)
                         self.log_message(f"[#00ff00]✓ {name}:[/#] Exited {symbols_exited}")
@@ -1940,6 +2049,10 @@ class KCLILiveSession:
                         self.log_message(f"[#87afaf]~ {name}:[/#] {msg}")
                 else:
                     self.log_message(f"[#ff0000]✗ {name}:[/#] Failed — {msg}")
+
+            if has_success:
+                if hasattr(self, "app") and self.app and self.app.loop:
+                    asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
 
         except KCLIClientError as exc:
             self.log_message(f"[#ff0000]Exit Execution Failed:[/#] {exc}")
@@ -3618,7 +3731,8 @@ class KCLILiveSession:
             lines.append("-" * 60)
 
             if acct.get("status", "").startswith("error"):
-                lines.append(f"  Error: {acct['status']}")
+                err_detail = acct["status"].split("error:")[-1].strip() if "error:" in acct["status"] else acct["status"]
+                lines.append(f"  Error: {self._clean_error(err_detail)}")
             elif not orders:
                 lines.append("  (no orders)")
             else:
@@ -3743,8 +3857,12 @@ class KCLILiveSession:
         # Keep noisy third-party WebSocket loggers off the full-screen TUI.
         _silence_websocket_loggers()
         # ── UI Controls ─────────────────────────────────────────────
-        self.header_control = FormattedTextControl(
-            text="🪁 KiteCLI Live │ Loading dashboard...",
+        self.left_header_control = FormattedTextControl(
+            text=self._get_left_header_text,
+            style="class:header",
+        )
+        self.right_header_control = FormattedTextControl(
+            text=self._get_right_header_text,
             style="class:header",
         )
         self.market_indices_control = FormattedTextControl(
@@ -3788,6 +3906,11 @@ class KCLILiveSession:
         history_dir.mkdir(parents=True, exist_ok=True)
         history_file = history_dir / "history.txt"
 
+        self.search_field = SearchToolbar(
+            text_if_not_searching=[("class:not-searching", "Press Ctrl+R to search history.")],
+            forward_search_prompt="Search: ",
+        )
+
         self.input_field = TextArea(
             multiline=False,
             prompt="",
@@ -3795,6 +3918,7 @@ class KCLILiveSession:
             accept_handler=self.handle_input,
             history=FileHistory(str(history_file)),
             focus_on_click=True,
+            search_field=self.search_field,
         )
         self.prompt_control = FormattedTextControl(text=" kcli> ")
 
@@ -3932,6 +4056,10 @@ class KCLILiveSession:
 
         # ── Key Bindings ───────────────────────────────────────────
         kb = KeyBindings()
+
+        @kb.add("c-r")
+        def _search_history(event):
+            start_search(self.input_field.control, SearchDirection.BACKWARD)
 
         @kb.add("c-c")
         def _quit(event):
@@ -4142,6 +4270,7 @@ class KCLILiveSession:
                             content=self.market_indices_control,
                             height=1,
                             style="class:market_indices",
+                            wrap_lines=False,
                         ),
                         Window(height=1, char="─", style="class:divider"),
                         self.info_window,
@@ -4153,13 +4282,17 @@ class KCLILiveSession:
 
         layout = Layout(
             HSplit([
-                Window(content=self.header_control, height=1, style="class:header"),
+                VSplit([
+                    Window(content=self.left_header_control, height=1, style="class:header", wrap_lines=False),
+                    Window(content=self.right_header_control, height=1, style="class:header", wrap_lines=False, align=WindowAlign.RIGHT),
+                ]),
                 DynamicContainer(lambda: _build_body()),
                 # ── Quick-action button bar ──
                 Window(
                     content=self.quickaction_control,
                     height=1,
                     style="class:quickaction",
+                    wrap_lines=False,
                 ),
                 # ── Command input row ──
                 VSplit([
@@ -4171,6 +4304,7 @@ class KCLILiveSession:
                     ),
                     self.input_field,
                 ], height=3),
+                self.search_field,
             ]),
             focused_element=self.input_field,
         )

@@ -38,3 +38,10 @@ typings/
 config.yaml
 *.env
 .env*
+
+# Scratch & temporary workspace files
+scratch/
+temp_live_session_*.py
+test_search.py
+print_kotak_curl.py
+*.csv

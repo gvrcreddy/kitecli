@@ -465,6 +465,73 @@ class TestApiClientBrokerRouting(unittest.TestCase):
         except Exception as exc:
             self.fail(f"place_order raised an exception on No Data: {exc}")
 
+    def test_kotak_ticker_reconnect_flow(self):
+        from cli.kotak_manager import KotakTicker
+        
+        mock_client = MagicMock()
+        ticker = KotakTicker("kt_key", "token", mock_client, reconnect=True, reconnect_max_tries=3)
+        
+        # Mock callbacks
+        on_close_called = False
+        def mock_on_close(ws, code, reason):
+            nonlocal on_close_called
+            on_close_called = True
+        ticker.on_close = mock_on_close
+        
+        # Patch Timer so we don't actually wait
+        timer_mocks = []
+        class MockTimer:
+            def __init__(self, delay, fn, *args, **kwargs):
+                self.delay = delay
+                self.fn = fn
+                timer_mocks.append(self)
+            def start(self):
+                pass
+            def cancel(self):
+                pass
+
+        import threading
+        original_timer = threading.Timer
+        threading.Timer = MockTimer
+        try:
+            # Simulate _on_close
+            ticker._on_close("Session closed")
+            self.assertTrue(on_close_called)
+            self.assertEqual(ticker._reconnect_attempt, 1)
+            self.assertEqual(len(timer_mocks), 1)
+            self.assertEqual(timer_mocks[0].delay, 2) # first backoff = 2 seconds
+            
+            # Reset timer_mocks and check close prevents reconnection
+            timer_mocks.clear()
+            ticker.close()
+            self.assertTrue(ticker._stop_reconnect)
+            ticker._on_close("Session closed")
+            # reconnect_attempt should NOT increment because _stop_reconnect is True
+            self.assertEqual(ticker._reconnect_attempt, 1)
+            self.assertEqual(len(timer_mocks), 0)
+        finally:
+            threading.Timer = original_timer
+
+    def test_kotak_ticker_error_code_mapping(self):
+        from cli.kotak_manager import KotakTicker
+        
+        mock_client = MagicMock()
+        ticker = KotakTicker("kt_key", "token", mock_client, reconnect=False)
+        
+        last_error_code = None
+        def mock_on_error(ws, code, reason):
+            nonlocal last_error_code
+            last_error_code = code
+        ticker.on_error = mock_on_error
+        
+        # Test regular error -> code 0
+        ticker._on_error("Connection timed out")
+        self.assertEqual(last_error_code, 0)
+        
+        # Test auth error -> code 403
+        ticker._on_error("unauthorized session")
+        self.assertEqual(last_error_code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

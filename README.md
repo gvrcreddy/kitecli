@@ -41,6 +41,14 @@ Install the package via `pip`:
 pip install kitecli
 ```
 
+### Kotak Neo Support (Optional)
+
+Since the official Kotak Neo Python SDK is not hosted on PyPI, if you want to use Kotak accounts, you must install the SDK directly from Kotak's official GitHub repository first:
+
+```bash
+pip install "git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client"
+```
+
 *(For local development or installing from source)*:
 ```bash
 git clone https://github.com/chandu389/kitecli.git

@@ -32,7 +32,7 @@ def _get_kotak_manager():
         except ImportError as exc:
             raise ImportError(
                 "Kotak Neo support requires the 'neo-api-client' package. "
-                "Install it with: pip install neo-api-client"
+                "Install it with: pip install \"git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client\""
             ) from exc
     return _kotak_manager
 

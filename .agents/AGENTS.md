@@ -38,4 +38,10 @@ These rules apply to all AI agents working on the `kitecli` repository. Follow t
     *   When returning errors from `KotakTicker._on_error`, you MUST map auth-related errors to code `403` so that the live session's `on_error` handler knows to cleanly stop reconnection and avoid auth-rate-limiting, while letting ordinary connection drops trigger exponential backoff.
 *   **Throttled TUI Logging for REST Refresh**:
     *   REST refresh failures caught in `_trigger_immediate_refresh` must be logged to the Status Logs pane using `_ws_should_log` with a 30s minimum interval to avoid spamming the user interface.
+*   **Zerodha / Kite Proxy Routing**:
+    *   Zerodha only enforces static IP whitelisting on order placement APIs (POST/PUT/DELETE to `/orders` or `/gtt`).
+    *   To avoid proxy-related network latency, 502 Bad Gateway REST errors, and 1006 WebSocket connection handshake timeouts, all read-only REST APIs (positions, margins, orderbook, profile) and all WebSocket connections (`KiteTicker` and `probe_ws_auth`) must bypass proxies and connect directly.
+*   **Handling Non-PyPI Dependencies**:
+    *   Third-party packages not hosted on PyPI (such as Kotak Neo's `neo-api-client`) must **never** be listed in `pyproject.toml`'s dependencies or optional-dependencies list to prevent PyPI dependency resolution crashes.
+    *   Instead, import them lazily at runtime and catch the `ImportError` to raise a clear instruction pointing to the direct Git repository installation command (e.g. `pip install "git+https://...#egg=neo_api_client"`). Always document the Git installation step in `README.md`.
 

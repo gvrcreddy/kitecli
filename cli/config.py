@@ -6,12 +6,19 @@ stored at ~/.kcli/config.yaml.
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any, Dict
+import json
+import logging
+import threading
 
 import yaml
 
 CONFIG_DIR = Path.home() / ".kcli"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
+SESSIONS_FILE = CONFIG_DIR / "sessions.json"
+
+sessions_lock = threading.RLock()
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "accounts": [
@@ -94,3 +101,43 @@ def create_default_config() -> dict:
     """
     save_config(DEFAULT_CONFIG)
     return DEFAULT_CONFIG
+
+
+def load_sessions() -> Dict[str, Any]:
+    """Load the shared sessions from ~/.kcli/sessions.json thread-safely."""
+    with sessions_lock:
+        if not SESSIONS_FILE.exists():
+            return {}
+        try:
+            with open(SESSIONS_FILE, "r") as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.error("Failed to load sessions: %s", exc)
+            return {}
+
+
+def save_session(key: str, value: Any) -> None:
+    """Save a session value thread-safely to ~/.kcli/sessions.json."""
+    with sessions_lock:
+        sessions = load_sessions()
+        sessions[key] = value
+        try:
+            SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(SESSIONS_FILE, "w") as f:
+                json.dump(sessions, f, indent=2)
+        except Exception as exc:
+            logger.error("Failed to save session for %s: %s", key, exc)
+
+
+def remove_session(key: str) -> None:
+    """Remove a session key thread-safely from ~/.kcli/sessions.json."""
+    with sessions_lock:
+        sessions = load_sessions()
+        if key in sessions:
+            del sessions[key]
+            try:
+                SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with open(SESSIONS_FILE, "w") as f:
+                    json.dump(sessions, f, indent=2)
+            except Exception as exc:
+                logger.error("Failed to remove session for %s: %s", key, exc)

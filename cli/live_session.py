@@ -1228,29 +1228,8 @@ class KCLILiveSession:
                     ticker.on_close = self._make_on_close(api_key)
                     ticker.on_error = self._make_on_error(api_key)
 
-                    # Parse proxy if configured for this account (Zerodha WS does not require IP whitelisting, direct is faster)
-                    proxy_str = acct.get("proxy")
-                    proxy_dict = None
-                    if broker != "zerodha" and proxy_str:
-                        from urllib.parse import urlparse
-                        try:
-                            p_str = proxy_str if "://" in proxy_str else f"http://{proxy_str}"
-                            parsed = urlparse(p_str)
-                            if parsed.hostname and parsed.port:
-                                proxy_dict = {
-                                    "host": parsed.hostname,
-                                    "port": int(parsed.port),
-                                }
-                                if parsed.username and parsed.password:
-                                    proxy_dict["username"] = parsed.username
-                                    proxy_dict["password"] = parsed.password
-                        except Exception as p_err:
-                            self.log_message(f"[#ff8700]Failed to parse proxy for {acct.get('name')}:[/#] {p_err}")
-
-                    # connect() only accepts threaded + proxy
+                    # connect() only accepts threaded
                     connect_kwargs = dict(threaded=True)
-                    if proxy_dict:
-                        connect_kwargs["proxy"] = proxy_dict
                     ticker.connect(**connect_kwargs)
                     self.tickers[api_key] = ticker
                 except Exception as exc:

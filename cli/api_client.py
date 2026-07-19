@@ -7,8 +7,12 @@ identical to the previous single-broker version so that cli/main.py and
 cli/live_session.py require zero changes.
 """
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from cli.kite_manager import KiteAccountManager
+from cli.config import remove_session
+
+logger = logging.getLogger(__name__)
 
 
 class KCLIClientError(Exception):
@@ -132,8 +136,27 @@ class KCLIClient:
                 )
                 _account_manager_map[account_key] = mgr
                 acct.setdefault("api_key", account_key)
+
+                # Validation: verify token with a REST query (limits)
+                is_valid = False
+                if mgr.is_authenticated(account_key):
+                    try:
+                        mgr._clients[account_key].limits()
+                        is_valid = True
+                    except Exception as exc:
+                        msg = str(exc).lower()
+                        is_auth_error = any(x in msg for x in ["100008", "unauthorized", "invalid token", "session expired", "session has been closed", "session closed"])
+                        if is_auth_error:
+                            logger.info("Kotak validation failed (expired/invalid) for %s: %s", name, exc)
+                            mgr._authenticated[account_key] = False
+                            remove_session(f"kotak:{account_key}")
+                        else:
+                            # Network/timeout error: fallback to assuming token is valid
+                            logger.warning("Kotak validation query failed due to network/other issue. Assuming valid. Error: %s", exc)
+                            is_valid = True
+
                 # Attempt auto-login for Kotak
-                if not mgr.is_authenticated(account_key):
+                if not is_valid:
                     success = mgr.auto_login(account_key)
                     return {
                         "name": name, "api_key": account_key,
@@ -158,7 +181,29 @@ class KCLIClient:
                 )
                 _account_manager_map[api_key] = _kite_manager
 
+                # Validation: verify token with a REST query (profile)
+                is_valid = False
                 if _kite_manager.is_authenticated(api_key):
+                    try:
+                        _kite_manager._clients[api_key].profile()
+                        is_valid = True
+                    except Exception as exc:
+                        try:
+                            from kiteconnect.exceptions import TokenException, PermissionException
+                        except Exception:
+                            TokenException = PermissionException = ()
+                        msg = str(exc).lower()
+                        is_auth_error = isinstance(exc, (TokenException, PermissionException)) or any(x in msg for x in ["403", "401", "unauthorized", "token", "session"])
+                        if is_auth_error:
+                            logger.info("Zerodha validation failed (expired/invalid) for %s: %s", name, exc)
+                            _kite_manager._authenticated[api_key] = False
+                            remove_session(api_key)
+                        else:
+                            # Network/timeout error: fallback to assuming token is valid
+                            logger.warning("Zerodha validation query failed due to network/other issue. Assuming valid. Error: %s", exc)
+                            is_valid = True
+
+                if is_valid:
                     return {
                         "name": name, "api_key": api_key,
                         "login_url": login_url, "auto_logged_in": True,

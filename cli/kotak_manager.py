@@ -98,26 +98,7 @@ def _check_neo_error(resp: Any) -> None:
 
 # ── session persistence (shared file with Zerodha tokens) ─────────────────────
 
-def _load_sessions() -> dict[str, str]:
-    if not SESSIONS_FILE.exists():
-        return {}
-    try:
-        with open(SESSIONS_FILE, "r") as f:
-            return json.load(f)
-    except Exception as exc:
-        logger.error("Failed to load sessions: %s", exc)
-        return {}
-
-
-def _save_session(key: str, token: str) -> None:
-    sessions = _load_sessions()
-    sessions[key] = token
-    try:
-        SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(SESSIONS_FILE, "w") as f:
-            json.dump(sessions, f, indent=2)
-    except Exception as exc:
-        logger.error("Failed to save session for %s: %s", key, exc)
+from cli.config import load_sessions as _load_sessions, save_session as _save_session
 
 
 # ── KotakAccountManager ────────────────────────────────────────────────────────
@@ -320,30 +301,7 @@ class KotakAccountManager(BaseBrokerManager):
 
         client.api_client.rest_client.request = _proxied_request
         if proxy:
-            logger.info("Kotak account '%s': HTTP proxy enabled (%s…)", name, proxy[:20])
-
-            # Also monkeypatch websocket-client (used by Kotak Neo WebSocket) to route over the proxy.
-            try:
-                import websocket as _ws_lib
-                from urllib.parse import urlparse as _urlparse
-                _parsed = _urlparse(proxy)
-                _proxy_host = _parsed.hostname
-                _proxy_port = _parsed.port
-                _proxy_auth = (_parsed.username, _parsed.password) if _parsed.username and _parsed.password else None
-                
-                _orig_run_forever = _ws_lib.WebSocketApp.run_forever
-                def _proxied_run_forever(self, *args, **kwargs):
-                    kwargs.setdefault("http_proxy_host", _proxy_host)
-                    kwargs.setdefault("http_proxy_port", _proxy_port)
-                    kwargs.setdefault("proxy_type", "http")
-                    if _proxy_auth:
-                        kwargs.setdefault("http_proxy_auth", _proxy_auth)
-                    return _orig_run_forever(self, *args, **kwargs)
-                
-                _ws_lib.WebSocketApp.run_forever = _proxied_run_forever
-                logger.info("Kotak account '%s': WebSocket proxy monkeypatch applied", name)
-            except Exception as e:
-                logger.error("Failed to apply WebSocket proxy patch for Kotak: %s", e)
+            logger.info("Kotak account '%s': HTTP proxy enabled for order APIs (%s…)", name, proxy[:20])
         self._clients[consumer_key] = client
         self._account_names[consumer_key] = name or consumer_key
         self._authenticated[consumer_key] = False
@@ -936,6 +894,10 @@ class KotakAccountManager(BaseBrokerManager):
         return KotakTicker(account_key, self.get_access_token(account_key), client)
 
 
+def _dummy_callback(*args, **kwargs):
+    pass
+
+
 # ── KotakTicker WebSocket Wrapper ─────────────────────────────────────────────
 
 class KotakTicker:
@@ -990,6 +952,13 @@ class KotakTicker:
                 self._reconnect_timer.cancel()
                 self._reconnect_timer = None
         logger.info("Closing Kotak Neo WebSocket (api_key=%s…)...", self.api_key[:8])
+        
+        # Clear client callbacks to avoid recursive callback noise during close
+        self.client.on_open = _dummy_callback
+        self.client.on_message = _dummy_callback
+        self.client.on_error = _dummy_callback
+        self.client.on_close = _dummy_callback
+
         neo_ws = getattr(self.client, "NeoWebSocket", None)
         if neo_ws:
             if getattr(neo_ws, "hsWebsocket", None):
@@ -1027,6 +996,16 @@ class KotakTicker:
 
     def _on_close(self, message: Any = None) -> None:
         logger.info("Kotak Neo WebSocket closed: %s", message or "Session closed")
+        msg_str = str(message or "").lower()
+        is_auth_error = any(x in msg_str for x in ["session has been closed", "unauthorized", "invalid token"])
+        
+        if is_auth_error:
+            logger.error("Kotak Neo WebSocket closed due to session expiry/auth failure: %s (mapped code=403)", message)
+            if self.on_error:
+                # Map to 403 so live_session stops reconnecting and prompts user to re-init
+                self.on_error(self, 403, str(message or "Session closed"))
+            return
+
         if self.on_close:
             self.on_close(self, 1000, str(message or "Closed"))
         if self.reconnect and not self._stop_reconnect:
@@ -1072,6 +1051,10 @@ class KotakTicker:
         
         logger.info("Kotak Neo WS: Attempting reconnection now...")
         try:
+            # Temporarily stub callbacks to avoid recursive on_error/on_close triggers during cleanup
+            self.client.on_error = _dummy_callback
+            self.client.on_close = _dummy_callback
+
             # First, clean up sockets
             neo_ws = getattr(self.client, "NeoWebSocket", None)
             if neo_ws:
@@ -1098,6 +1081,11 @@ class KotakTicker:
             self.client.subscribe_to_orderfeed()
         except Exception as e:
             logger.error("Kotak Neo WS: Reconnection attempt failed: %s", e)
+            # Re-register open/message/error/close hooks on client
+            self.client.on_open = self._on_open
+            self.client.on_message = self._on_message
+            self.client.on_error = self._on_error
+            self.client.on_close = self._on_close
             self._trigger_reconnect()
 
     def _on_message(self, message: Any) -> None:

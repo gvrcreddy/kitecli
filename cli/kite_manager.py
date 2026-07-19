@@ -12,29 +12,7 @@ from cli.base_manager import BaseBrokerManager
 
 logger = logging.getLogger(__name__)
 
-SESSIONS_FILE = Path.home() / ".kcli" / "sessions.json"
-
-
-def _load_sessions() -> dict[str, str]:
-    if not SESSIONS_FILE.exists():
-        return {}
-    try:
-        with open(SESSIONS_FILE, "r") as f:
-            return json.load(f)
-    except Exception as exc:
-        logger.error("Failed to load sessions: %s", exc)
-        return {}
-
-
-def _save_session(api_key: str, access_token: str) -> None:
-    sessions = _load_sessions()
-    sessions[api_key] = access_token
-    try:
-        SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(SESSIONS_FILE, "w") as f:
-            json.dump(sessions, f, indent=2)
-    except Exception as exc:
-        logger.error("Failed to save session for %s: %s", api_key[:8], exc)
+from cli.config import load_sessions as _load_sessions, save_session as _save_session
 
 
 class KiteAccountManager(BaseBrokerManager):

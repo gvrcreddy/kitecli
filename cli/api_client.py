@@ -141,11 +141,13 @@ class KCLIClient:
                 is_valid = False
                 if mgr.is_authenticated(account_key):
                     try:
-                        mgr._clients[account_key].limits()
+                        resp = mgr._clients[account_key].limits()
+                        from cli.kotak_manager import _check_neo_error
+                        _check_neo_error(resp)
                         is_valid = True
                     except Exception as exc:
                         msg = str(exc).lower()
-                        is_auth_error = any(x in msg for x in ["100008", "unauthorized", "invalid token", "session expired", "session has been closed", "session closed"])
+                        is_auth_error = any(x in msg for x in ["100008", "100022", "1037", "unauthorized", "invalid token", "invalid session", "session expired", "session has been closed", "session closed"])
                         if is_auth_error:
                             logger.info("Kotak validation failed (expired/invalid) for %s: %s", name, exc)
                             mgr._authenticated[account_key] = False

@@ -1003,6 +1003,14 @@ class KCLILiveSession:
             " Advisor ",
             make_click_handler("advisor")
         ))
+        fragments.append(("", " "))
+
+        # Tab 5: Help
+        fragments.append((
+            "class:tab.active" if self.info_mode == "help" else "class:tab.inactive",
+            " Help ",
+            make_click_handler("help")
+        ))
         
         return fragments
 
@@ -1162,6 +1170,12 @@ class KCLILiveSession:
     async def _initial_fetch_and_connect(self) -> None:
         """Initial fetch of data and connect all WebSockets."""
         self.log_message("Initializing connections and fetching data...")
+
+        # Ensure accounts are validated & auto-logged in
+        try:
+            await self._run_api_call(self.client.init_accounts, self.accounts)
+        except Exception as e:
+            self.log_message(f"[#ff8700]Account init warning:[/#] {e}")
         
         # Fire off REST data fetch in the background so it doesn't block WebSockets
         if hasattr(self, "app") and self.app and self.app.loop:
@@ -1188,7 +1202,7 @@ class KCLILiveSession:
             )
 
         # Connect WebSockets for accounts that support it (Zerodha and Kotak).
-        for idx, acct in enumerate(self.accounts):
+        for acct in self.accounts:
             api_key = acct.get("api_key")
             broker = acct.get("broker", "zerodha").lower()
             access_token = self.client.get_access_token(api_key)
@@ -1200,9 +1214,6 @@ class KCLILiveSession:
                     f"token not valid ({token_statuses.get(api_key)})."
                 )
                 continue
-
-            if idx > 0:
-                await asyncio.sleep(0.2)
 
             if api_key and (access_token or broker == "kotak"):
                 try:
@@ -2318,6 +2329,44 @@ class KCLILiveSession:
                     status="cancelled",
                     api_key=p.get("api_key") if p.get("api_key") else (p.get("api_keys")[0] if p.get("api_keys") else None),
                 )
+            return
+
+        # Direct commands to switch info pane mode
+        cmd_norm = cmd.strip().lower()
+        if cmd_norm in ("pending", "p", "1", "/1", "/pending"):
+            self.info_mode = "orders_pending"
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message("Switched info pane to [bold]Pending Orders[/bold].")
+            return
+        elif cmd_norm in ("executed", "e", "ex", "2", "/2", "/executed"):
+            self.info_mode = "orders_executed"
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message("Switched info pane to [bold]Executed Orders[/bold].")
+            return
+        elif cmd_norm in ("oc", "optionchain", "chain", "3", "/3", "/oc"):
+            self.info_mode = "oc"
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message("Switched info pane to [bold]Option Chain[/bold].")
+            return
+        elif cmd_norm in ("advisor", "adv", "ai", "4", "/4", "/advisor"):
+            self.info_mode = "advisor"
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message("Switched info pane to [bold]AI Advisor[/bold].")
+            return
+        elif cmd_norm in ("help", "h", "5", "/5", "/help"):
+            self.info_mode = "help"
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message("Switched info pane to [bold]Help & Shortcuts[/bold].")
             return
 
         # Attempt parsing via the unified parser
@@ -3826,6 +3875,59 @@ class KCLILiveSession:
             lines.append("No pending orders across all accounts.")
         return "\n".join(lines)
 
+    def _build_help_text(self) -> str:
+        """Return formatted keyboard shortcuts & command cheat sheet."""
+        return """=== KiteCLI Keyboard & Command Cheat Sheet ===
+
+1. TAB SWITCHING (RIGHT PANE)
+   Type at prompt:
+     p or pending or 1  -> Switch to Pending Orders tab
+     e or executed or 2 -> Switch to Executed Orders tab
+     oc or chain or 3   -> Switch to Option Chain tab
+     adv or advisor or 4-> Switch to AI Advisor tab
+     h or help or 5     -> Switch to this Help tab
+
+   Universal Hotkeys:
+     Ctrl + P           -> Pending Orders
+     Ctrl + E           -> Executed Orders
+     Ctrl + O           -> Option Chain
+     Ctrl + G           -> AI Advisor
+     Ctrl + H           -> Help
+
+   Function Keys / Alt:
+     F1 / F2 / F3 / F4 / F5
+     Option+1 / 2 / 3 / 4 / 5 (or Esc then 1..5)
+     Mouse Click: Click directly on any tab title in header bar
+
+2. ORDER PLACEMENT & TRADING COMMANDS
+   Buy / Sell Orders:
+     b <symbol> <qty> [price]     -> Buy limit/market (e.g. b NIFTY26JUL22500PE 100 1.40)
+     s <symbol> <qty> [price]     -> Sell limit/market (e.g. s BANKNIFTY26JUL50000CE 15@2.50)
+     b 1 100                       -> Buy 100 qty of active position #1
+     s 2                           -> Sell/exit all qty of active position #2
+
+   Exiting Positions:
+     exit <symbol|id> [price]     -> Exit position by symbol or table ID (e.g. exit 1, exit 2 1.50)
+     exit all [price]              -> Exit all active positions (e.g. exit all)
+
+   Modifying & Cancelling:
+     modify <order_id> [qty] [price] -> Modify open order
+     cancel <order_id>               -> Cancel pending order
+     cancel all                      -> Cancel all open/pending orders
+
+3. SELECTION & SELECTION CLEARING
+   Selection:
+     Click on symbol/account row   -> Target specific position/account
+     Esc                             -> Clear active selection / reset account filter
+
+4. GLOBAL NAVIGATION & CONTROL
+   Tab           -> Cycle focus (Input box -> Positions -> Right Pane)
+   Ctrl + R      -> Search command history
+   Ctrl + Left   -> Narrow left pane split width
+   Ctrl + Right  -> Widen left pane split width
+   Ctrl + C      -> Exit KiteCLI
+"""
+
     def _update_info_buffer(self, reset_scroll: bool = True) -> None:
         """Push current info_mode text into the info_buffer.
 
@@ -3846,6 +3948,8 @@ class KCLILiveSession:
             except Exception as exc:
                 self._last_advisor_text = f"=== Tuesday Expiry Advisor ===\n\nFailed to plan: {exc}"
             text = self._last_advisor_text
+        elif self.info_mode == "help":
+            text = self._build_help_text()
         else:
             text = self._last_oc_text
         if reset_scroll:
@@ -4217,8 +4321,10 @@ class KCLILiveSession:
                 nxt = self.input_field.control
             event.app.layout.focus(nxt)
 
-        # Ctrl+1/2/3/4 & F1-F4 — switch info pane content
+        # Ctrl+1/2/3/4, Ctrl+P/E/O/G, Alt/Esc+1/2/3/4, F1-F4 — switch info pane content
         @kb.add("c-1")
+        @kb.add("c-p")
+        @kb.add("escape", "1")
         @kb.add("f1")
         def _c1(event):
             self.info_mode = "orders_pending"
@@ -4226,6 +4332,8 @@ class KCLILiveSession:
             event.app.invalidate()
 
         @kb.add("c-2")
+        @kb.add("c-e")
+        @kb.add("escape", "2")
         @kb.add("f2")
         def _c2(event):
             self.info_mode = "orders_executed"
@@ -4233,6 +4341,8 @@ class KCLILiveSession:
             event.app.invalidate()
 
         @kb.add("c-3")
+        @kb.add("c-o")
+        @kb.add("escape", "3")
         @kb.add("f3")
         def _c3(event):
             self.info_mode = "oc"
@@ -4240,9 +4350,20 @@ class KCLILiveSession:
             event.app.invalidate()
 
         @kb.add("c-4")
+        @kb.add("c-g")
+        @kb.add("escape", "4")
         @kb.add("f4")
         def _c4(event):
             self.info_mode = "advisor"
+            self._update_info_buffer()
+            event.app.invalidate()
+
+        @kb.add("c-5")
+        @kb.add("c-h")
+        @kb.add("escape", "5")
+        @kb.add("f5")
+        def _c5(event):
+            self.info_mode = "help"
             self._update_info_buffer()
             event.app.invalidate()
 

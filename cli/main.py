@@ -206,6 +206,7 @@ def live() -> None:
         display_error("No accounts configured. Edit your config file to add accounts.")
         raise typer.Exit(code=1)
     client = _build_client(config)
+    client.init_accounts(accounts)
 
     # Launch interactive session
     session = KCLILiveSession(client, accounts)

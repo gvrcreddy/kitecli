@@ -137,7 +137,9 @@ class KotakAccountManager(BaseBrokerManager):
 
     def init_account(self, account_key: str, **credentials) -> str:
         """ABC entry point — delegates to init_account_kotak."""
-        return self.init_account_kotak(consumer_key=account_key, **credentials)
+        creds = dict(credentials)
+        creds.pop("consumer_key", None)
+        return self.init_account_kotak(consumer_key=account_key, **creds)
 
     def init_account_kotak(
         self,
@@ -265,17 +267,19 @@ class KotakAccountManager(BaseBrokerManager):
             except Exception:
                 logger.debug("Kotak REST response body (raw): %s", resp.text[:200])
 
-            # Check for IP mismatch error (stCode 1037) or Session expired (stCode 100008)
+            # Check for IP mismatch error (stCode 1037), Session expired (stCode 100008, 100022), or HTTP 401
             try:
-                resp_json = resp.json()
+                resp_json = resp.json() if resp.text else {}
                 if isinstance(resp_json, dict):
                     st_code = resp_json.get("stCode")
                     err_msg = str(resp_json.get("errMsg", "")).lower()
                     if (
-                        st_code == 1037 or 
-                        st_code == 100008 or 
-                        "session ip" in err_msg or 
-                        "unauthorized" in err_msg
+                        resp.status_code == 401 or
+                        st_code in (1037, 100008, 100022) or
+                        "session ip" in err_msg or
+                        "unauthorized" in err_msg or
+                        "invalid session" in err_msg or
+                        "invalid token" in err_msg
                     ):
                         logger.info("Kotak session invalid (stCode=%s, msg='%s') for account '%s'. Triggering auto-login...", st_code, resp_json.get("errMsg"), name)
                         if self.auto_login(consumer_key):
@@ -655,6 +659,7 @@ class KotakAccountManager(BaseBrokerManager):
 
         try:
             resp = client.limits()
+            _check_neo_error(resp)
             if isinstance(resp, dict):
                 data = resp.get("data", resp)
                 net = data.get("Net", data.get("net"))

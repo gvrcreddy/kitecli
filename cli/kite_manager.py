@@ -1039,22 +1039,36 @@ class KiteAccountManager(BaseBrokerManager):
         return {}
 
     def get_market_indices(self) -> dict[str, Any]:
-        # 1. Try Kite first
+        # 1. Try Kite ohlc first for last_price and yesterday's close
         for api_key in self.get_all_api_keys():
             if self.is_authenticated(api_key):
                 kite = self._clients.get(api_key)
                 if kite:
                     try:
-                        data = kite.ltp(["NSE:NIFTY 50", "BSE:SENSEX", "NSE:INDIA VIX"])
-                        nifty = data.get("NSE:NIFTY 50", {}).get("last_price")
-                        sensex = data.get("BSE:SENSEX", {}).get("last_price")
-                        vix = data.get("NSE:INDIA VIX", {}).get("last_price")
-                        if nifty or sensex or vix:
+                        data = kite.ohlc(["NSE:NIFTY 50", "BSE:SENSEX", "NSE:INDIA VIX"])
+                        
+                        def parse_item(item_data):
+                            if not isinstance(item_data, dict):
+                                return None, None
+                            last = item_data.get("last_price")
+                            ohlc = item_data.get("ohlc", {})
+                            close = ohlc.get("close") if isinstance(ohlc, dict) else None
+                            change = (last - close) if (last is not None and close is not None) else None
+                            return last, change
+
+                        nifty_last, nifty_change = parse_item(data.get("NSE:NIFTY 50"))
+                        sensex_last, sensex_change = parse_item(data.get("BSE:SENSEX"))
+                        vix_last, vix_change = parse_item(data.get("NSE:INDIA VIX"))
+
+                        if nifty_last or sensex_last or vix_last:
                             return {
                                 "status": "success",
-                                "nifty": nifty,
-                                "sensex": sensex,
-                                "vix": vix,
+                                "nifty": nifty_last,
+                                "nifty_change": nifty_change,
+                                "sensex": sensex_last,
+                                "sensex_change": sensex_change,
+                                "vix": vix_last,
+                                "vix_change": vix_change,
                             }
                     except Exception as exc:
                         logger.warning("Kite indices fetch failed for api_key=%s…: %s", api_key[:8], exc)

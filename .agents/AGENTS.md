@@ -29,7 +29,7 @@ These rules apply to all AI agents working on the `kitecli` repository. Follow t
 *   **Kotak Neo Session Retries**:
     *   When intercepting `100008` (unauthorized) or `"unauthorized"` body responses to trigger auto-login retries, you MUST update both the request headers (`Sid`, `Auth`) and the URL query parameters (`sId`, `sid`) to keep them in sync. Mismatches will result in recurring 401s from the Kotak Neo gateway.
 *   **Kotak Static IP Whitelisting**:
-    *   Kotak Neo enforces strict static IP whitelisting ONLY on order placement APIs (place, modify, cancel). Limits and positions APIs are exempt. If limits/positions succeed but order placement returns `unauthorized`, verify if the proxy configured in `config.yaml` is whitelisted on the developer portal.
+    *   Kotak Neo enforces strict static IP whitelisting on order placement APIs (place, modify, cancel) and login authentication endpoints (tradeApiLogin, tradeApiValidate). Limits and positions APIs are exempt. Both login authentication and order placement MUST route through the configured static proxy so that session tokens match the order placement IP.
 *   **TUI Ctrl+R History Search**:
     *   The `SearchToolbar` must be instantiated before the `TextArea` and passed directly into the `search_field` constructor argument. Dynamic assignment of `TextArea.search_field` is not supported by prompt-toolkit.
 *   **Immediate UI Refresh**:
@@ -39,7 +39,7 @@ These rules apply to all AI agents working on the `kitecli` repository. Follow t
 *   **Throttled TUI Logging for REST Refresh**:
     *   REST refresh failures caught in `_trigger_immediate_refresh` must be logged to the Status Logs pane using `_ws_should_log` with a 30s minimum interval to avoid spamming the user interface.
 *   **Broker Proxy Routing**:
-    *   Both Zerodha and Kotak Neo only enforce static IP whitelisting on order placement REST APIs (POST/PUT/DELETE /place, /modify, /cancel).
+    *   Both Zerodha and Kotak Neo enforce static IP whitelisting on order placement REST APIs (POST/PUT/DELETE /place, /modify, /cancel) and Kotak login authentication APIs.
     *   To avoid proxy-related network latency, 502 Bad Gateway REST errors, and 1006 WebSocket connection handshake timeouts, all read-only REST APIs (positions, margins/limits, orderbook, profile) and all WebSocket connections (both Zerodha's `KiteTicker` / `probe_ws_auth` and Kotak's `KotakTicker` / WebSocket feed) must bypass proxies and connect directly.
 *   **Handling Non-PyPI Dependencies**:
     *   Third-party packages not hosted on PyPI (such as Kotak Neo's `neo-api-client`) must **never** be listed in `pyproject.toml`'s dependencies or optional-dependencies list to prevent PyPI dependency resolution crashes.

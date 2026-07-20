@@ -312,6 +312,7 @@ class KCLILiveSession:
         #   NSE:NIFTY 50 -> 256265, BSE:SENSEX -> 265, NSE:INDIA VIX -> 264969
         self.index_tokens = {256265: "nifty", 265: "sensex", 264969: "vix"}
         self.index_values = {"nifty": None, "sensex": None, "vix": None}
+        self.index_close_prices = {}
 
         # Designated primary streaming account. Index and option-chain ticks are
         # subscribed only on this account's ticker (chosen in
@@ -1329,7 +1330,9 @@ class KCLILiveSession:
                 code == 403
                 or "403" in reason_str
                 or "auth_failed" in reason_str
-                or "token" in reason_str
+                or "invalid token" in reason_str
+                or "token expired" in reason_str
+                or "unauthorized" in reason_str
             )
             if is_auth_failure:
                 self.log_message(
@@ -1378,9 +1381,22 @@ class KCLILiveSession:
             if not token or ltp is None:
                 continue
 
-            # Market index tick → update the header values.
+            # Market index tick → update the header values & streaming change.
             if token in self.index_tokens:
-                self.index_values[self.index_tokens[token]] = ltp
+                key = self.index_tokens[token]
+                self.index_values[key] = ltp
+
+                # Extract close from tick OHLC if available, or use cached REST close price
+                tick_close = None
+                if isinstance(tick.get("ohlc"), dict):
+                    tick_close = tick["ohlc"].get("close")
+                if tick_close:
+                    self.index_close_prices[key] = tick_close
+
+                close_val = self.index_close_prices.get(key)
+                if close_val is not None:
+                    self.index_values[f"{key}_change"] = ltp - close_val
+
                 indices_updated = True
                 continue
 
@@ -1458,18 +1474,82 @@ class KCLILiveSession:
             self.app.invalidate()
 
     def _render_indices_html(self) -> HTML:
-        """Build the formatted market-index header from the current values."""
-        def fmt(v):
-            return f"{v:,.2f}" if v else "N/A"
+        """Build formatted market-index header tailored to the Right Pane width."""
+        total_cols = 100
+        if hasattr(self, "app") and self.app and hasattr(self.app, "output") and self.app.output:
+            try:
+                cols = self.app.output.get_size().columns
+                if isinstance(cols, int):
+                    total_cols = cols
+            except Exception:
+                pass
 
-        nifty_str = fmt(self.index_values.get("nifty"))
-        sensex_str = fmt(self.index_values.get("sensex"))
-        vix_str = fmt(self.index_values.get("vix"))
-        return HTML(
-            f"  <ansicyan><b>NIFTY 50:</b></ansicyan> <style fg='#ffffff'>{nifty_str}</style>   "
-            f"│   <ansiyellow><b>SENSEX:</b></ansiyellow> <style fg='#ffffff'>{sensex_str}</style>   "
-            f"│   <ansired><b>INDIA VIX:</b></ansired> <style fg='#ffffff'>{vix_str}</style>"
-        )
+        # The indices bar is rendered inside the Right Pane, so compute right pane width
+        lw = getattr(self, "left_pane_weight", 50)
+        rw = getattr(self, "right_pane_weight", 50)
+        pane_cols = int(total_cols * (rw / max(1, lw + rw)))
+
+        def fmt_item(val, chg, is_vix: bool = False, compact: bool = False):
+            if val is None:
+                return "<style fg='#ffffff'>N/A</style>"
+            val_str = f"{val:,.2f}"
+            if chg is None:
+                return f"<style fg='#ffffff'>{val_str}</style>"
+
+            # For VIX: negative change (volatility drop) is green, positive (volatility spike) is red
+            # For NIFTY/SENSEX: positive is green, negative is red
+            if is_vix:
+                color = "#00ff00" if chg <= 0 else "#ff5f5f"
+            else:
+                color = "#00ff00" if chg >= 0 else "#ff5f5f"
+
+            sign = "+" if chg >= 0 else ""
+            if compact:
+                # In tight right-pane spaces, round large changes to integers e.g. (+80) instead of (+80.50)
+                chg_str = f"{sign}{int(round(chg)):,d}" if not is_vix else f"{sign}{chg:.2f}"
+            else:
+                chg_str = f"{sign}{chg:,.2f}"
+            return f"<style fg='{color}'>{val_str} ({chg_str})</style>"
+
+        if pane_cols >= 75:
+            # Full width: NIFTY 50: 24,234.85 (-99.80) │ SENSEX: 77,708.24 (-441.41) │ IV: 13.45 (+0.25)
+            nifty_html = fmt_item(self.index_values.get("nifty"), self.index_values.get("nifty_change"))
+            sensex_html = fmt_item(self.index_values.get("sensex"), self.index_values.get("sensex_change"))
+            vix_html = fmt_item(self.index_values.get("vix"), self.index_values.get("vix_change"), is_vix=True)
+            return HTML(
+                f" <ansicyan><b>NIFTY 50:</b></ansicyan> {nifty_html} "
+                f"│ <ansiyellow><b>SENSEX:</b></ansiyellow> {sensex_html} "
+                f"│ <ansired><b>IV:</b></ansired> {vix_html}"
+            )
+        elif pane_cols >= 55:
+            # Medium width: NIFTY: 24,234.85 (-100) │ SENSEX: 77,708.24 (-441) │ IV: 13.45 (+0.25)
+            nifty_html = fmt_item(self.index_values.get("nifty"), self.index_values.get("nifty_change"), compact=True)
+            sensex_html = fmt_item(self.index_values.get("sensex"), self.index_values.get("sensex_change"), compact=True)
+            vix_html = fmt_item(self.index_values.get("vix"), self.index_values.get("vix_change"), is_vix=True, compact=True)
+            return HTML(
+                f"<ansicyan><b>NIFTY:</b></ansicyan> {nifty_html} "
+                f"│ <ansiyellow><b>SENSEX:</b></ansiyellow> {sensex_html} "
+                f"│ <ansired><b>IV:</b></ansired> {vix_html}"
+            )
+        else:
+            # Ultra compact for narrow right pane (< 55 cols): N: 24,234.85 │ S: 77,708.24 │ IV: 13.45
+            def fmt_val_only(val, chg, is_vix=False):
+                if val is None:
+                    return "<style fg='#ffffff'>N/A</style>"
+                val_str = f"{val:,.2f}"
+                if chg is None:
+                    return f"<style fg='#ffffff'>{val_str}</style>"
+                color = ("#00ff00" if chg <= 0 else "#ff5f5f") if is_vix else ("#00ff00" if chg >= 0 else "#ff5f5f")
+                return f"<style fg='{color}'>{val_str}</style>"
+
+            nifty_html = fmt_val_only(self.index_values.get("nifty"), self.index_values.get("nifty_change"))
+            sensex_html = fmt_val_only(self.index_values.get("sensex"), self.index_values.get("sensex_change"))
+            vix_html = fmt_val_only(self.index_values.get("vix"), self.index_values.get("vix_change"), is_vix=True)
+            return HTML(
+                f"<ansicyan><b>N:</b></ansicyan> {nifty_html} "
+                f"│ <ansiyellow><b>S:</b></ansiyellow> {sensex_html} "
+                f"│ <ansired><b>IV:</b></ansired> {vix_html}"
+            )
 
     def _get_active_ticker(self):
         """Get the primary ticker if it is connected, else fallback to any connected ticker."""
@@ -1730,9 +1810,20 @@ class KCLILiveSession:
                         if self._ws_should_log("rest_err:indices", min_interval=30.0):
                             self.log_message(f"[#ff8700]Indices fetch failed:[/#] {self._clean_error(str(indices_resp))}")
                     elif isinstance(indices_resp, dict) and indices_resp.get("status") == "success":
-                        self.index_values["nifty"]  = indices_resp.get("nifty")
-                        self.index_values["sensex"] = indices_resp.get("sensex")
-                        self.index_values["vix"]    = indices_resp.get("vix")
+                        self.index_values["nifty"]         = indices_resp.get("nifty")
+                        self.index_values["nifty_change"]  = indices_resp.get("nifty_change")
+                        self.index_values["sensex"]        = indices_resp.get("sensex")
+                        self.index_values["sensex_change"] = indices_resp.get("sensex_change")
+                        self.index_values["vix"]           = indices_resp.get("vix")
+                        self.index_values["vix_change"]    = indices_resp.get("vix_change")
+
+                        # Cache close prices (last - change) so live WebSocket ticks can dynamically recalculate change
+                        for key in ["nifty", "sensex", "vix"]:
+                            last_val = self.index_values.get(key)
+                            chg_val = self.index_values.get(f"{key}_change")
+                            if last_val is not None and chg_val is not None:
+                                self.index_close_prices[key] = last_val - chg_val
+
                         self.market_indices_control.text = self._render_indices_html()
                     elif isinstance(indices_resp, dict):
                         errors_this_cycle += 1
@@ -3892,7 +3983,7 @@ class KCLILiveSession:
      Ctrl + E           -> Executed Orders
      Ctrl + O           -> Option Chain
      Ctrl + G           -> AI Advisor
-     Ctrl + H           -> Help
+     F5 / Esc+5         -> Help
 
    Function Keys / Alt:
      F1 / F2 / F3 / F4 / F5
@@ -4359,7 +4450,6 @@ class KCLILiveSession:
             event.app.invalidate()
 
         @kb.add("c-5")
-        @kb.add("c-h")
         @kb.add("escape", "5")
         @kb.add("f5")
         def _c5(event):

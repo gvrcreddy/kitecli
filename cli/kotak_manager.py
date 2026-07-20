@@ -228,40 +228,46 @@ class KotakAccountManager(BaseBrokerManager):
             if 'Content-Type' not in headers:
                 headers['Content-Type'] = 'application/json'
 
-            u = url
-            if query_params:
-                u_with_params = u
-                if '?' not in u:
-                    u_with_params += '?' + _urlencode(query_params)
+            def _do_req(h, max_proxy_retries: int = 2):
+                if query_params and isinstance(query_params, dict):
+                    base_u = url.split('?')[0]
+                    u_curr = base_u + '?' + _urlencode(query_params)
                 else:
-                    pass
-            else:
-                u_with_params = u
+                    u_curr = url
 
-            def _do_req(h):
                 req_kwargs = {}
                 if _proxies:
-                    # Kotak Neo static IP whitelisting is only enforced on order APIs
-                    url_lower = u_with_params.lower()
-                    if "/order/" in url_lower and any(x in url_lower for x in ["/place", "/modify", "/cancel"]):
+                    url_lower = u_curr.lower()
+                    is_order_api = "/order/" in url_lower and any(x in url_lower for x in ["/place", "/modify", "/cancel"])
+                    is_login_api = "/login/" in url_lower or "tradeapilogin" in url_lower or "tradeapivalidate" in url_lower
+                    if is_order_api or is_login_api:
                         req_kwargs["proxies"] = _proxies
 
-                logger.debug("Kotak REST [%s] requesting: %s", method, u_with_params)
+                logger.debug("Kotak REST [%s] requesting: %s", method, u_curr)
                 logger.debug("Kotak REST headers: %s", {k: v[:15] + '...' if len(str(v)) > 15 else v for k, v in h.items()})
 
-                if method in ['POST', 'PUT', 'PATCH', 'DELETE']:
-                    if _re.search('json', h['Content-Type'], _re.IGNORECASE):
-                        request_body = _json.dumps(body) if body is not None else None
-                        return _req.post(url=u_with_params, headers=h, data=request_body, **req_kwargs)
-                    elif _re.search('x-www-form-urlencoded', h['Content-Type'], _re.IGNORECASE):
-                        request_body = {"jData": _json.dumps(body)} if body is not None else {}
-                        return _req.post(url=u_with_params, headers=h, data=request_body, **req_kwargs)
-                elif method == 'GET':
-                    return _req.get(url=u_with_params, headers=h, **req_kwargs)
-                return _orig_request(method, url, query_params=query_params, headers=h, body=body)
+                try:
+                    if method in ['POST', 'PUT', 'PATCH', 'DELETE']:
+                        if _re.search('json', h.get('Content-Type', ''), _re.IGNORECASE):
+                            request_body = _json.dumps(body) if body is not None else None
+                            return _req.post(url=u_curr, headers=h, data=request_body, **req_kwargs)
+                        elif _re.search('x-www-form-urlencoded', h.get('Content-Type', ''), _re.IGNORECASE):
+                            request_body = {"jData": _json.dumps(body)} if body is not None else {}
+                            return _req.post(url=u_curr, headers=h, data=request_body, **req_kwargs)
+                    elif method == 'GET':
+                        return _req.get(url=u_curr, headers=h, **req_kwargs)
+                    return _orig_request(method, url, query_params=query_params, headers=h, body=body)
+                except Exception as req_exc:
+                    exc_str = str(req_exc).lower()
+                    if max_proxy_retries > 0 and _proxies and ("proxy" in exc_str or "502" in exc_str or "tunnel" in exc_str or "connect" in exc_str):
+                        import time
+                        logger.warning("Kotak static proxy transient error (%s). Retrying via proxy in 1s...", req_exc)
+                        time.sleep(1.0)
+                        return _do_req(h, max_proxy_retries=max_proxy_retries - 1)
+                    raise
 
             resp = _do_req(headers)
-            logger.info("Kotak REST %s %s → status %s", method, u_with_params, resp.status_code)
+            logger.info("Kotak REST %s %s → status %s", method, url, resp.status_code)
             try:
                 logger.debug("Kotak REST response body: %s", resp.json())
             except Exception:
@@ -284,16 +290,20 @@ class KotakAccountManager(BaseBrokerManager):
                         logger.info("Kotak session invalid (stCode=%s, msg='%s') for account '%s'. Triggering auto-login...", st_code, resp_json.get("errMsg"), name)
                         if self.auto_login(consumer_key):
                             # Update headers with new credentials
+                            new_sid = client.configuration.serverId or client.configuration.edit_sid
                             headers["Sid"] = client.configuration.edit_sid
                             headers["Auth"] = client.configuration.edit_token
+                            if new_sid:
+                                url = _re.sub(r'([?&]sId=)[^&]*', r'\g<1>' + str(new_sid), url)
+                                url = _re.sub(r'([?&]sid=)[^&]*', r'\g<1>' + str(new_sid), url)
                             if isinstance(query_params, dict):
                                 if "sId" in query_params:
-                                    query_params["sId"] = client.configuration.serverId
+                                    query_params["sId"] = new_sid
                                 if "sid" in query_params:
-                                    query_params["sid"] = client.configuration.edit_sid
+                                    query_params["sid"] = new_sid
                             logger.info("Retrying request after successful auto-login...")
                             resp = _do_req(headers)
-                            logger.info("Kotak REST retry %s %s → status %s", method, u_with_params, resp.status_code)
+                            logger.info("Kotak REST retry %s %s → status %s", method, url, resp.status_code)
                             try:
                                 logger.debug("Kotak REST retry response body: %s", resp.json())
                             except Exception:
@@ -628,6 +638,18 @@ class KotakAccountManager(BaseBrokerManager):
             except ValueError:
                 pending_quantity = 0
 
+            fld_qty_str = str(ord.get("fldQty", ord.get("filled_quantity", "0")))
+            try:
+                filled_quantity = int(fld_qty_str)
+            except ValueError:
+                filled_quantity = 0
+
+            avg_prc_str = str(ord.get("avgPrc", ord.get("average_price", "0")))
+            try:
+                average_price = float(avg_prc_str)
+            except ValueError:
+                average_price = 0.0
+
             price_str = str(ord.get("prc", ord.get("price", "0")))
             try:
                 price = float(price_str)
@@ -639,8 +661,10 @@ class KotakAccountManager(BaseBrokerManager):
                 "tradingsymbol": ord.get("trdSym", ord.get("tradingsymbol", "")),
                 "transaction_type": str(ord.get("trnsTp", ord.get("transaction_type", ""))).upper(),
                 "quantity": quantity,
+                "filled_quantity": filled_quantity,
                 "pending_quantity": pending_quantity,
                 "price": price,
+                "average_price": average_price,
                 "order_type": str(ord.get("prcTp", ord.get("order_type", "MARKET"))).upper(),
                 "status": status,
                 "product": str(ord.get("prod", ord.get("product", "NRML"))).upper(),

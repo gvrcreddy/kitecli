@@ -132,7 +132,23 @@ def probe_ws_auth(api_key: str, access_token: str, proxy_str: str = None,
             if " 200" not in first:
                 return "proxy_blocked", first.strip() or "proxy CONNECT failed"
         else:
-            raw_sock = socket.create_connection((host, port), timeout=timeout)
+            infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            # Prioritize IPv6 if available on current network
+            infos = sorted(infos, key=lambda x: 0 if x[0] == socket.AF_INET6 else 1)
+            err = None
+            for info in infos:
+                family, socktype, proto, _, sockaddr = info
+                try:
+                    s = socket.socket(family, socktype, proto)
+                    s.settimeout(timeout)
+                    s.connect(sockaddr)
+                    raw_sock = s
+                    break
+                except Exception as e:
+                    err = e
+                    continue
+            if not raw_sock:
+                raise err or socket.error(f"Failed to connect to {host}:{port}")
 
         try:
             tls = ctx.wrap_socket(raw_sock, server_hostname=host)
@@ -2051,6 +2067,119 @@ class KCLILiveSession:
 
 
 
+    def _format_curr(self, val: float | None) -> str:
+        if val is None:
+            return "N/A"
+        abs_v = abs(val)
+        if abs_v >= 100000:
+            return f"₹{val / 100000:.2f}L"
+        elif abs_v >= 1000:
+            return f"₹{val / 1000:.2f}k"
+        else:
+            return f"₹{val:,.2f}"
+
+    def _get_order_margin_summary(
+        self,
+        api_keys: list[str],
+        symbol: str,
+        transaction_type: str,
+        qty: int,
+        price: float | None = None,
+        product: str = "NRML",
+    ) -> str:
+        """Fetch margin required and available margins for the given accounts."""
+        if not api_keys or not symbol:
+            return ""
+
+        summary_parts = []
+        for key in api_keys:
+            name = self._get_account_name(key)
+            avail_margin = None
+            m_dict = getattr(self, "margins_by_api_key", {}).get(key, {})
+            if isinstance(m_dict, dict):
+                avail_margin = m_dict.get("net")
+                if avail_margin is None:
+                    avail_margin = m_dict.get("cash")
+                if avail_margin is None and isinstance(m_dict.get("available"), dict):
+                    avail_margin = m_dict["available"].get("live_balance")
+
+            try:
+                m_res = self.client.get_order_margin(
+                    api_key=key,
+                    tradingsymbol=symbol,
+                    transaction_type=transaction_type,
+                    quantity=qty,
+                    price=price,
+                    product=product,
+                )
+                if isinstance(m_res, dict) and m_res.get("status") == "success":
+                    req_margin = m_res.get("total", 0.0)
+                    req_str = f"Needed {self._format_curr(req_margin)}"
+                    avail_str = f"Avail {self._format_curr(avail_margin)}" if avail_margin is not None else ""
+                    if avail_str:
+                        summary_parts.append(f"@{name}: {req_str} │ {avail_str}")
+                    else:
+                        summary_parts.append(f"@{name}: {req_str}")
+            except Exception as exc:
+                pass
+
+        if summary_parts:
+            if len(summary_parts) == 1:
+                return f"\n  👉 [bold]{summary_parts[0]}[/bold]"
+            else:
+                lines = [f"\n  • [bold]{s}[/bold]" for s in summary_parts]
+                return "".join(lines)
+        return ""
+
+    def _get_order_margin_summary_inline(
+        self,
+        api_keys: list[str],
+        symbol: str,
+        transaction_type: str,
+        qty: int,
+        price: float | None = None,
+        product: str = "NRML",
+    ) -> str:
+        """Fetch margin required and available margins as a concise inline string for prompt line."""
+        if not api_keys or not symbol:
+            return ""
+
+        summary_parts = []
+        for key in api_keys:
+            name = self._get_account_name(key)
+            avail_margin = None
+            m_dict = getattr(self, "margins_by_api_key", {}).get(key, {})
+            if isinstance(m_dict, dict):
+                avail_margin = m_dict.get("net")
+                if avail_margin is None:
+                    avail_margin = m_dict.get("cash")
+                if avail_margin is None and isinstance(m_dict.get("available"), dict):
+                    avail_margin = m_dict["available"].get("live_balance")
+
+            try:
+                m_res = self.client.get_order_margin(
+                    api_key=key,
+                    tradingsymbol=symbol,
+                    transaction_type=transaction_type,
+                    quantity=qty,
+                    price=price,
+                    product=product,
+                )
+                if isinstance(m_res, dict) and m_res.get("status") == "success":
+                    req_margin = m_res.get("total", 0.0)
+                    req_str = f"Need: {self._format_curr(req_margin)}"
+                    avail_str = f"Avail: {self._format_curr(avail_margin)}" if avail_margin is not None else ""
+                    if len(api_keys) > 1:
+                        summary_parts.append(f"@{name}: {req_str}" + (f"/{avail_str}" if avail_str else ""))
+                    else:
+                        summary_parts.append(f"{req_str}" + (f" │ {avail_str}" if avail_str else ""))
+            except Exception:
+                pass
+
+        if summary_parts:
+            return " [" + " │ ".join(summary_parts) + "]"
+        return ""
+
     def _resolve_qty(self, qty_arg: str, symbol: str | None) -> tuple[str, str, str | None]:
         """Resolve a quantity argument that may use the lot suffix (e.g. '2L').
 
@@ -2551,8 +2680,24 @@ class KCLILiveSession:
                             api_key=api_keys[0] if api_keys else None
                         )
                         
-                        self.prompt_control.text = f" Confirm {parsed.action} {qty_display} {symbol} ({parsed.product}) {price_desc}? (y/n)> "
-                        self.log_message(f"[#ff8700]Pending Confirmation:[/#] {parsed.action} {qty_display} {symbol} {price_desc} ({parsed.product}). Press [bold]y[/bold] to confirm.")
+                        margin_summary = self._get_order_margin_summary(
+                            api_keys=api_keys,
+                            symbol=symbol,
+                            transaction_type=parsed.action.upper(),
+                            qty=int(qty_val) if str(qty_val).isdigit() else 1,
+                            price=parsed.price,
+                            product=parsed.product,
+                        )
+                        margin_inline = self._get_order_margin_summary_inline(
+                            api_keys=api_keys,
+                            symbol=symbol,
+                            transaction_type=parsed.action.upper(),
+                            qty=int(qty_val) if str(qty_val).isdigit() else 1,
+                            price=parsed.price,
+                            product=parsed.product,
+                        )
+                        self.prompt_control.text = f" Confirm {parsed.action} {qty_display} {symbol} ({parsed.product}) {price_desc}{margin_inline}? (y/n)> "
+                        self.log_message(f"[#ff8700]Pending Confirmation:[/#] {parsed.action} {qty_display} {symbol} {price_desc} ({parsed.product}).{margin_summary}\nPress [bold]y[/bold] to confirm.")
                         continue
 
                     elif isinstance(parsed, ExitCommand):
@@ -3325,9 +3470,24 @@ class KCLILiveSession:
             )
 
             price_desc = f"at price {price_str}" if price_str else "at MARKET"
-            self.prompt_control.text = f" Confirm {primary_cmd.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}? (y/n)> "
-            self.log_message(f"[#ff8700]Pending Confirmation:[/#] {primary_cmd.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
-            return
+            margin_summary = self._get_order_margin_summary(
+                api_keys=target_keys,
+                symbol=symbol,
+                transaction_type=primary_cmd.upper(),
+                qty=int(raw_qty_str) if str(raw_qty_str).isdigit() else 1,
+                price=float(price_str) if price_str and price_str.replace('.', '', 1).isdigit() else None,
+                product=product,
+            )
+            margin_inline = self._get_order_margin_summary_inline(
+                api_keys=target_keys,
+                symbol=symbol,
+                transaction_type=primary_cmd.upper(),
+                qty=int(raw_qty_str) if str(raw_qty_str).isdigit() else 1,
+                price=float(price_str) if price_str and price_str.replace('.', '', 1).isdigit() else None,
+                product=product,
+            )
+            self.prompt_control.text = f" Confirm {primary_cmd.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}{margin_inline}? (y/n)> "
+            self.log_message(f"[#ff8700]Pending Confirmation:[/#] {primary_cmd.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}.{margin_summary}\nPress [bold]y[/bold] to confirm, any other key to cancel.")
             return
 
         # Exit Positions Command

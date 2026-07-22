@@ -125,8 +125,22 @@ class TestKiteGetPositions(unittest.TestCase):
         pos = positions[0]
         self.assertEqual(pos["tradingsymbol"], "NIFTY24JAN21000CE")
         self.assertEqual(pos["quantity"], 50)
-        self.assertIn("pnl_pct", pos)
+        self.assertAlmostEqual(pos["pnl_pct"], 8.33, places=2)
         self.assertEqual(pos["instrument_token"], 12345)
+
+    def test_order_margin_calculation(self):
+        from cli.kite_manager import KiteAccountManager
+        mgr = KiteAccountManager()
+        mock_kite = MagicMock()
+        mock_kite.order_margins.return_value = [
+            {"total": 457.5, "span": 0.0, "exposure": 0.0, "option_premium": 457.5}
+        ]
+        mgr._clients["k1"] = mock_kite
+        mgr._authenticated["k1"] = True
+
+        m_info = mgr.get_order_margin("k1", "NIFTY26JUL22200PE", "BUY", 150, price=3.05)
+        self.assertEqual(m_info["status"], "success")
+        self.assertEqual(m_info["total"], 457.5)
 
 
 # ── KotakAccountManager tests ─────────────────────────────────────────────────

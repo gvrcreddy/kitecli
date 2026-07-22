@@ -261,6 +261,30 @@ class KCLIClient:
         except Exception as exc:
             raise KCLIClientError(str(exc)) from exc
 
+    def get_order_margin(
+        self,
+        api_key: str,
+        tradingsymbol: str,
+        transaction_type: str,
+        quantity: int,
+        price: float | None = None,
+        product: str = "NRML",
+        exchange: str = "NFO",
+        order_type: str = "LIMIT",
+    ) -> dict:
+        """Calculate margin required for a proposed order on a specific account."""
+        mgr = _manager_for(api_key)
+        return mgr.get_order_margin(
+            account_key=api_key,
+            tradingsymbol=tradingsymbol,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            price=price,
+            product=product,
+            exchange=exchange,
+            order_type=order_type,
+        )
+
     def get_positions(self, api_keys: list[str]) -> dict:
         """Fetch open positions for the given accounts in parallel."""
         keys = api_keys or [a.get("api_key") for a in self._accounts if a.get("api_key")]

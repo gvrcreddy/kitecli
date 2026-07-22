@@ -143,3 +143,17 @@ class BaseBrokerManager(ABC):
     def get_market_indices(self) -> dict[str, Any]:
         """Return Nifty / Sensex / India VIX snapshot. Default: not supported."""
         return {"status": "error", "message": "not supported by this broker"}
+
+    def get_order_margin(
+        self,
+        account_key: str,
+        tradingsymbol: str,
+        transaction_type: str,
+        quantity: int,
+        price: float | None = None,
+        product: str = "NRML",
+        exchange: str = "NFO",
+        order_type: str = "LIMIT",
+    ) -> dict[str, Any]:
+        """Calculate margin required for a proposed order. Default: fallback estimation."""
+        return {"status": "error", "message": "not supported by this broker"}

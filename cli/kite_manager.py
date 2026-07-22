@@ -1103,3 +1103,58 @@ class KiteAccountManager(BaseBrokerManager):
             logger.warning("Failed to fetch LTP/tokens from Zerodha: %s", exc)
             return {}
 
+    def get_order_margin(
+        self,
+        account_key: str,
+        tradingsymbol: str,
+        transaction_type: str,
+        quantity: int,
+        price: float | None = None,
+        product: str = "NRML",
+        exchange: str = "NFO",
+        order_type: str = "LIMIT",
+    ) -> dict[str, Any]:
+        """Calculate margin required using Zerodha kite.order_margins()."""
+        kite = self._clients.get(account_key)
+        if not kite or not self.is_authenticated(account_key):
+            return {"status": "error", "message": "Account not authenticated"}
+
+        try:
+            p_val = price if price is not None else 0.0
+            order_param = {
+                "exchange": exchange,
+                "tradingsymbol": tradingsymbol,
+                "transaction_type": transaction_type.upper(),
+                "variety": "regular",
+                "product": product.upper(),
+                "order_type": order_type.upper() if price is not None else "MARKET",
+                "quantity": abs(quantity),
+                "price": p_val,
+                "trigger_price": 0,
+            }
+
+            margin_resp = kite.order_margins([order_param])
+            if isinstance(margin_resp, list) and len(margin_resp) > 0:
+                m_info = margin_resp[0]
+                total_margin = m_info.get("total")
+                if total_margin is None:
+                    total_margin = m_info.get("margin_required", 0.0)
+                return {
+                    "status": "success",
+                    "total": float(total_margin),
+                    "span": float(m_info.get("span", 0.0)),
+                    "exposure": float(m_info.get("exposure", 0.0)),
+                    "option_premium": float(m_info.get("option_premium", 0.0)),
+                    "detail": m_info,
+                }
+            return {"status": "error", "message": "Empty margin response from Zerodha"}
+        except Exception as exc:
+            logger.warning("Zerodha order_margins fetch failed for %s: %s", tradingsymbol, exc)
+            if price and price > 0 and transaction_type.upper() == "BUY":
+                return {
+                    "status": "success",
+                    "total": round(abs(quantity) * price, 2),
+                    "is_estimated": True,
+                }
+            return {"status": "error", "message": str(exc)}
+

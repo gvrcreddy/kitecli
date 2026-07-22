@@ -1202,3 +1202,46 @@ class KotakTicker:
                 if self.on_order_update:
                     self.on_order_update(self, norm_data)
 
+    def get_order_margin(
+        self,
+        account_key: str,
+        tradingsymbol: str,
+        transaction_type: str,
+        quantity: int,
+        price: float | None = None,
+        product: str = "NRML",
+        exchange: str = "NFO",
+        order_type: str = "LIMIT",
+    ) -> dict[str, Any]:
+        """Calculate margin required for Kotak Neo orders."""
+        client = self._clients.get(account_key)
+        if not client or not self.is_authenticated(account_key):
+            return {"status": "error", "message": "Kotak account not authenticated"}
+
+        try:
+            p_val = price if price is not None else 0.0
+            if hasattr(client, "margin_required") and callable(getattr(client, "margin_required")):
+                margin_resp = client.margin_required(
+                    exchange_segment=exchange,
+                    price=str(p_val),
+                    product=product,
+                    quantity=str(abs(quantity)),
+                    token=tradingsymbol,
+                    transaction_type=transaction_type.upper(),
+                )
+                if isinstance(margin_resp, dict) and "margin" in margin_resp:
+                    return {
+                        "status": "success",
+                        "total": float(margin_resp.get("margin", 0.0)),
+                    }
+        except Exception as exc:
+            logger.debug("Kotak SDK margin_required call failed: %s", exc)
+
+        if price and price > 0:
+            return {
+                "status": "success",
+                "total": round(abs(quantity) * price, 2),
+                "is_estimated": True,
+            }
+        return {"status": "error", "message": "Kotak margin estimation unavailable"}
+

@@ -198,9 +198,18 @@ def status() -> None:
 
 
 @app.command()
-def live() -> None:
+def live(
+    record_context: bool = typer.Option(
+        False,
+        "--record-context",
+        help="Enable SQLite database persistence for executed order context (Option Greeks, Margins, Daily Indicators).",
+    ),
+) -> None:
     """[bold]Live dashboard[/bold] — Interactive positions monitor and order terminal."""
     config = _load_config_or_exit()
+    if record_context:
+        config["record_executed_order_context"] = True
+
     accounts = config.get("accounts", [])
     if not accounts:
         display_error("No accounts configured. Edit your config file to add accounts.")

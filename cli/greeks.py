@@ -1,0 +1,160 @@
+import calendar
+import math
+import re
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Optional
+
+MONTH_MAP = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+MONTH_CODE_MAP = {
+    "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6,
+    "7": 7, "8": 8, "9": 9, "O": 10, "N": 11, "D": 12,
+}
+
+# Standard Normal Cumulative Distribution Function
+def _norm_cdf(x: float) -> float:
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+# Standard Normal Probability Density Function
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def parse_nfo_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    """Parse NFO option tradingsymbol into strike, option_type, and estimated expiry date."""
+    symbol = symbol.strip().upper()
+    if not (symbol.endswith("CE") or symbol.endswith("PE")):
+        return None
+
+    opt_type = "PE" if symbol.endswith("PE") else "CE"
+    core = symbol[:-2]
+
+    # Pattern A: Monthly (e.g. NIFTY26JUL22500 or BANKNIFTY26AUG50000)
+    m_monthly = re.match(r"^([A-Z]+)(\d{2})([A-Z]{3})(\d+(?:\.\d+)?)$", core)
+    if m_monthly:
+        underlying, yy, mon_str, strike_str = m_monthly.groups()
+        year = 2000 + int(yy)
+        month = MONTH_MAP.get(mon_str, date.today().month)
+        strike = float(strike_str)
+        cal = calendar.monthcalendar(year, month)
+        thursdays = [week[calendar.THURSDAY] for week in cal if week[calendar.THURSDAY] != 0]
+        expiry_day = thursdays[-1] if thursdays else 28
+        exp_date = date(year, month, expiry_day)
+        return {"underlying": underlying, "option_type": opt_type, "strike": strike, "expiry_date": exp_date}
+
+    # Pattern B: Weekly (e.g. NIFTY2672522500 -> YY=26, M=7, DD=25, STRIKE=22500)
+    m_weekly = re.match(r"^([A-Z]+)(\d{2})([1-9OND])(\d{2})(\d+(?:\.\d+)?)$", core)
+    if m_weekly:
+        underlying, yy, m_code, dd_str, strike_str = m_weekly.groups()
+        year = 2000 + int(yy)
+        month = MONTH_CODE_MAP.get(m_code, date.today().month)
+        day = int(dd_str)
+        strike = float(strike_str)
+        try:
+            exp_date = date(year, month, day)
+        except ValueError:
+            exp_date = date.today() + timedelta(days=7)
+        return {"underlying": underlying, "option_type": opt_type, "strike": strike, "expiry_date": exp_date}
+
+    # Fallback pattern if non-standard string:
+    nums = re.findall(r"\d+", core)
+    if nums:
+        strike = float(nums[-1])
+        exp_date = date.today() + timedelta(days=7)
+        return {"underlying": "NIFTY", "option_type": opt_type, "strike": strike, "expiry_date": exp_date}
+
+    return None
+
+
+def calculate_greeks_for_symbol(symbol: str, spot_price: float, vix_pct: float = 15.0) -> Dict[str, Optional[float]]:
+    """Helper to calculate Option Greeks directly from a tradingsymbol."""
+    parsed = parse_nfo_symbol(symbol)
+    if not parsed:
+        return {"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None}
+
+    return calculate_greeks(
+        spot_price=spot_price,
+        strike_price=parsed["strike"],
+        expiry_date=parsed["expiry_date"],
+        option_type=parsed["option_type"],
+        vix_pct=vix_pct,
+    )
+
+
+def calculate_greeks(
+    spot_price: float,
+    strike_price: float,
+    expiry_date: str | datetime | date,
+    option_type: str,
+    vix_pct: float = 15.0,
+    risk_free_rate: float = 0.07,
+) -> Dict[str, Optional[float]]:
+    """Calculate Black-Scholes Option Greeks.
+
+    Args:
+        spot_price: Current spot price of underlying index/stock (e.g. 24500.0)
+        strike_price: Strike price of option (e.g. 24500.0)
+        expiry_date: Expiry date string (YYYY-MM-DD), date, or datetime object
+        option_type: 'CE' / 'CALL' or 'PE' / 'PUT'
+        vix_pct: Volatility percentage (e.g. 15.2 for 15.2% India VIX)
+        risk_free_rate: Annual risk-free interest rate (default 7% = 0.07)
+
+    Returns:
+        Dict containing delta, gamma, theta, vega, and iv.
+    """
+    if spot_price <= 0 or strike_price <= 0:
+        return {"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None}
+
+    # Calculate time to expiry in years
+    if isinstance(expiry_date, str):
+        try:
+            exp_dt = datetime.strptime(expiry_date, "%Y-%m-%d")
+        except ValueError:
+            exp_dt = datetime.now() + timedelta(days=7)
+    elif isinstance(expiry_date, date) and not isinstance(expiry_date, datetime):
+        exp_dt = datetime.combine(expiry_date, datetime.min.time())
+    else:
+        exp_dt = expiry_date
+
+    now = datetime.now()
+    days_to_exp = max((exp_dt - now).total_seconds() / 86400.0, 0.25)
+    T = days_to_exp / 365.0
+    sigma = max(vix_pct / 100.0, 0.01)
+
+    # Black-Scholes d1 and d2 calculations
+    d1 = (math.log(spot_price / strike_price) + (risk_free_rate + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+
+    opt_type_upper = option_type.upper()
+    is_call = "CE" in opt_type_upper or "CALL" in opt_type_upper
+
+    # 1. Delta
+    if is_call:
+        delta = _norm_cdf(d1)
+    else:
+        delta = _norm_cdf(d1) - 1.0
+
+    # 2. Gamma
+    gamma = _norm_pdf(d1) / (spot_price * sigma * math.sqrt(T))
+
+    # 3. Theta (daily decay)
+    term1 = -(spot_price * _norm_pdf(d1) * sigma) / (2.0 * math.sqrt(T))
+    if is_call:
+        term2 = -risk_free_rate * strike_price * math.exp(-risk_free_rate * T) * _norm_cdf(d2)
+    else:
+        term2 = risk_free_rate * strike_price * math.exp(-risk_free_rate * T) * _norm_cdf(-d2)
+    theta = (term1 + term2) / 365.0
+
+    # 4. Vega (per 1% change in volatility)
+    vega = (spot_price * math.sqrt(T) * _norm_pdf(d1)) / 100.0
+
+    return {
+        "delta": round(delta, 4),
+        "gamma": round(gamma, 6),
+        "theta": round(theta, 2),
+        "vega": round(vega, 2),
+        "iv": round(vix_pct, 2),
+    }

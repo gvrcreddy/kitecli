@@ -77,6 +77,33 @@ class DataRecorder:
             "index_values": index_values,
         })
 
+    def enqueue_executed_order_context(
+        self,
+        user_id: str,
+        order_data: dict[str, Any],
+        margins: dict[str, Any],
+        greeks: dict[str, Any],
+        indicators: dict[str, Any],
+        index_values: dict[str, Any],
+        positions: list[dict[str, Any]] | None = None,
+        account_name: str | None = None,
+        charges: dict[str, Any] | None = None,
+    ) -> None:
+        """Enqueue an executed order with market context (Greeks, Margins, Indicators, Positions, Charges)."""
+        self._queue.put({
+            "type": "executed_order_context",
+            "timestamp": datetime.now().isoformat(),
+            "user_id": user_id,
+            "account_name": account_name,
+            "order_data": order_data,
+            "margins": margins,
+            "greeks": greeks,
+            "indicators": indicators,
+            "index_values": index_values,
+            "positions": positions or [],
+            "charges": charges or {},
+        })
+
     def enqueue_command(
         self,
         command_text: str,
@@ -162,6 +189,110 @@ class DataRecorder:
                 vix REAL
             );
         """)
+
+        # Create executed order context table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS executed_order_context (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                account_name TEXT,
+                order_id TEXT NOT NULL,
+                tradingsymbol TEXT NOT NULL,
+                exchange TEXT,
+                transaction_type TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price REAL NOT NULL,
+                status TEXT NOT NULL,
+
+                -- Option Greeks
+                delta REAL,
+                gamma REAL,
+                theta REAL,
+                vega REAL,
+                iv REAL,
+
+                -- Account Margins
+                available_net_margin REAL,
+                available_cash REAL,
+
+                -- Technical & Market Context
+                nifty_spot REAL,
+                nifty_vix REAL,
+                nifty_ema_9 REAL,
+                nifty_sma_20 REAL,
+                nifty_sma_50 REAL,
+                nifty_sma_200 REAL,
+                nifty_rsi_14 REAL,
+
+                -- ML Indicators (MACD, Bollinger Bands, Distances, Returns)
+                nifty_macd_line REAL,
+                nifty_macd_signal REAL,
+                nifty_macd_hist REAL,
+                nifty_bb_upper REAL,
+                nifty_bb_lower REAL,
+                nifty_bb_pct_b REAL,
+                nifty_bb_width REAL,
+                nifty_dist_sma_20_pct REAL,
+                nifty_dist_sma_50_pct REAL,
+                nifty_dist_sma_200_pct REAL,
+                nifty_ret_1d_pct REAL,
+                nifty_ret_5d_pct REAL,
+                nifty_ret_20d_pct REAL,
+
+                -- Open Positions Context at Execution Time
+                positions_snapshot TEXT,
+                open_positions_count INTEGER,
+                total_unrealised_pnl REAL,
+                total_realised_pnl REAL,
+                grand_total_pnl REAL,
+
+                -- Order Statutory Charges & Taxes
+                total_charges REAL,
+                brokerage REAL,
+                stt REAL,
+                gst REAL
+            );
+        """)
+
+        # Ensure schema migrations for executed_order_context if table pre-existed with fewer columns
+        try:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(executed_order_context);")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if existing_cols:
+                required_cols = {
+                    "account_name": "TEXT",
+                    "nifty_sma_200": "REAL",
+                    "nifty_macd_line": "REAL",
+                    "nifty_macd_signal": "REAL",
+                    "nifty_macd_hist": "REAL",
+                    "nifty_bb_upper": "REAL",
+                    "nifty_bb_lower": "REAL",
+                    "nifty_bb_pct_b": "REAL",
+                    "nifty_bb_width": "REAL",
+                    "nifty_dist_sma_20_pct": "REAL",
+                    "nifty_dist_sma_50_pct": "REAL",
+                    "nifty_dist_sma_200_pct": "REAL",
+                    "nifty_ret_1d_pct": "REAL",
+                    "nifty_ret_5d_pct": "REAL",
+                    "nifty_ret_20d_pct": "REAL",
+                    "positions_snapshot": "TEXT",
+                    "open_positions_count": "INTEGER",
+                    "total_unrealised_pnl": "REAL",
+                    "total_realised_pnl": "REAL",
+                    "grand_total_pnl": "REAL",
+                    "total_charges": "REAL",
+                    "brokerage": "REAL",
+                    "stt": "REAL",
+                    "gst": "REAL",
+                }
+                for col_name, col_type in required_cols.items():
+                    if col_name not in existing_cols:
+                        conn.execute(f"ALTER TABLE executed_order_context ADD COLUMN {col_name} {col_type};")
+        except Exception as exc:
+            logger.warning("Schema migration for executed_order_context skipped: %s", exc)
+
         conn.commit()
 
     def _worker_loop(self) -> None:
@@ -299,23 +430,88 @@ class DataRecorder:
                         ),
                     )
 
-            elif item_type == "command":
+            elif item_type == "executed_order_context":
+                o = item.get("order_data", {})
+                m = item.get("margins", {})
+                g = item.get("greeks", {})
+                ind = item.get("indicators", {})
+                pos_list = item.get("positions", [])
+                pos_json = json.dumps(pos_list) if pos_list else None
+                open_cnt = len([p for p in pos_list if p.get("quantity", 0) != 0])
+                total_unrealised = sum(float(p.get("unrealised", 0.0)) for p in pos_list if p.get("quantity", 0) != 0)
+                total_realised = sum(float(p.get("realised", 0.0)) for p in pos_list)
+                grand_total = total_realised + total_unrealised
+
+                account_name = item.get("account_name")
+
+                chg = item.get("charges", {})
+                oid_str = str(o.get("order_id", "")).strip()
+                if oid_str:
+                    cursor.execute("DELETE FROM executed_order_context WHERE order_id = ?;", (oid_str,))
+
                 cursor.execute(
                     """
-                    INSERT INTO user_commands (
-                        timestamp, user_id, command_text, parsed_action, status, result_message, nifty, sensex, vix
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO executed_order_context (
+                        timestamp, user_id, account_name, order_id, tradingsymbol, exchange,
+                        transaction_type, quantity, price, status,
+                        delta, gamma, theta, vega, iv,
+                        available_net_margin, available_cash,
+                        nifty_spot, nifty_vix, nifty_ema_9, nifty_sma_20, nifty_sma_50, nifty_sma_200, nifty_rsi_14,
+                        nifty_macd_line, nifty_macd_signal, nifty_macd_hist,
+                        nifty_bb_upper, nifty_bb_lower, nifty_bb_pct_b, nifty_bb_width,
+                        nifty_dist_sma_20_pct, nifty_dist_sma_50_pct, nifty_dist_sma_200_pct,
+                        nifty_ret_1d_pct, nifty_ret_5d_pct, nifty_ret_20d_pct,
+                        positions_snapshot, open_positions_count, total_unrealised_pnl, total_realised_pnl, grand_total_pnl,
+                        total_charges, brokerage, stt, gst
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ts,
                         user_id,
-                        item.get("command_text", ""),
-                        item.get("parsed_action", ""),
-                        item.get("status", ""),
-                        item.get("result_message"),
+                        account_name,
+                        str(o.get("order_id", "")),
+                        o.get("tradingsymbol", ""),
+                        o.get("exchange", ""),
+                        o.get("transaction_type", ""),
+                        int(o.get("quantity", 0)),
+                        float(o.get("average_price") or o.get("price") or 0.0),
+                        o.get("status", "COMPLETE"),
+                        g.get("delta"),
+                        g.get("gamma"),
+                        g.get("theta"),
+                        g.get("vega"),
+                        g.get("iv"),
+                        m.get("margin_net"),
+                        m.get("margin_cash"),
                         nifty,
-                        sensex,
                         vix,
+                        ind.get("nifty_ema_9"),
+                        ind.get("nifty_sma_20"),
+                        ind.get("nifty_sma_50"),
+                        ind.get("nifty_sma_200"),
+                        ind.get("nifty_rsi_14"),
+                        ind.get("nifty_macd_line"),
+                        ind.get("nifty_macd_signal"),
+                        ind.get("nifty_macd_hist"),
+                        ind.get("nifty_bb_upper"),
+                        ind.get("nifty_bb_lower"),
+                        ind.get("nifty_bb_pct_b"),
+                        ind.get("nifty_bb_width"),
+                        ind.get("nifty_dist_sma_20_pct"),
+                        ind.get("nifty_dist_sma_50_pct"),
+                        ind.get("nifty_dist_sma_200_pct"),
+                        ind.get("nifty_ret_1d_pct"),
+                        ind.get("nifty_ret_5d_pct"),
+                        ind.get("nifty_ret_20d_pct"),
+                        pos_json,
+                        open_cnt,
+                        total_unrealised,
+                        total_realised,
+                        grand_total,
+                        chg.get("total_charges"),
+                        chg.get("brokerage"),
+                        chg.get("stt"),
+                        chg.get("gst"),
                     ),
                 )
         conn.commit()

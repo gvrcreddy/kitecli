@@ -128,7 +128,7 @@ def parse_command_line(raw_text: str) -> list[Any]:
             commands.append(ExitCommand(target=target, price=price))
 
         # 4. Status
-        elif primary == "status":
+        elif primary in ("status", "st", "health"):
             commands.append(StatusCommand())
 
         # 5. Positions / Pos

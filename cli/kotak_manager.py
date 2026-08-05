@@ -1026,7 +1026,7 @@ class KotakTicker:
     def _on_close(self, message: Any = None) -> None:
         logger.info("Kotak Neo WebSocket closed: %s", message or "Session closed")
         msg_str = str(message or "").lower()
-        is_auth_error = any(x in msg_str for x in ["session has been closed", "unauthorized", "invalid token"])
+        is_auth_error = any(x in msg_str for x in ["unauthorized", "invalid token", "token expired", "100008"])
         
         if is_auth_error:
             logger.error("Kotak Neo WebSocket closed due to session expiry/auth failure: %s (mapped code=403)", message)
@@ -1042,7 +1042,8 @@ class KotakTicker:
 
     def _on_error(self, error: Any) -> None:
         error_str = str(error).lower()
-        code = 403 if ("unauthorized" in error_str or "auth" in error_str or "session" in error_str or "token" in error_str) else 0
+        is_auth = any(x in error_str for x in ["unauthorized", "invalid token", "token expired", "100008"]) and not ("session has been closed" in error_str or "session closed" in error_str)
+        code = 403 if is_auth else 0
         logger.error("Kotak Neo WebSocket error: %s (mapped code=%s)", error, code)
         if self.on_error:
             self.on_error(self, code, str(error))

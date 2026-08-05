@@ -247,6 +247,19 @@ async def execute_command(cmd: Any, context: ExecutionContext) -> dict:
             "message": "\n".join(output_lines)
         }
 
+    # 5.5 Status Command
+    elif isinstance(cmd, StatusCommand):
+        res = context.client.get_status()
+        output_lines = ["🔌 Account Connection & Health Status:"]
+        for acct in res.get("accounts", []):
+            auth_icon = "🟢 Active" if acct.get("authenticated") else "🔴 Inactive"
+            broker_name = acct.get("broker", "Zerodha").title()
+            output_lines.append(f"  • {acct.get('name', 'Account')} ({broker_name}): {auth_icon}")
+        return {
+            "status": "executed",
+            "message": "\n".join(output_lines)
+        }
+
     # 6. Orders Command
     elif isinstance(cmd, OrdersCommand):
         api_keys = [context.selected_account_key] if context.selected_account_key != "ALL" else None

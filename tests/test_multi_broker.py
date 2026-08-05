@@ -142,6 +142,50 @@ class TestKiteGetPositions(unittest.TestCase):
         self.assertEqual(m_info["status"], "success")
         self.assertEqual(m_info["total"], 457.5)
 
+    def test_option_greeks_calculation(self):
+        from cli.greeks import calculate_greeks
+        g = calculate_greeks(
+            spot_price=24500.0,
+            strike_price=24500.0,
+            expiry_date="2026-07-30",
+            option_type="CE",
+            vix_pct=15.0,
+        )
+        self.assertIsNotNone(g["delta"])
+        self.assertGreater(g["delta"], 0.4)
+        self.assertLess(g["delta"], 0.6)
+        self.assertIsNotNone(g["gamma"])
+        self.assertIsNotNone(g["vega"])
+
+    def test_indicator_calculation(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from cli.indicators import calculate_daily_indicators
+
+        with tempfile.NamedTemporaryFile(suffix=".json") as tmp:
+            with patch("cli.indicators.CACHE_PATH", Path(tmp.name)):
+                mock_client = MagicMock()
+                mock_client._api_keys = ["k1"]
+                mock_mgr = MagicMock()
+                mock_kite = MagicMock()
+                mock_kite.historical_data.return_value = [
+                    {"close": 24000.0 + i} for i in range(200)
+                ]
+                mock_mgr._clients = {"k1": mock_kite}
+                mock_client._account_manager_map = {"k1": mock_mgr}
+
+                ind = calculate_daily_indicators(mock_client, 24500.0)
+                self.assertIsNotNone(ind["nifty_ema_9"])
+                self.assertIsNotNone(ind["nifty_sma_20"])
+                self.assertIsNotNone(ind["nifty_sma_50"])
+                self.assertIsNotNone(ind["nifty_sma_200"])
+        self.assertIsNotNone(ind["nifty_rsi_14"])
+        self.assertIsNotNone(ind["nifty_macd_line"])
+        self.assertIsNotNone(ind["nifty_bb_pct_b"])
+        self.assertIsNotNone(ind["nifty_dist_sma_200_pct"])
+        self.assertIsNotNone(ind["nifty_ret_1d_pct"])
+
 
 # ── KotakAccountManager tests ─────────────────────────────────────────────────
 

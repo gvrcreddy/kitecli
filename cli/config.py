@@ -21,6 +21,7 @@ sessions_lock = threading.RLock()
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
+    "record_executed_order_context": False,
     "accounts": [
         {
             # --- Zerodha account (default) ---

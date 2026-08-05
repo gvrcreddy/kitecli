@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, time
 import logging
 from urllib.parse import urlparse
 import threading
@@ -7,7 +7,7 @@ import threading
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
-from prompt_toolkit.formatted_text import ANSI, HTML
+from prompt_toolkit.formatted_text import ANSI, HTML, to_formatted_text
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout.containers import DynamicContainer, HSplit, VSplit, Window, WindowAlign
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
@@ -18,9 +18,9 @@ from prompt_toolkit.widgets import Frame, TextArea
 
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.history import InMemoryHistory, FileHistory
-from collections import UserDict
+from collections import UserDict, defaultdict
 from prompt_toolkit.widgets import SearchToolbar
-from prompt_toolkit.search import start_search, SearchDirection
+from prompt_toolkit.search import start_search, is_searching, do_incremental_search, SearchDirection
 from prompt_toolkit.filters import has_focus
 from prompt_toolkit.data_structures import Point
 
@@ -35,6 +35,23 @@ from cli.executor import ExecutionContext, resolve_symbol_or_id
 import json
 
 logger = logging.getLogger(__name__)
+
+import re
+_ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*m')
+
+def _visible_len(text: str) -> int:
+    return len(_ANSI_REGEX.sub('', text))
+
+def _pad_ansi(text: str, width: int, align: str = '<') -> str:
+    v_len = _visible_len(text)
+    pad_needed = max(0, width - v_len)
+    if align == '>':
+        return ' ' * pad_needed + text
+    elif align == '^':
+        left = pad_needed // 2
+        right = pad_needed - left
+        return ' ' * left + text + ' ' * right
+    return text + ' ' * pad_needed
 
 
 def _silence_websocket_loggers() -> None:
@@ -358,24 +375,44 @@ class KCLILiveSession:
         self.pending_order = None
         self.selected_order = None
 
-        # Build account api_key -> user_id mapping
-        self.api_key_to_user_id = {
-            a.get("api_key"): a.get("user_id", "UNKNOWN")
-            for a in accounts
-            if a.get("api_key")
-        }
+        # Build account api_key -> user_id mapping (supporting Zerodha & Kotak)
+        self.api_key_to_user_id = {}
+        for a in accounts:
+            key = a.get("api_key") or a.get("consumer_key")
+            uid = a.get("user_id") or a.get("ucc") or a.get("name") or "UNKNOWN"
+            if key:
+                self.api_key_to_user_id[key] = uid
+
+        # Track recorded executed order IDs to avoid duplicate DB insertions
+        self._executed_order_ids_recorded: set[str] = set()
+        self._orders_seeded_on_startup: bool = False
 
         # Initialize and start SQLite recorder
         self.recorder = DataRecorder()
         self.recorder.start()
+        self.record_context_enabled = True
+        try:
+            import sqlite3
+            if self.recorder.db_path.exists():
+                conn = sqlite3.connect(str(self.recorder.db_path))
+                cursor = conn.cursor()
+                cursor.execute("SELECT DISTINCT order_id FROM executed_order_context WHERE order_id IS NOT NULL;")
+                for row in cursor.fetchall():
+                    if row[0]:
+                        self._executed_order_ids_recorded.add(str(row[0]))
+                conn.close()
+        except Exception as exc:
+            logger.warning("Failed to load existing executed_order_context IDs: %s", exc)
 
         # Info pane state
-        # mode: "orders_pending" | "orders_executed" | "oc" | "advisor"
+        # mode: "orders_pending" | "orders_executed" | "oc" | "advisor" | "pnl" | "help"
         self.info_mode: str = "orders_pending"
+        self.pnl_period: str = "month"  # "week" | "month" | "year"
         self._last_oc_text: str = "Press F3 or run 'oc <UNDERLYING>' to fetch option chain."
         self._last_pending_text: str = "Fetching pending orders..."
         self._last_executed_text: str = "Fetching executed orders..."
         self._last_advisor_text: str = "Press F4 to view Tuesday Option Strangle Advisor plan."
+        self._last_pnl_text: str = "Fetching P&L analytics..."
         self._advisor_alerted_today: str | None = None
         self._last_advisor_time_check: float = 0.0
 
@@ -929,7 +966,7 @@ class KCLILiveSession:
                 pass
 
         if total_cols >= 120:
-            left_str = f" 🪁 KiteCLI Live │ Last Update: {now} │ Accounts: {total} │ Ctrl+C: Quit │ Escape: Deselect"
+            left_str = f" 🪁 KiteCLI Live │ Last Update: {now} │ Accounts: {total} │ Ctrl+Q: Quit │ Ctrl+C: Cancel │ Escape: Deselect"
         elif total_cols >= 95:
             left_str = f" 🪁 KiteCLI Live │ {now} │ Accounts: {total}"
         else:
@@ -957,15 +994,28 @@ class KCLILiveSession:
 
         if good_count == total:
             status_style = "fg:#00ff00 bold"
-            status_label = "● Health: Good "
-        elif good_count > 0:
-            status_style = "fg:#ff8700 bold"
-            status_label = f"● Health: Partial ({good_count}/{total}) "
-        else:
-            status_style = "fg:#ff0000 bold"
-            status_label = f"● Health: Critical ({good_count}/{total}) "
+            status_label = f"● Health: Good ({total}/{total}) "
+            return [(status_style, status_label, _header_click_handler)]
 
-        return [(status_style, status_label, _header_click_handler)]
+        fragments = []
+        status_style = "fg:#ff8700 bold" if good_count > 0 else "fg:#ff0000 bold"
+        fragments.append((status_style, f"● Health: ({good_count}/{total}) [", _header_click_handler))
+
+        for i, acct in enumerate(self.accounts):
+            key = acct.get("api_key")
+            name = acct.get("name", key)
+            healthy = self.is_account_healthy(key)
+
+            if healthy:
+                fragments.append(("fg:#00ff00", f"{name}:✓", _header_click_handler))
+            else:
+                fragments.append(("fg:#ff0000 bold", f"{name}:✗", _header_click_handler))
+
+            if i < total - 1:
+                fragments.append(("", " ", _header_click_handler))
+
+        fragments.append((status_style, "] ", _header_click_handler))
+        return fragments
 
     def _get_tab_bar_text(self):
         """Build clickable, styled text fragments for the info pane tabs."""
@@ -990,10 +1040,10 @@ class KCLILiveSession:
         # Tiny spacing for visual margin
         fragments.append(("", " "))
         
-        # Tab 1: Pending
+        # Tab 1: Orders
         fragments.append((
             "class:tab.active" if self.info_mode == "orders_pending" else "class:tab.inactive",
-            " Pending ",
+            " Orders ",
             make_click_handler("orders_pending")
         ))
         fragments.append(("", " "))
@@ -1022,7 +1072,15 @@ class KCLILiveSession:
         ))
         fragments.append(("", " "))
 
-        # Tab 5: Help
+        # Tab 5: P&L
+        fragments.append((
+            "class:tab.active" if self.info_mode == "pnl" else "class:tab.inactive",
+            " P&L ",
+            make_click_handler("pnl")
+        ))
+        fragments.append(("", " "))
+
+        # Tab 6: Help
         fragments.append((
             "class:tab.active" if self.info_mode == "help" else "class:tab.inactive",
             " Help ",
@@ -1381,6 +1439,7 @@ class KCLILiveSession:
             if hasattr(self, "recorder"):
                 user_id = self.api_key_to_user_id.get(api_key, "UNKNOWN")
                 self.recorder.enqueue_order(data, self.index_values, user_id)
+                self._handle_executed_order_context(api_key, data)
 
             # Trigger immediate refresh of positions and orders
             if hasattr(self, "app") and self.app and self.app.loop:
@@ -1774,14 +1833,6 @@ class KCLILiveSession:
 
                     self._update_subscriptions(new_tokens)
 
-                    # Record position snapshots to database
-                    if hasattr(self, "recorder"):
-                        for acct in response.get("accounts", []):
-                            api_key = acct.get("api_key", "")
-                            user_id = self.api_key_to_user_id.get(api_key, "UNKNOWN")
-                            positions = acct.get("positions", [])
-                            self.recorder.enqueue_positions(positions, self.index_values, user_id)
-
                 # 3. Process orders response
                 if isinstance(orders_resp, BaseException):
                     errors_this_cycle += 1
@@ -1818,6 +1869,14 @@ class KCLILiveSession:
                     self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
                     if self.info_mode in ("orders_pending", "orders_executed"):
                         self._update_info_buffer(reset_scroll=False)
+
+                    # Trigger context recording for completed orders returned via REST (e.g. Kotak / Zerodha)
+                    if hasattr(self, "recorder") and self.recorder:
+                        for acct in orders_resp.get("accounts", []):
+                            key = acct.get("api_key", "")
+                            for ord_item in acct.get("orders", []):
+                                if str(ord_item.get("status", "")).upper() == "COMPLETE":
+                                    self._handle_executed_order_context(key, ord_item)
 
                 # Indices REST snapshot (WebSocket ticks keep these live thereafter).
                 try:
@@ -2180,6 +2239,97 @@ class KCLILiveSession:
             return " [" + " │ ".join(summary_parts) + "]"
         return ""
 
+    def _handle_executed_order_context(self, api_key: str, data: dict) -> None:
+        """Record enriched context when an order executes successfully (`COMPLETE`)."""
+        if not getattr(self, "record_context_enabled", False):
+            return
+
+        status = str(data.get("status", "")).upper()
+        filled_qty = int(data.get("filled_quantity") or data.get("quantity") or 0)
+        if status != "COMPLETE" and filled_qty == 0:
+            return
+
+        order_id = str(data.get("order_id", "")).strip()
+        if not order_id:
+            import time as _t
+            order_id = f"LIVE_{api_key}_{data.get('tradingsymbol')}_{_t.time_ns()}"
+
+        recorded_dict = getattr(self, "_executed_order_ids_recorded_dict", {})
+        last_recorded_qty = recorded_dict.get(order_id, 0)
+        if filled_qty <= last_recorded_qty and order_id in recorded_dict:
+            return
+        recorded_dict[order_id] = filled_qty
+        self._executed_order_ids_recorded_dict = recorded_dict
+        executed_set = getattr(self, "_executed_order_ids_recorded", set())
+        executed_set.add(order_id)
+        self._executed_order_ids_recorded = executed_set
+
+        # Use filled_quantity as effective order quantity for DB and charges calculation
+        data_copy = dict(data)
+        data_copy["quantity"] = filled_qty
+
+        user_id = self.api_key_to_user_id.get(api_key, "UNKNOWN")
+        account_name = self._get_account_name(api_key)
+        m_dict = getattr(self, "margins_by_api_key", {}).get(api_key, {})
+        margin_net = m_dict.get("net")
+        margin_cash = m_dict.get("cash")
+        margins = {"margin_net": margin_net, "margin_cash": margin_cash}
+
+        # Calculate Option Greeks if option contract
+        symbol = data_copy.get("tradingsymbol", "")
+        greeks = {"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None}
+        if any(x in symbol for x in ["CE", "PE", "CALL", "PUT"]):
+            try:
+                from cli.greeks import calculate_greeks_for_symbol
+                spot = self.index_values.get("nifty") or 24500.0
+                vix = self.index_values.get("vix") or 15.0
+                greeks = calculate_greeks_for_symbol(symbol=symbol, spot_price=spot, vix_pct=vix)
+            except Exception as exc:
+                logger.warning("Greeks calculation skipped for %s: %s", symbol, exc)
+
+        # Get Daily Indicators (1st order of day lazy fetch + cached math)
+        indicators = {"nifty_ema_9": None, "nifty_sma_20": None, "nifty_sma_50": None, "nifty_rsi_14": None}
+        try:
+            from cli.indicators import calculate_daily_indicators
+            spot = self.index_values.get("nifty") or 0.0
+            if spot > 0:
+                indicators = calculate_daily_indicators(self.client, spot)
+        except Exception as exc:
+            logger.warning("Daily indicators calculation failed for %s: %s", symbol, exc)
+
+        # Collect positions (includes both open and closed positions for realised P&L calculation)
+        all_positions = []
+        if isinstance(getattr(self, "last_positions_response", None), dict):
+            for acct in self.last_positions_response.get("accounts", []):
+                for p in acct.get("positions", []):
+                    all_positions.append(p)
+        if not all_positions:
+            all_positions = getattr(self, "active_positions", [])
+
+        # Calculate estimated order charges
+        from cli.charges import calculate_option_charges
+        o_price = float(data_copy.get("average_price") or data_copy.get("price") or 0.0)
+        o_qty = filled_qty
+        tt = str(data_copy.get("transaction_type", "")).upper()
+        exch = str(data_copy.get("exchange") or "NFO")
+        if tt in ["B", "BUY"]:
+            chg_dict = calculate_option_charges(o_price, 0.0, o_qty, 1, 0, exch)
+        else:
+            chg_dict = calculate_option_charges(0.0, o_price, o_qty, 0, 1, exch)
+
+        if hasattr(self, "recorder") and self.recorder:
+            self.recorder.enqueue_executed_order_context(
+                user_id=user_id,
+                order_data=data,
+                margins=margins,
+                greeks=greeks,
+                indicators=indicators,
+                index_values=self.index_values,
+                positions=all_positions,
+                account_name=account_name,
+                charges=chg_dict,
+            )
+
     def _resolve_qty(self, qty_arg: str, symbol: str | None) -> tuple[str, str, str | None]:
         """Resolve a quantity argument that may use the lot suffix (e.g. '2L').
 
@@ -2425,7 +2575,7 @@ class KCLILiveSession:
             self.log_message(f"[#ff0000]Cancel Execution Failed:[/#] {exc}")
 
     def _log_command(self, cmd_text: str, action: dict | str, status: str, result: str | None = None, api_key: str | None = None) -> None:
-        if not hasattr(self, "recorder"):
+        if not getattr(self, "recorder", None):
             return
         user_id = self.api_key_to_user_id.get(api_key) if api_key else None
         parsed_str = json.dumps(action) if isinstance(action, dict) else str(action)
@@ -2581,7 +2731,32 @@ class KCLILiveSession:
                 self.app.invalidate()
             self.log_message("Switched info pane to [bold]AI Advisor[/bold].")
             return
-        elif cmd_norm in ("help", "h", "5", "/5", "/help"):
+        elif cmd_norm in ("pnl", "pl", "5", "/5", "/pnl") or cmd_norm.startswith("pnl ") or cmd_norm.startswith("pl "):
+            self.info_mode = "pnl"
+            if "week" in cmd_norm or " w" in cmd_norm or cmd_norm == "pnl w":
+                self.pnl_period = "week"
+            elif "year" in cmd_norm or " y" in cmd_norm or cmd_norm == "pnl y":
+                self.pnl_period = "year"
+            elif "month" in cmd_norm or " m" in cmd_norm or cmd_norm == "pnl m":
+                self.pnl_period = "month"
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message(f"Switched info pane to [bold]P&L Analytics ({getattr(self, 'pnl_period', 'month').title()})[/bold].")
+            return
+        elif self.info_mode == "pnl" and cmd_norm in ("w", "m", "y", "week", "month", "year", "1", "2", "3"):
+            period_map = {
+                "w": "week", "week": "week", "1": "week",
+                "m": "month", "month": "month", "2": "month",
+                "y": "year", "year": "year", "3": "year"
+            }
+            self.pnl_period = period_map[cmd_norm]
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message(f"P&L period switched to [bold]{self.pnl_period.title()}[/bold].")
+            return
+        elif cmd_norm in ("help", "h", "6", "/6", "/help"):
             self.info_mode = "help"
             self._update_info_buffer()
             if hasattr(self, "app") and self.app:
@@ -2835,11 +3010,46 @@ class KCLILiveSession:
                         continue
                         
                     elif isinstance(parsed, StatusCommand):
-                        res = self.client.get_status()
-                        self.log_message("[#00afaf]🔌 Account Status:[/#]")
-                        for acct in res.get("accounts", []):
-                            icon = "[#00ff00]🟢 Active[/#]" if acct.get("authenticated") else "[#ff0000]🔴 Inactive[/#]"
-                            self.log_message(f"  {acct.get('name')}: {icon}")
+                        self.log_message("[#00afaf]🔌 Account Health & Connection Status:[/#]")
+                        w_acct = 10
+                        w_brk = 8
+                        w_ws = 11
+                        w_rest = 12
+                        w_diag = 28
+
+                        top_b = f"┌─{'─'*w_acct}─┬─{'─'*w_brk}─┬─{'─'*w_ws}─┬─{'─'*w_rest}─┬─{'─'*w_diag}─┐"
+                        head  = f"│ {'Account':<{w_acct}} │ {'Broker':<{w_brk}} │ {'WS Stream':<{w_ws}} │ {'REST Status':<{w_rest}} │ {'Diagnostics':<{w_diag}} │"
+                        mid_b = f"├─{'─'*w_acct}─┼─{'─'*w_brk}─┼─{'─'*w_ws}─┼─{'─'*w_rest}─┼─{'─'*w_diag}─┤"
+                        bot_b = f"└─{'─'*w_acct}─┴─{'─'*w_brk}─┴─{'─'*w_ws}─┴─{'─'*w_rest}─┴─{'─'*w_diag}─┘"
+
+                        self.log_message(top_b)
+                        self.log_message(head)
+                        self.log_message(mid_b)
+
+                        for acct in self.accounts:
+                            key = acct.get("api_key")
+                            name = acct.get("name", key)
+                            broker = acct.get("broker", "zerodha").title()
+
+                            ws_ok = self.websocket_connected.get(key, False)
+                            rest_failed = self.account_rest_failed.get(key, False)
+
+                            ws_str = "[#00ff00]🟢 Stream[/#]" if ws_ok else "[#ff0000]🔴 Closed[/#]"
+                            rest_str = "[#ff0000]🔴 Failed[/#]" if rest_failed else "[#00ff00]🟢 Healthy[/#]"
+
+                            access_token = self.client.get_access_token(key)
+                            if not access_token and broker.lower() == "zerodha":
+                                diag_str = "[#ff8700]No token (re-login)[/#]"
+                            elif not ws_ok and rest_failed:
+                                diag_str = "[#ff0000]Disconnected / Auth fail[/#]"
+                            elif not ws_ok:
+                                diag_str = "[#ff8700]WS reconnecting...[/#]"
+                            else:
+                                diag_str = "[#00ff00]Session active[/#]"
+
+                            self.log_message(f"│ {name:<{w_acct}} │ {broker:<{w_brk}} │ {ws_str} │ {rest_str} │ {diag_str} │")
+
+                        self.log_message(bot_b)
                         continue
                         
                     elif isinstance(parsed, PositionsCommand):
@@ -4066,24 +4276,26 @@ class KCLILiveSession:
 
 
     def _render_orders_pane(self, response: dict, mode: str) -> str:
-        """Render pending or executed orders from a /api/orders response into plain text."""
+        """Render pending or executed orders from a /api/orders response into tabular formatted text with status colors."""
         PENDING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED"}
         EXECUTED_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
-        filter_statuses = PENDING_STATUSES if mode == "orders_pending" else EXECUTED_STATUSES
-        label = "PENDING ORDERS" if mode == "orders_pending" else "EXECUTED ORDERS (TODAY)"
-
-        lines = [f"=== {label} ===", ""]
+        lines = []
         any_orders = False
 
         for acct in response.get("accounts", []):
             name = acct.get("name", "?")
-            orders = [
-                o for o in acct.get("orders", [])
-                if o.get("status", "").upper() in filter_statuses
-            ]
+            acct_orders = acct.get("orders", [])
+
+            if mode == "orders_pending":
+                # Main Orders pane shows ALL open/pending orders + latest 4 executed/terminal orders
+                pending_orders = [o for o in acct_orders if o.get("status", "").upper() in PENDING_STATUSES]
+                executed_orders = [o for o in acct_orders if o.get("status", "").upper() in EXECUTED_STATUSES]
+                recent_executed = executed_orders[-4:]
+                orders = pending_orders + recent_executed
+            else:
+                orders = [o for o in acct_orders if o.get("status", "").upper() in EXECUTED_STATUSES]
 
             lines.append(f"Account: {name}")
-            lines.append("-" * 60)
 
             if acct.get("status", "").startswith("error"):
                 err_detail = acct["status"].split("error:")[-1].strip() if "error:" in acct["status"] else acct["status"]
@@ -4092,6 +4304,23 @@ class KCLILiveSession:
                 lines.append("  (no orders)")
             else:
                 any_orders = True
+                w_oid = 8
+                w_tx = 4
+                w_sym = max(18, max((len(str(o.get("tradingsymbol", ""))) for o in orders), default=18))
+                w_qty = max(9, max((len(f"{o.get('filled_quantity', 0)}/{o.get('quantity', 0)}") for o in orders), default=9))
+                w_price = 14
+                w_prod = 5
+                w_status = max(10, max((len(str(o.get("status", ""))) for o in orders), default=10))
+
+                top_border = f"┌─{'─'*w_oid}─┬─{'─'*w_tx}─┬─{'─'*w_sym}─┬─{'─'*w_qty}─┬─{'─'*w_price}─┬─{'─'*w_prod}─┬─{'─'*w_status}─┐"
+                header_row = f"│ {'Order ID':<{w_oid}} │ {'Tx':<{w_tx}} │ {'Symbol':<{w_sym}} │ {'Qty':<{w_qty}} │ {'Type & Price':<{w_price}} │ {'Prod':<{w_prod}} │ {'Status':<{w_status}} │"
+                mid_border = f"├─{'─'*w_oid}─┼─{'─'*w_tx}─┼─{'─'*w_sym}─┼─{'─'*w_qty}─┼─{'─'*w_price}─┼─{'─'*w_prod}─┼─{'─'*w_status}─┤"
+                bot_border = f"└─{'─'*w_oid}─┴─{'─'*w_tx}─┴─{'─'*w_sym}─┴─{'─'*w_qty}─┴─{'─'*w_price}─┴─{'─'*w_prod}─┴─{'─'*w_status}─┘"
+
+                lines.append(top_border)
+                lines.append(header_row)
+                lines.append(mid_border)
+
                 for o in orders:
                     sym = o.get("tradingsymbol", "?")
                     tx = o.get("transaction_type", "?")
@@ -4099,95 +4328,528 @@ class KCLILiveSession:
                     filled = o.get("filled_quantity", 0)
                     otype = o.get("order_type", "?")
                     product = o.get("product", "?")
-                    status = o.get("status", "?")
+                    status = str(o.get("status", "?"))
+                    status_upper = status.upper()
                     price = o.get("price", 0.0)
                     avg = o.get("average_price", 0.0)
-                    oid = o.get("order_id", "?")
+                    oid = str(o.get("order_id", "?"))[-6:]
 
-                    if mode == "orders_executed":
-                        price_desc = f"avg={avg:.2f}" if avg else "MARKET"
+                    if status_upper == "COMPLETE":
+                        price_desc = f"{otype} avg={avg:.2f}" if avg else f"{otype} MKT"
                     else:
-                        price_desc = f"@ {price:.2f}" if price else "MARKET"
+                        price_desc = f"{otype} @ {price:.2f}" if price else f"{otype} MKT"
 
-                    # Always show filled/total format (e.g. 0/910, 130/910, 910/910)
                     qty_desc = f"{filled}/{qty}"
                     status_desc = status
-                    status_msg = o.get("status_message")
-                    if status_msg and status_msg != "--":
-                        status_desc = f"{status} ({status_msg})"
+
+                    # Status Color Coding:
+                    # Open/Pending: Orange (\033[38;5;208m)
+                    # Complete: Green (\033[38;5;48m)
+                    # Rejected/Failed/Cancelled: Red (\033[38;5;196m)
+                    if status_upper in PENDING_STATUSES:
+                        color_start = "\033[38;5;208m"
+                    elif status_upper == "COMPLETE":
+                        color_start = "\033[38;5;48m"
+                    else:  # REJECTED, CANCELLED, FAILED, etc.
+                        color_start = "\033[38;5;196m"
+                    color_end = "\033[0m"
 
                     lines.append(
-                        f"  [{oid[-6:]}] {tx} {sym} | {qty_desc} | "
-                        f"{otype} {price_desc} | {product} | {status_desc}"
+                        f"│ {color_start}{oid:<{w_oid}}{color_end} │ "
+                        f"{color_start}{tx:<{w_tx}}{color_end} │ "
+                        f"{color_start}{sym:<{w_sym}}{color_end} │ "
+                        f"{color_start}{qty_desc:<{w_qty}}{color_end} │ "
+                        f"{color_start}{price_desc:<{w_price}}{color_end} │ "
+                        f"{color_start}{product:<{w_prod}}{color_end} │ "
+                        f"{color_start}{status_desc:<{w_status}}{color_end} │"
                     )
+                lines.append(bot_border)
             lines.append("")
 
         if not any_orders and mode == "orders_pending":
-            lines.append("No pending orders across all accounts.")
+            lines.append("No open or recent orders across all accounts.")
         return "\n".join(lines)
 
     def _build_help_text(self) -> str:
-        """Return formatted keyboard shortcuts & command cheat sheet."""
-        return """=== KiteCLI Keyboard & Command Cheat Sheet ===
+        """Return formatted keyboard shortcuts & command cheat sheet in clean tabular layout."""
+        return """┌─────────────────────────────────────────────────────────────────────────────┐
+│                       KiteCLI COMMAND & HOTKEY CHEAT SHEET                  │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-1. TAB SWITCHING (RIGHT PANE)
-   Type at prompt:
-     p or pending or 1  -> Switch to Pending Orders tab
-     e or executed or 2 -> Switch to Executed Orders tab
-     oc or chain or 3   -> Switch to Option Chain tab
-     adv or advisor or 4-> Switch to AI Advisor tab
-     h or help or 5     -> Switch to this Help tab
+ 1. TAB SWITCHING (RIGHT PANE)
+┌───────────────────────┬───────────────────────┬─────────────────────────────┐
+│ Prompt Command        │ Keyboard Hotkey       │ Target Tab                  │
+├───────────────────────┼───────────────────────┼─────────────────────────────┤
+│ p  / pending  / 1     │ Ctrl + P  / F1        │ Pending Orders Pane         │
+│ e  / executed / 2     │ Ctrl + 2  / F2        │ Executed Orders Pane        │
+│ oc / chain    / 3     │ Ctrl + O  / F3        │ Option Chain Pane           │
+│ adv / advisor / 4     │ Ctrl + G  / F4        │ AI Expiry Advisor Pane      │
+│ pnl / pl      / 5     │ F5 / Esc+5            │ P&L Analytics (Week/Mo/Yr)  │
+│ h  / help     / 6     │ F6 / Esc+6            │ Help & Cheat Sheet Pane     │
+└───────────────────────┴───────────────────────┴─────────────────────────────┘
+  * Quick Navigation: Click directly on any tab title in the header bar.
+  * P&L Period Options: Type 'w' (Week), 'm' (Month), 'y' (Year) when P&L tab is active.
 
-   Universal Hotkeys:
-     Ctrl + P           -> Pending Orders
-     Ctrl + E           -> Executed Orders
-     Ctrl + O           -> Option Chain
-     Ctrl + G           -> AI Advisor
-     F5 / Esc+5         -> Help
+ 2. ORDER PLACEMENT & TRADING
+┌──────────────────────────────────┬──────────────────────────────────────────┐
+│ Command Syntax                   │ Description / Example                    │
+├──────────────────────────────────┼──────────────────────────────────────────┤
+│ b <symbol> <qty> [price]         │ Buy limit or market                      │
+│                                  │ e.g. b NIFTY26JUL22500PE 100 1.40        │
+│ s <symbol> <qty> [price]         │ Sell limit or market                     │
+│                                  │ e.g. s BANKNIFTY26JUL50000CE 15 2.50     │
+│ b <pos_id> <qty> [price]         │ Buy additional qty for position ID       │
+│                                  │ e.g. b 1 100                             │
+│ s <pos_id> [price]               │ Sell / Exit position by table ID         │
+│                                  │ e.g. s 2                                 │
+└──────────────────────────────────┴──────────────────────────────────────────┘
 
-   Function Keys / Alt:
-     F1 / F2 / F3 / F4 / F5
-     Option+1 / 2 / 3 / 4 / 5 (or Esc then 1..5)
-     Mouse Click: Click directly on any tab title in header bar
+ 3. ORDERS, POSITION EXITS, MODIFY & CANCEL
+┌──────────────────────────────────┬──────────────────────────────────────────┐
+│ Command Syntax                   │ Description / Example                    │
+├──────────────────────────────────┼──────────────────────────────────────────┤
+│ orders                           │ List / view open pending orders          │
+│                                  │ e.g. orders  (or ord)                    │
+│ exit <symbol|id> [price]         │ Exit position by symbol or index ID      │
+│                                  │ e.g. exit 1  /  exit NIFTY26JUL22200PE    │
+│ exit all                         │ Square off ALL active positions (Market) │
+│                                  │ e.g. exit all                            │
+│ order <id|sym> <price>           │ Modify open order price (or modify / m)  │
+│                                  │ e.g. order 12345 1.50  /  order 1 2.10    │
+│ order <id|sym> <qty> <price>     │ Modify open order quantity & price       │
+│                                  │ e.g. order 12345 50 1.50                 │
+│ cancel <order_id|symbol|all>     │ Cancel order(s) by ID, symbol or all     │
+│                                  │ e.g. cancel 12345  /  cancel all (or c)  │
+└──────────────────────────────────┴──────────────────────────────────────────┘
 
-2. ORDER PLACEMENT & TRADING COMMANDS
-   Buy / Sell Orders:
-     b <symbol> <qty> [price]     -> Buy limit/market (e.g. b NIFTY26JUL22500PE 100 1.40)
-     s <symbol> <qty> [price]     -> Sell limit/market (e.g. s BANKNIFTY26JUL50000CE 15@2.50)
-     b 1 100                       -> Buy 100 qty of active position #1
-     s 2                           -> Sell/exit all qty of active position #2
+ 4. ACCOUNT & SELECTION CONTROL
+┌──────────────────────────────────┬──────────────────────────────────────────┐
+│ Command Syntax / Action          │ Description / Example                    │
+├──────────────────────────────────┼──────────────────────────────────────────┤
+│ account <name|all>               │ Switch / filter by account name or all   │
+│                                  │ e.g. account Account1 (or acct / a)      │
+│ Click Row                        │ Select / target specific position/account│
+│ Esc                              │ Clear active selection / reset filter    │
+└──────────────────────────────────┴──────────────────────────────────────────┘
 
-   Exiting Positions:
-     exit <symbol|id> [price]     -> Exit position by symbol or table ID (e.g. exit 1, exit 2 1.50)
-     exit all [price]              -> Exit all active positions (e.g. exit all)
-
-   Modifying & Cancelling:
-     modify <order_id> [qty] [price] -> Modify open order
-     cancel <order_id>               -> Cancel pending order
-     cancel all                      -> Cancel all open/pending orders
-
-3. SELECTION & SELECTION CLEARING
-   Selection:
-     Click on symbol/account row   -> Target specific position/account
-     Esc                             -> Clear active selection / reset account filter
-
-4. GLOBAL NAVIGATION & CONTROL
-   Tab           -> Cycle focus (Input box -> Positions -> Right Pane)
-   Ctrl + R      -> Search command history
-   Ctrl + Left   -> Narrow left pane split width
-   Ctrl + Right  -> Widen left pane split width
-   Ctrl + C      -> Exit KiteCLI
+ 5. GLOBAL NAVIGATION & CONTROL
+┌───────────────────────┬─────────────────────────────────────────────────────┐
+│ Key / Action          │ Description / Function                              │
+├───────────────────────┼─────────────────────────────────────────────────────┤
+│ Tab                   │ Cycle focus: Input box ➔ Positions ➔ Right Pane      │
+│ Ctrl + R              │ Interactive command history search (press repeatedly)│
+│ Ctrl + Left / Right   │ Adjust left / right split pane width                │
+│ Ctrl + C              │ Cancel current command line / clear selection       │
+│ Ctrl + Q              │ Quit KiteCLI                                        │
+└───────────────────────┴─────────────────────────────────────────────────────┘
 """
 
+    def _get_pnl_date_range(self, period: str) -> tuple[datetime, datetime, str]:
+        """Compute the start date, end date, and human-readable label for a P&L period.
+        
+        Periods:
+        - "week": From most recent Wednesday 00:00:00 to now.
+        - "month": From day after last month's last Tuesday (Wednesday) 00:00:00 to now.
+        - "year": From current financial year April 1st 00:00:00 to now.
+        """
+        now = datetime.now()
+        
+        if period == "week":
+            d = now.weekday()
+            days_ago = d - 2 if d >= 2 else d + 5
+            start_dt = (now - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
+            label = f"Week (Wed {start_dt.strftime('%b %d')} -> Now)"
+            
+        elif period == "month":
+            first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            last_day_prev_month = first_of_this_month - timedelta(days=1)
+            offset = (last_day_prev_month.weekday() - 1) % 7
+            last_tue_prev_month = last_day_prev_month - timedelta(days=offset)
+            start_dt = (last_tue_prev_month + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            label = f"Month (Wed {start_dt.strftime('%b %d')} -> Now)"
+            
+        else:  # "year" (Financial Year starting April 1st)
+            fy_year = now.year if now.month >= 4 else now.year - 1
+            start_dt = datetime(fy_year, 4, 1, 0, 0, 0)
+            label = f"FY Year (Apr 01, {fy_year} -> Now)"
+            
+        return start_dt, now, label
+
+    def _render_pnl_pane(self) -> str:
+        """Render the P&L Analytics tab with Grand Total and Account-wise breakdown."""
+        period = getattr(self, "pnl_period", "month")
+        start_dt, now_dt, period_label = self._get_pnl_date_range(period)
+        start_iso = start_dt.isoformat()
+
+        # Build period selector buttons header line
+        def _fmt_btn(p_key, p_name):
+            if period == p_key:
+                return f"\033[30;46;1m [{p_name}] \033[0m"  # Cyan background for active period
+            return f"\033[36m [{p_name}] \033[0m"
+
+        btn_week = _fmt_btn("week", "1: Week")
+        btn_month = _fmt_btn("month", "2: Month")
+        btn_year = _fmt_btn("year", "3: Year")
+
+        header_selector = f"Period:  {btn_week}  │  {btn_month}  │  {btn_year}"
+
+        # Collect completed orders from BOTH SQLite database (~/.kcli/data.db) and live broker response
+        executed_orders_map = {}
+
+        try:
+            import sqlite3
+            db_path = getattr(self, "recorder", None).db_path if getattr(self, "recorder", None) else None
+            if not db_path:
+                from pathlib import Path
+                db_path = Path.home() / ".kcli" / "data.db"
+            if db_path.exists():
+                conn = sqlite3.connect(str(db_path))
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT timestamp, account_name, user_id, tradingsymbol, transaction_type, quantity, price, order_id, status
+                    FROM executed_order_context
+                    WHERE UPPER(status) = 'COMPLETE'
+                    ORDER BY id ASC;
+                    """
+                )
+                for row in cursor.fetchall():
+                    raw_oid = row[7]
+                    oid = str(raw_oid) if raw_oid and str(raw_oid).strip() != "" else f"DB_ROW_{row[0]}_{row[3]}"
+                    tt = str(row[4]).upper()
+                    if tt == "B": tt = "BUY"
+                    if tt == "S": tt = "SELL"
+                    executed_orders_map[oid] = {
+                        "timestamp": row[0],
+                        "account_name": row[1] or row[2] or "Default",
+                        "user_id": row[2] or "Default",
+                        "tradingsymbol": row[3],
+                        "transaction_type": tt,
+                        "quantity": int(row[5]),
+                        "price": float(row[6]),
+                        "order_id": oid,
+                        "status": str(row[8]),
+                    }
+                conn.close()
+        except Exception as exc:
+            logger.warning("Failed to query executed_order_context for P&L: %s", exc)
+
+        # Merge live executed orders from self.last_orders_response
+        last_orders = getattr(self, "last_orders_response", {})
+        if isinstance(last_orders, dict):
+            for acct in last_orders.get("accounts", []):
+                acct_name = acct.get("name") or acct.get("user_id") or "Default"
+                for o in acct.get("orders", []):
+                    if str(o.get("status", "")).upper() == "COMPLETE":
+                        oid = str(o.get("order_id", ""))
+                        raw_ts = o.get("order_timestamp") or o.get("exchange_timestamp") or ""
+                        ts_str = raw_ts.isoformat() if hasattr(raw_ts, "isoformat") else str(raw_ts)
+                        price_val = float(o.get("average_price") or o.get("price") or 0.0)
+                        tt = str(o.get("transaction_type", "")).upper()
+                        if tt == "B": tt = "BUY"
+                        if tt == "S": tt = "SELL"
+                        executed_orders_map[oid] = {
+                            "timestamp": ts_str,
+                            "account_name": acct_name,
+                            "user_id": acct.get("user_id") or acct_name,
+                            "tradingsymbol": o.get("tradingsymbol", ""),
+                            "transaction_type": tt,
+                            "quantity": int(o.get("quantity", 0)),
+                            "price": price_val,
+                            "order_id": oid,
+                            "status": "COMPLETE",
+                        }
+
+        executed_orders = list(executed_orders_map.values())
+
+        # Active positions
+        open_positions = getattr(self, "active_positions", [])
+
+        # Group executed orders & active positions by account
+        acct_orders_map = defaultdict(list)
+        for o in executed_orders:
+            acct_orders_map[o["account_name"]].append(o)
+
+        acct_pos_map = defaultdict(list)
+        for p in open_positions:
+            acct_name = p.get("account_name") or p.get("user_id") or "Default"
+            acct_pos_map[acct_name].append(p)
+
+        all_acct_names = sorted(list(set(list(acct_orders_map.keys()) + list(acct_pos_map.keys()))))
+        if not all_acct_names:
+            all_acct_names = ["Default"]
+
+        from datetime import time
+        from cli.greeks import parse_nfo_symbol
+
+        grand_realised = 0.0
+        grand_unrealised = 0.0
+        grand_closed_cnt = 0
+        grand_win_cnt = 0
+
+        acct_summaries = {}
+
+        def _to_iso_str(ts_val):
+            if hasattr(ts_val, "isoformat"):
+                return ts_val.isoformat()
+            return str(ts_val or "")
+
+        for acct in all_acct_names:
+            orders = acct_orders_map[acct]
+            positions = acct_pos_map[acct]
+
+            trades_by_symbol = defaultdict(list)
+            for o in orders:
+                trades_by_symbol[o["tradingsymbol"]].append(o)
+
+            from cli.charges import calculate_option_charges
+
+            realised_pnl = 0.0
+            total_acct_charges = 0.0
+            closed_cnt = 0
+            win_cnt = 0
+            trade_rows = []
+
+            for symbol, s_orders in trades_by_symbol.items():
+                period_orders = [o for o in s_orders if _to_iso_str(o.get("timestamp")) >= start_iso]
+                if not period_orders:
+                    continue
+                # FIFO trade matching for completed legs
+                buys = [{"qty": int(o["quantity"]), "price": float(o["price"])} for o in s_orders if o["transaction_type"] == "BUY"]
+                sells = [{"qty": int(o["quantity"]), "price": float(o["price"])} for o in s_orders if o["transaction_type"] == "SELL"]
+
+                m_pnl = 0.0
+                matched_qty = 0
+                b_val_matched = 0.0
+                s_val_matched = 0.0
+                b_idx, s_idx = 0, 0
+
+                while b_idx < len(buys) and s_idx < len(sells):
+                    b = buys[b_idx]
+                    s = sells[s_idx]
+                    match_q = min(b["qty"], s["qty"])
+                    if match_q > 0:
+                        m_pnl += (s["price"] - b["price"]) * match_q
+                        matched_qty += match_q
+                        b_val_matched += match_q * b["price"]
+                        s_val_matched += match_q * s["price"]
+                        b["qty"] -= match_q
+                        s["qty"] -= match_q
+                    if b["qty"] == 0:
+                        b_idx += 1
+                    if s["qty"] == 0:
+                        s_idx += 1
+
+                parsed = parse_nfo_symbol(symbol)
+                exp_date = parsed.get("expiry_date") if parsed else None
+
+                is_expired = False
+                if exp_date:
+                    if now_dt.date() > exp_date:
+                        is_expired = True
+                    elif now_dt.date() == exp_date and now_dt.time() >= time(15, 30):
+                        is_expired = True
+
+                rem_buy_qty = sum(b["qty"] for b in buys[b_idx:])
+                rem_sell_qty = sum(s["qty"] for s in sells[s_idx:])
+                net_qty = rem_buy_qty - rem_sell_qty
+
+                if matched_qty > 0:
+                    realised_pnl += m_pnl
+                    closed_cnt += 1
+                    if m_pnl >= 0:
+                        win_cnt += 1
+                    avg_b = b_val_matched / matched_qty if matched_qty > 0 else 0.0
+                    avg_s = s_val_matched / matched_qty if matched_qty > 0 else 0.0
+                    b_cnt = max(1, b_idx)
+                    s_cnt = max(1, s_idx)
+                    chg_info = calculate_option_charges(avg_b, avg_s, matched_qty, b_cnt, s_cnt)
+                    c_val = chg_info["total_charges"]
+                    total_acct_charges += c_val
+                    trade_rows.append({"symbol": symbol, "qty": matched_qty, "buy_price": avg_b, "sell_price": avg_s, "pnl": m_pnl, "charges": c_val, "net_pnl": m_pnl - c_val})
+
+                if is_expired and net_qty != 0:
+                    if net_qty < 0:  # Short option expired worthless
+                        exp_qty = abs(net_qty)
+                        rem_s_val = sum(s["qty"] * s["price"] for s in sells[s_idx:])
+                        exp_pnl = rem_s_val if rem_sell_qty > 0 else 0.0
+                        realised_pnl += exp_pnl
+                        closed_cnt += 1
+                        win_cnt += 1
+                        avg_s = rem_s_val / exp_qty if exp_qty > 0 else 0.0
+                        chg_info = calculate_option_charges(0.0, avg_s, exp_qty, 0, 1)
+                        c_val = chg_info["total_charges"]
+                        total_acct_charges += c_val
+                        trade_rows.append({"symbol": symbol, "qty": exp_qty, "buy_price": 0.0, "sell_price": avg_s, "pnl": exp_pnl, "charges": c_val, "net_pnl": exp_pnl - c_val})
+                    elif net_qty > 0:  # Long option expired worthless
+                        exp_qty = net_qty
+                        rem_b_val = sum(b["qty"] * b["price"] for b in buys[b_idx:])
+                        exp_pnl = -rem_b_val if rem_buy_qty > 0 else 0.0
+                        realised_pnl += exp_pnl
+                        closed_cnt += 1
+                        avg_b = rem_b_val / exp_qty if exp_qty > 0 else 0.0
+                        chg_info = calculate_option_charges(avg_b, 0.0, exp_qty, 1, 0)
+                        c_val = chg_info["total_charges"]
+                        total_acct_charges += c_val
+                        trade_rows.append({"symbol": symbol, "qty": exp_qty, "buy_price": avg_b, "sell_price": 0.0, "pnl": exp_pnl, "charges": c_val, "net_pnl": exp_pnl - c_val})
+
+            # Fallback for closed positions today (q == 0) in positions if not already in trade_rows
+            for p in positions:
+                q = p.get("quantity", 0)
+                sym = p.get("tradingsymbol", "")
+                if q == 0 and sym and not any(r["symbol"] == sym for r in trade_rows):
+                    p_pnl = float(p.get("realised") or p.get("pnl") or 0.0)
+                    if p_pnl != 0.0:
+                        realised_pnl += p_pnl
+                        closed_cnt += 1
+                        if p_pnl >= 0:
+                            win_cnt += 1
+                        bp = float(p.get("buy_price") or p.get("average_price") or 0.0)
+                        sp = float(p.get("sell_price") or p.get("average_price") or 0.0)
+                        matched_q = abs(p.get("buy_quantity") or p.get("sell_quantity") or 0)
+                        chg_info = calculate_option_charges(bp, sp, matched_q, 1, 1)
+                        c_val = chg_info["total_charges"]
+                        total_acct_charges += c_val
+                        trade_rows.append({"symbol": sym, "qty": matched_q, "buy_price": bp, "sell_price": sp, "pnl": p_pnl, "charges": c_val, "net_pnl": p_pnl - c_val})
+
+            unrealised_pnl = sum(float(p.get("pnl", p.get("unrealised", 0.0))) for p in positions if p.get("quantity", 0) != 0)
+            net_pnl = (realised_pnl - total_acct_charges) + unrealised_pnl
+
+            grand_realised += realised_pnl
+            grand_unrealised += unrealised_pnl
+            grand_closed_cnt += closed_cnt
+            grand_win_cnt += win_cnt
+            if not hasattr(self, "_grand_charges"): self._grand_charges = 0.0
+            self._grand_charges += total_acct_charges
+
+            acct_summaries[acct] = {
+                "realised": realised_pnl,
+                "charges": total_acct_charges,
+                "net_realised": realised_pnl - total_acct_charges,
+                "unrealised": unrealised_pnl,
+                "net": net_pnl,
+                "closed_cnt": closed_cnt,
+                "win_cnt": win_cnt,
+                "trade_rows": trade_rows,
+            }
+
+        def _fmt_money(val: float) -> str:
+            color = "\033[38;5;48m" if val >= 0 else "\033[38;5;196m"
+            if val >= 0:
+                return f"{color}+₹{val:,.2f}\033[0m"
+            else:
+                return f"{color}-₹{abs(val):,.2f}\033[0m"
+
+        def _fmt_charges(val: float) -> str:
+            return f"\033[38;5;208m-₹{val:,.2f}\033[0m"
+
+        lines = [header_selector, ""]
+
+        # Account Summary Table
+        w_acct = 12
+        w_real = 16
+        w_chg = 14
+        w_net_r = 16
+        w_unreal = 16
+        w_net = 16
+
+        top_b = f"┌─{'─'*w_acct}─┬─{'─'*w_real}─┬─{'─'*w_chg}─┬─{'─'*w_net_r}─┬─{'─'*w_unreal}─┬─{'─'*w_net}─┐"
+        head_r = f"│ {'Account':<{w_acct}} │ {'Realised P&L':<{w_real}} │ {'Charges':<{w_chg}} │ {'Net Realised':<{w_net_r}} │ {'Unrealised P&L':<{w_unreal}} │ {'Net P&L':<{w_net}} │"
+        mid_b = f"├─{'─'*w_acct}─┼─{'─'*w_real}─┼─{'─'*w_chg}─┼─{'─'*w_net_r}─┼─{'─'*w_unreal}─┼─{'─'*w_net}─┤"
+        bot_b = f"└─{'─'*w_acct}─┴─{'─'*w_real}─┴─{'─'*w_chg}─┴─{'─'*w_net_r}─┴─{'─'*w_unreal}─┴─{'─'*w_net}─┘"
+
+        lines.append(top_b)
+        lines.append(head_r)
+        lines.append(mid_b)
+
+        all_trade_rows = []
+
+        grand_total_charges = 0.0
+
+        for acct in all_acct_names:
+            d = acct_summaries[acct]
+            grand_total_charges += d["charges"]
+            acct_s = _pad_ansi(acct, w_acct)
+            r_s = _pad_ansi(_fmt_money(d["realised"]), w_real, ">")
+            chg_s = _pad_ansi(_fmt_charges(d["charges"]), w_chg, ">")
+            nr_s = _pad_ansi(_fmt_money(d["net_realised"]), w_net_r, ">")
+            u_s = _pad_ansi(_fmt_money(d["unrealised"]), w_unreal, ">")
+            n_s = _pad_ansi(_fmt_money(d["net"]), w_net, ">")
+            lines.append(f"│ {acct_s} │ {r_s} │ {chg_s} │ {nr_s} │ {u_s} │ {n_s} │")
+
+            for r in d["trade_rows"]:
+                all_trade_rows.append({
+                    "account": acct,
+                    "symbol": r["symbol"],
+                    "qty": r["qty"],
+                    "buy_price": r.get("buy_price", 0.0),
+                    "sell_price": r.get("sell_price", 0.0),
+                    "pnl": r["pnl"],
+                    "charges": r.get("charges", 0.0),
+                    "net_pnl": r.get("net_pnl", r["pnl"]),
+                })
+
+        lines.append(mid_b)
+
+        # Grand Total Row
+        grand_net_realised = grand_realised - grand_total_charges
+        grand_net = grand_net_realised + grand_unrealised
+
+        gt_acct_s = _pad_ansi("\033[1mGRAND TOTAL\033[0m", w_acct)
+        gt_r_s = _pad_ansi(_fmt_money(grand_realised), w_real, ">")
+        gt_chg_s = _pad_ansi(_fmt_charges(grand_total_charges), w_chg, ">")
+        gt_nr_s = _pad_ansi(_fmt_money(grand_net_realised), w_net_r, ">")
+        gt_u_s = _pad_ansi(_fmt_money(grand_unrealised), w_unreal, ">")
+        gt_n_s = _pad_ansi(_fmt_money(grand_net), w_net, ">")
+
+        lines.append(f"│ {gt_acct_s} │ {gt_r_s} │ {gt_chg_s} │ {gt_nr_s} │ {gt_u_s} │ {gt_n_s} │")
+        lines.append(bot_b)
+        lines.append("")
+
+        # Single Trade Breakdown Table
+        if all_trade_rows:
+            lines.append("Trade Breakdown:")
+            w_acct_tb = max(10, max(len(r["account"]) for r in all_trade_rows))
+            w_sym_tb = max(18, max(len(r["symbol"]) for r in all_trade_rows))
+            w_qty_tb = 8
+            w_bp_tb = 11
+            w_sp_tb = 11
+            w_pnl_tb = 14
+            w_chg_tb = 12
+            w_net_tb = 14
+
+            tb_top = f"┌─{'─'*w_acct_tb}─┬─{'─'*w_sym_tb}─┬─{'─'*w_qty_tb}─┬─{'─'*w_bp_tb}─┬─{'─'*w_sp_tb}─┬─{'─'*w_pnl_tb}─┬─{'─'*w_chg_tb}─┬─{'─'*w_net_tb}─┐"
+            tb_head = f"│ {'Account':<{w_acct_tb}} │ {'Symbol':<{w_sym_tb}} │ {'Qty':<{w_qty_tb}} │ {'Buy Price':<{w_bp_tb}} │ {'Sell Price':<{w_sp_tb}} │ {'Realised P&L':<{w_pnl_tb}} │ {'Charges':<{w_chg_tb}} │ {'Net P&L':<{w_net_tb}} │"
+            tb_mid = f"├─{'─'*w_acct_tb}─┼─{'─'*w_sym_tb}─┼─{'─'*w_qty_tb}─┼─{'─'*w_bp_tb}─┼─{'─'*w_sp_tb}─┼─{'─'*w_pnl_tb}─┼─{'─'*w_chg_tb}─┼─{'─'*w_net_tb}─┤"
+            tb_bot = f"└─{'─'*w_acct_tb}─┴─{'─'*w_sym_tb}─┴─{'─'*w_qty_tb}─┴─{'─'*w_bp_tb}─┴─{'─'*w_sp_tb}─┴─{'─'*w_pnl_tb}─┴─{'─'*w_chg_tb}─┴─{'─'*w_net_tb}─┘"
+
+            lines.append(tb_top)
+            lines.append(tb_head)
+            lines.append(tb_mid)
+            for r in all_trade_rows:
+                acct_s = f"{r['account']:<{w_acct_tb}}"
+                sym_s = f"{r['symbol']:<{w_sym_tb}}"
+                qty_s = f"{r['qty']:<{w_qty_tb}}"
+                bp_s = _pad_ansi(f"₹{r['buy_price']:.2f}", w_bp_tb, ">")
+                sp_s = _pad_ansi(f"₹{r['sell_price']:.2f}", w_sp_tb, ">")
+                pnl_s = _pad_ansi(_fmt_money(r["pnl"]), w_pnl_tb, ">")
+                chg_s = _pad_ansi(_fmt_charges(r["charges"]), w_chg_tb, ">")
+                net_s = _pad_ansi(_fmt_money(r["net_pnl"]), w_net_tb, ">")
+                lines.append(f"│ {acct_s} │ {sym_s} │ {qty_s} │ {bp_s} │ {sp_s} │ {pnl_s} │ {chg_s} │ {net_s} │")
+            lines.append(tb_bot)
+            lines.append("")
+
+        return "\n".join(lines)
+
     def _update_info_buffer(self, reset_scroll: bool = True) -> None:
-        """Push current info_mode text into the info_buffer.
+        """Push current info_mode text into the info control.
 
         Args:
             reset_scroll: When True (default) the pane scrolls back to the top.
                           Pass False for live tick/data refreshes where the user
                           may have scrolled down — preserves their position.
         """
-        if not hasattr(self, "info_buffer"):
+        if not hasattr(self, "_info_control"):
             return
         if self.info_mode == "orders_pending":
             text = self._last_pending_text
@@ -4199,27 +4861,22 @@ class KCLILiveSession:
             except Exception as exc:
                 self._last_advisor_text = f"=== Tuesday Expiry Advisor ===\n\nFailed to plan: {exc}"
             text = self._last_advisor_text
+        elif self.info_mode == "pnl":
+            try:
+                self._last_pnl_text = self._render_pnl_pane()
+            except Exception as exc:
+                self._last_pnl_text = f"=== P&L Analytics ===\n\nFailed to calculate P&L: {exc}"
+            text = self._last_pnl_text
         elif self.info_mode == "help":
             text = self._build_help_text()
         else:
             text = self._last_oc_text
-        if reset_scroll:
-            new_cursor = 0
-        else:
-            old_doc = self.info_buffer.document
-            old_row = old_doc.cursor_position_row
-            old_col = old_doc.cursor_position_col
-            temp_doc = Document(text=text)
-            target_row = min(old_row, max(0, len(temp_doc.lines) - 1))
-            new_cursor = temp_doc.translate_row_col_to_index(target_row, old_col)
 
-        self.info_buffer.set_document(
-            Document(text=text, cursor_position=new_cursor),
-            bypass_readonly=True,
-        )
-        if reset_scroll and hasattr(self, "_info_control"):
+        if reset_scroll:
             self._info_control.vertical_scroll_position = 0
-        if hasattr(self, "app"):
+
+        self._info_control.text = to_formatted_text(ANSI(text))
+        if hasattr(self, "app") and self.app:
             self.app.invalidate()
 
     def _get_frame_style(self, body_window) -> str:
@@ -4300,14 +4957,12 @@ class KCLILiveSession:
         # Enable focus_on_click=True so clicking the logs pane focuses it and allows selection
         self._logs_control = ScrollableBufferControl(buffer=self.logs_buffer, focusable=True, focus_on_click=True)
 
-        # Info Pane (right half) — Buffer-backed: scroll, selection
-        self.info_buffer = Buffer(
-            name="info_buffer",
-            read_only=True,
-            document=Document(text=self._last_pending_text, cursor_position=0),
+        # Info Pane (right half) — ScrollableFormattedTextControl: scroll, ANSI formatting
+        self._info_control = ScrollableFormattedTextControl(
+            text=to_formatted_text(ANSI(self._last_pending_text)),
+            focusable=True,
+            show_cursor=False,
         )
-        # Enable focus_on_click=True so clicking the info pane focuses it and allows selection
-        self._info_control = ScrollableBufferControl(buffer=self.info_buffer, focusable=True, focus_on_click=True)
 
         # Command input
         # Pass FileHistory to support persistent command line history
@@ -4359,28 +5014,55 @@ class KCLILiveSession:
 
         original_info_mouse_handler = self._info_control.mouse_handler
         def new_info_mouse_handler(mouse_event):
-            res = original_info_mouse_handler(mouse_event)
+            res = original_info_mouse_handler(mouse_event) if original_info_mouse_handler else None
             from prompt_toolkit.mouse_events import MouseEventType
             if mouse_event.event_type == MouseEventType.MOUSE_UP:
-                buf = self._info_control.buffer
-                selected_text = None
-                if buf.selection_state is not None:
-                    from_, to_ = buf.document.selection_range()
-                    selected_text = buf.document.text[from_:to_]
-                else:
-                    pos = buf.document.cursor_position
-                    text = buf.document.text
-                    selected_text = _get_word_at_pos(text, pos)
-                
-                if selected_text:
-                    selected_text = selected_text.strip()
-                    import subprocess
-                    try:
-                        proc = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
-                        proc.communicate(selected_text.encode('utf-8'))
-                    except Exception:
-                        pass
-                    self._select_symbol_from_text(selected_text)
+                if self.info_mode == "pnl":
+                    v_scroll = getattr(self._info_control, "vertical_scroll_position", 0)
+                    if mouse_event.position.y - v_scroll == 0:
+                        x = mouse_event.position.x
+                        if 8 <= x <= 20:
+                            self.pnl_period = "week"
+                            self._update_info_buffer()
+                            if hasattr(self, "app") and self.app:
+                                self.app.invalidate()
+                            self.log_message("P&L period switched to [bold]Week[/bold].")
+                            return res
+                        elif 21 <= x <= 35:
+                            self.pnl_period = "month"
+                            self._update_info_buffer()
+                            if hasattr(self, "app") and self.app:
+                                self.app.invalidate()
+                            self.log_message("P&L period switched to [bold]Month[/bold].")
+                            return res
+                        elif 36 <= x <= 50:
+                            self.pnl_period = "year"
+                            self._update_info_buffer()
+                            if hasattr(self, "app") and self.app:
+                                self.app.invalidate()
+                            self.log_message("P&L period switched to [bold]Year[/bold].")
+                            return res
+
+                if hasattr(self._info_control, "buffer"):
+                    buf = self._info_control.buffer
+                    selected_text = None
+                    if buf.selection_state is not None:
+                        from_, to_ = buf.document.selection_range()
+                        selected_text = buf.document.text[from_:to_]
+                    else:
+                        pos = buf.document.cursor_position
+                        text = buf.document.text
+                        selected_text = _get_word_at_pos(text, pos)
+                    
+                    if selected_text:
+                        selected_text = selected_text.strip()
+                        import subprocess
+                        try:
+                            proc = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+                            proc.communicate(selected_text.encode('utf-8'))
+                        except Exception:
+                            pass
+                        self._select_symbol_from_text(selected_text)
             return res
         self._info_control.mouse_handler = new_info_mouse_handler
 
@@ -4428,7 +5110,7 @@ class KCLILiveSession:
             content=self._info_control,
             wrap_lines=True,
             allow_scroll_beyond_bottom=True,
-            get_vertical_scroll=lambda win: self._info_control.buffer.document.cursor_position_row,
+            get_vertical_scroll=lambda win: getattr(self._info_control, "vertical_scroll_position", 0),
         )
 
         # Define tab bar control and window for the info pane
@@ -4459,12 +5141,8 @@ class KCLILiveSession:
                     if hasattr(control, "buffer"):
                         for _ in range(3):
                             control.buffer.cursor_down()
-                    else:
-                        if window.render_info:
-                            max_scroll = max(0, window.render_info.content_height - window.render_info.window_height)
-                            control.vertical_scroll_position = min(max_scroll, control.vertical_scroll_position + 3)
-                        else:
-                            control.vertical_scroll_position += 3
+                    elif hasattr(control, "vertical_scroll_position"):
+                        control.vertical_scroll_position += 3
                     self.app.invalidate()
                     return None
                 if original_handler:
@@ -4479,14 +5157,38 @@ class KCLILiveSession:
         # ── Key Bindings ───────────────────────────────────────────
         kb = KeyBindings()
 
-        @kb.add("c-r")
-        def _search_history(event):
+        @kb.add("c-r", filter=is_searching)
+        def _reverse_search_next(event):
+            do_incremental_search(SearchDirection.BACKWARD, count=event.arg)
+
+        @kb.add("c-r", filter=~is_searching)
+        def _start_reverse_search(event):
             start_search(self.input_field.control, SearchDirection.BACKWARD)
 
-        @kb.add("c-c")
+        @kb.add("c-q")
         def _quit(event):
             self.running = False
             event.app.exit()
+
+        @kb.add("c-c")
+        def _cancel_command(event):
+            buf = self.input_field.buffer
+            if buf.text:
+                buf.text = ""
+                buf.cursor_position = 0
+                self.log_message("Command cancelled.")
+            else:
+                if (
+                    (hasattr(self, "selected_symbol") and self.selected_symbol)
+                    or (hasattr(self, "selected_account_name") and self.selected_account_name)
+                    or (hasattr(self, "selected_order") and self.selected_order)
+                ):
+                    self.selected_symbol = None
+                    self.selected_account_name = None
+                    self.selected_account_api_key = None
+                    self.selected_order = None
+                    self.update_prompt_label()
+                    self.log_message("Selection cleared.")
 
         @kb.add("escape")
         def _deselect(event):
@@ -4513,30 +5215,24 @@ class KCLILiveSession:
         @kb.add("up", filter=~has_focus(self.input_field))
         def _scroll_up_kb(event):
             cur = event.app.layout.current_control
-            if cur == self.positions_control:
-                self.positions_control.vertical_scroll_position = max(0, self.positions_control.vertical_scroll_position - 1)
+            if hasattr(cur, "vertical_scroll_position"):
+                cur.vertical_scroll_position = max(0, cur.vertical_scroll_position - 1)
             elif hasattr(cur, "buffer"):
                 cur.buffer.cursor_up()
 
         @kb.add("down", filter=~has_focus(self.input_field))
         def _scroll_down_kb(event):
             cur = event.app.layout.current_control
-            if cur == self.positions_control:
-                w = self.positions_window
-                c = self.positions_control
-                if w.render_info:
-                    max_scroll = max(0, w.render_info.content_height - w.render_info.window_height)
-                    c.vertical_scroll_position = min(max_scroll, c.vertical_scroll_position + 1)
-                else:
-                    c.vertical_scroll_position += 1
+            if hasattr(cur, "vertical_scroll_position"):
+                cur.vertical_scroll_position += 1
             elif hasattr(cur, "buffer"):
                 cur.buffer.cursor_down()
 
         @kb.add("pageup", filter=~has_focus(self.input_field))
         def _page_up_kb(event):
             cur = event.app.layout.current_control
-            if cur == self.positions_control:
-                self.positions_control.vertical_scroll_position = max(0, self.positions_control.vertical_scroll_position - 10)
+            if hasattr(cur, "vertical_scroll_position"):
+                cur.vertical_scroll_position = max(0, cur.vertical_scroll_position - 10)
             elif hasattr(cur, "buffer"):
                 for _ in range(10):
                     cur.buffer.cursor_up()
@@ -4544,14 +5240,8 @@ class KCLILiveSession:
         @kb.add("pagedown", filter=~has_focus(self.input_field))
         def _page_down_kb(event):
             cur = event.app.layout.current_control
-            if cur == self.positions_control:
-                w = self.positions_window
-                c = self.positions_control
-                if w.render_info:
-                    max_scroll = max(0, w.render_info.content_height - w.render_info.window_height)
-                    c.vertical_scroll_position = min(max_scroll, c.vertical_scroll_position + 10)
-                else:
-                    c.vertical_scroll_position += 10
+            if hasattr(cur, "vertical_scroll_position"):
+                cur.vertical_scroll_position += 10
             elif hasattr(cur, "buffer"):
                 for _ in range(10):
                     cur.buffer.cursor_down()
@@ -4583,7 +5273,6 @@ class KCLILiveSession:
             event.app.invalidate()
 
         @kb.add("c-2")
-        @kb.add("c-e")
         @kb.add("escape", "2")
         @kb.add("f2")
         def _c2(event):
@@ -4613,6 +5302,14 @@ class KCLILiveSession:
         @kb.add("escape", "5")
         @kb.add("f5")
         def _c5(event):
+            self.info_mode = "pnl"
+            self._update_info_buffer()
+            event.app.invalidate()
+
+        @kb.add("c-6")
+        @kb.add("escape", "6")
+        @kb.add("f6")
+        def _c6(event):
             self.info_mode = "help"
             self._update_info_buffer()
             event.app.invalidate()
@@ -4666,7 +5363,7 @@ class KCLILiveSession:
             return VSplit([
                 # ── LEFT half: Positions (scrollable) ──
                 Frame(
-                    title="Active Positions (Live Ticks) [Tab: focus]",
+                    title="Positions",
                     body=self.positions_window,
                     style=self._get_frame_style(self.positions_window),
                     width=D(weight=lw),

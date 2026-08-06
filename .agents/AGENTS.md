@@ -34,14 +34,24 @@ These rules apply to all AI agents working on the `kitecli` repository. Follow t
     *   The `SearchToolbar` must be instantiated before the `TextArea` and passed directly into the `search_field` constructor argument. Dynamic assignment of `TextArea.search_field` is not supported by prompt-toolkit.
 *   **Immediate UI Refresh**:
     *   Successful order placement (`execute_order`) and position exits (`execute_exit`) must explicitly trigger TUI refresh (`_trigger_immediate_refresh`) to ensure immediate rendering, as WebSocket order update ticks are not guaranteed or can be delayed on certain brokers (e.g. Kotak).
-*   **Kotak Neo WebSocket Error Mapping**:
-    *   When returning errors from `KotakTicker._on_error`, you MUST map auth-related errors to code `403` so that the live session's `on_error` handler knows to cleanly stop reconnection and avoid auth-rate-limiting, while letting ordinary connection drops trigger exponential backoff.
+*   **Kotak Neo WebSocket Error & Routine Disconnect Mapping**:
+    *   When returning errors from `KotakTicker._on_close` and `_on_error`, you MUST map auth-related errors to code `403` ONLY for true credential/session failures (`"100008"`, `"unauthorized"`, `"invalid token"`, `"token expired"`).
+    *   Kotak Neo's SDK emits `"The Session has been Closed!"` on routine socket closures (idle timeouts, server resets). Do NOT map routine closure messages to `403`; allow them to proceed to `_trigger_reconnect()` for standard exponential backoff.
 *   **Throttled TUI Logging for REST Refresh**:
     *   REST refresh failures caught in `_trigger_immediate_refresh` must be logged to the Status Logs pane using `_ws_should_log` with a 30s minimum interval to avoid spamming the user interface.
+*   **P&L Calculation Invariants & SQLite Single Source of Truth**:
+    *   `_render_pnl_pane()` must rely **strictly and 100% on the SQLite database (`executed_order_context`)** as the sole authoritative source of truth for completed orders, prices, timestamps, and statutory charges. Do NOT merge un-hydrated in-memory order responses (`last_orders_response`) over DB records, as this overwrites valid timestamps with empty strings.
+    *   **Transaction Type Normalization**: Order feeds and APIs emitting shorthand (`"B"` / `"S"`) must be normalized to `"BUY"` and `"SELL"` across DB inserts, memory structures, and FIFO trade pairing.
+    *   **Overnight FIFO Trade Matching**: FIFO buy/sell trade pairing must run across the complete order history (`s_orders`) so opening legs opened on previous days match with closing legs. A trade leg is included in the period P&L if its **closing leg timestamp** (`max(buy_ts, sell_ts)`) falls within the selected period (`>= start_iso`).
+    *   **NIFTY F&O Options Week Cycle**: The weekly options cycle runs from **Wednesday 00:00:00 to Tuesday end of day**. `_get_pnl_date_range("week")` computes the week start date from the most recent Wednesday 00:00:00.
+*   **TUI Global Hotkeys**:
+    *   Application exit is bound to `Ctrl+D` (`c-d`).
+    *   Command line cancellation / selection clearing is bound to `Ctrl+C` (`c-c`).
 *   **Broker Proxy Routing**:
     *   Both Zerodha and Kotak Neo enforce static IP whitelisting on order placement REST APIs (POST/PUT/DELETE /place, /modify, /cancel) and Kotak login authentication APIs.
     *   To avoid proxy-related network latency, 502 Bad Gateway REST errors, and 1006 WebSocket connection handshake timeouts, all read-only REST APIs (positions, margins/limits, orderbook, profile) and all WebSocket connections (both Zerodha's `KiteTicker` / `probe_ws_auth` and Kotak's `KotakTicker` / WebSocket feed) must bypass proxies and connect directly.
 *   **Handling Non-PyPI Dependencies**:
     *   Third-party packages not hosted on PyPI (such as Kotak Neo's `neo-api-client`) must **never** be listed in `pyproject.toml`'s dependencies or optional-dependencies list to prevent PyPI dependency resolution crashes.
     *   Instead, import them lazily at runtime and catch the `ImportError` to raise a clear instruction pointing to the direct Git repository installation command (e.g. `pip install "git+https://...#egg=neo_api_client"`). Always document the Git installation step in `README.md`.
+
 

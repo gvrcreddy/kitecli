@@ -287,11 +287,14 @@ class DataRecorder:
                     "stt": "REAL",
                     "gst": "REAL",
                 }
-                for col_name, col_type in required_cols.items():
-                    if col_name not in existing_cols:
-                        conn.execute(f"ALTER TABLE executed_order_context ADD COLUMN {col_name} {col_type};")
         except Exception as exc:
             logger.warning("Schema migration for executed_order_context skipped: %s", exc)
+
+        try:
+            conn.execute("UPDATE executed_order_context SET transaction_type = 'BUY' WHERE UPPER(transaction_type) = 'B';")
+            conn.execute("UPDATE executed_order_context SET transaction_type = 'SELL' WHERE UPPER(transaction_type) = 'S';")
+        except Exception:
+            pass
 
         conn.commit()
 
@@ -472,7 +475,7 @@ class DataRecorder:
                         str(o.get("order_id", "")),
                         o.get("tradingsymbol", ""),
                         o.get("exchange", ""),
-                        o.get("transaction_type", ""),
+                        ("BUY" if str(o.get("transaction_type", "")).upper() in ("B", "BUY") else ("SELL" if str(o.get("transaction_type", "")).upper() in ("S", "SELL") else str(o.get("transaction_type", "")).upper())),
                         int(o.get("quantity", 0)),
                         float(o.get("average_price") or o.get("price") or 0.0),
                         o.get("status", "COMPLETE"),

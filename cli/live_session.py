@@ -966,7 +966,7 @@ class KCLILiveSession:
                 pass
 
         if total_cols >= 120:
-            left_str = f" 🪁 KiteCLI Live │ Last Update: {now} │ Accounts: {total} │ Ctrl+Q: Quit │ Ctrl+C: Cancel │ Escape: Deselect"
+            left_str = f" 🪁 KiteCLI Live │ Last Update: {now} │ Accounts: {total} │ Ctrl+D: Quit │ Ctrl+C: Cancel │ Escape: Deselect"
         elif total_cols >= 95:
             left_str = f" 🪁 KiteCLI Live │ {now} │ Accounts: {total}"
         else:
@@ -4440,7 +4440,7 @@ class KCLILiveSession:
 │ Ctrl + R              │ Interactive command history search (press repeatedly)│
 │ Ctrl + Left / Right   │ Adjust left / right split pane width                │
 │ Ctrl + C              │ Cancel current command line / clear selection       │
-│ Ctrl + Q              │ Quit KiteCLI                                        │
+│ Ctrl + D              │ Quit KiteCLI                                        │
 └───────────────────────┴─────────────────────────────────────────────────────┘
 """
 
@@ -4455,6 +4455,7 @@ class KCLILiveSession:
         now = datetime.now()
         
         if period == "week":
+            # NIFTY Options F&O Week: Wednesday 00:00:00 to Tuesday (most recent Wednesday)
             d = now.weekday()
             days_ago = d - 2 if d >= 2 else d + 5
             start_dt = (now - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -4493,7 +4494,7 @@ class KCLILiveSession:
 
         header_selector = f"Period:  {btn_week}  │  {btn_month}  │  {btn_year}"
 
-        # Collect completed orders from BOTH SQLite database (~/.kcli/data.db) and live broker response
+        # Collect completed orders strictly from SQLite database (~/.kcli/data.db)
         executed_orders_map = {}
 
         try:
@@ -4533,32 +4534,6 @@ class KCLILiveSession:
                 conn.close()
         except Exception as exc:
             logger.warning("Failed to query executed_order_context for P&L: %s", exc)
-
-        # Merge live executed orders from self.last_orders_response
-        last_orders = getattr(self, "last_orders_response", {})
-        if isinstance(last_orders, dict):
-            for acct in last_orders.get("accounts", []):
-                acct_name = acct.get("name") or acct.get("user_id") or "Default"
-                for o in acct.get("orders", []):
-                    if str(o.get("status", "")).upper() == "COMPLETE":
-                        oid = str(o.get("order_id", ""))
-                        raw_ts = o.get("order_timestamp") or o.get("exchange_timestamp") or ""
-                        ts_str = raw_ts.isoformat() if hasattr(raw_ts, "isoformat") else str(raw_ts)
-                        price_val = float(o.get("average_price") or o.get("price") or 0.0)
-                        tt = str(o.get("transaction_type", "")).upper()
-                        if tt == "B": tt = "BUY"
-                        if tt == "S": tt = "SELL"
-                        executed_orders_map[oid] = {
-                            "timestamp": ts_str,
-                            "account_name": acct_name,
-                            "user_id": acct.get("user_id") or acct_name,
-                            "tradingsymbol": o.get("tradingsymbol", ""),
-                            "transaction_type": tt,
-                            "quantity": int(o.get("quantity", 0)),
-                            "price": price_val,
-                            "order_id": oid,
-                            "status": "COMPLETE",
-                        }
 
         executed_orders = list(executed_orders_map.values())
 
@@ -4611,12 +4586,9 @@ class KCLILiveSession:
             trade_rows = []
 
             for symbol, s_orders in trades_by_symbol.items():
-                period_orders = [o for o in s_orders if _to_iso_str(o.get("timestamp")) >= start_iso]
-                if not period_orders:
-                    continue
-                # FIFO trade matching for completed legs
-                buys = [{"qty": int(o["quantity"]), "price": float(o["price"])} for o in s_orders if o["transaction_type"] == "BUY"]
-                sells = [{"qty": int(o["quantity"]), "price": float(o["price"])} for o in s_orders if o["transaction_type"] == "SELL"]
+                # FIFO trade matching for completed legs across all available history
+                buys = [{"qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp"))} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("B", "BUY")]
+                sells = [{"qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp"))} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("S", "SELL")]
 
                 m_pnl = 0.0
                 matched_qty = 0
@@ -4629,10 +4601,12 @@ class KCLILiveSession:
                     s = sells[s_idx]
                     match_q = min(b["qty"], s["qty"])
                     if match_q > 0:
-                        m_pnl += (s["price"] - b["price"]) * match_q
-                        matched_qty += match_q
-                        b_val_matched += match_q * b["price"]
-                        s_val_matched += match_q * s["price"]
+                        close_ts = max(b["ts"], s["ts"])
+                        if close_ts >= start_iso:
+                            m_pnl += (s["price"] - b["price"]) * match_q
+                            matched_qty += match_q
+                            b_val_matched += match_q * b["price"]
+                            s_val_matched += match_q * s["price"]
                         b["qty"] -= match_q
                         s["qty"] -= match_q
                     if b["qty"] == 0:
@@ -5165,7 +5139,7 @@ class KCLILiveSession:
         def _start_reverse_search(event):
             start_search(self.input_field.control, SearchDirection.BACKWARD)
 
-        @kb.add("c-q")
+        @kb.add("c-d")
         def _quit(event):
             self.running = False
             event.app.exit()

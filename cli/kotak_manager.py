@@ -656,6 +656,8 @@ class KotakAccountManager(BaseBrokerManager):
             except ValueError:
                 price = 0.0
 
+            ord_ts_str = str(ord.get("ordDtTm") or ord.get("ordEntTm") or ord.get("ordTm") or ord.get("order_timestamp") or ord.get("exchange_timestamp") or "")
+
             result.append({
                 "order_id": str(ord.get("nOrdNo", ord.get("order_id", ""))),
                 "tradingsymbol": ord.get("trdSym", ord.get("tradingsymbol", "")),
@@ -671,6 +673,8 @@ class KotakAccountManager(BaseBrokerManager):
                 "exchange": str(ord.get("exch", ord.get("exchange", "NFO"))).upper(),
                 "parent_order_id": str(ord.get("refLmtPrc", ord.get("parent_order_id", ""))) or None,
                 "status_message": str(ord.get("rejRsn", ord.get("status_message", ""))),
+                "order_timestamp": ord_ts_str,
+                "exchange_timestamp": ord_ts_str,
             })
 
         return result

@@ -7,7 +7,7 @@ Official Rates from https://zerodha.com/charges/#charges-explained:
 - GST: 18% on (brokerage + SEBI charges + transaction charges).
 - SEBI charges: ₹10 / crore (0.0001%).
 - Stamp charges: 0.003% or ₹300 / crore on buy side.
-- IPFT fee: ₹50 / crore (0.0005%).
+- IPFT fee: ₹0.01 / crore (0.0000001%).
 """
 
 from typing import Any
@@ -55,8 +55,8 @@ def calculate_option_charges(
     # 4. SEBI turnover fee: ₹10 / crore (0.0001%)
     sebi_fee = round(total_val * 0.000001, 2)
 
-    # 5. IPFT fee: ₹50 / crore (0.000005%) for NSE/NFO
-    ipft_fee = round(total_val * 0.000005, 2) if is_nse else 0.0
+    # 5. IPFT fee: ₹0.01 / crore (0.0000001%) for NSE/NFO
+    ipft_fee = round(total_val * 1e-9, 2) if is_nse else 0.0
 
     # 6. GST: 18% on (Brokerage + Exchange Fee + SEBI Fee)
     gst = round((brokerage + exch_fee + sebi_fee) * 0.18, 2)

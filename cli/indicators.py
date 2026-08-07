@@ -129,11 +129,14 @@ def calculate_daily_indicators(
         "nifty_dist_sma_20_pct": None, "nifty_dist_sma_50_pct": None, "nifty_dist_sma_200_pct": None,
         "nifty_ret_1d_pct": None, "nifty_ret_5d_pct": None, "nifty_ret_20d_pct": None,
     }
-    if live_nifty_spot <= 0:
-        return empty_res
-
     historical_closes = fetch_or_get_daily_closes(client)
     if not historical_closes:
+        return empty_res
+
+    if live_nifty_spot <= 0:
+        live_nifty_spot = historical_closes[-1]
+
+    if live_nifty_spot <= 0:
         return empty_res
 
     # Append live Nifty spot as today's forming daily close

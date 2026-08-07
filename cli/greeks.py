@@ -69,7 +69,37 @@ def parse_nfo_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def calculate_greeks_for_symbol(symbol: str, spot_price: float, vix_pct: float = 15.0) -> Dict[str, Optional[float]]:
+def implied_volatility(
+    spot_price: float, strike_price: float, T: float, option_price: float, is_call: bool, r: float = 0.07
+) -> float | None:
+    """Solve for Implied Volatility (IV %) from option price using Newton-Raphson."""
+    if option_price <= 0 or T <= 0:
+        return None
+    sigma = 0.25
+    for _ in range(100):
+        d1 = (math.log(spot_price / strike_price) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        if is_call:
+            price = spot_price * _norm_cdf(d1) - strike_price * math.exp(-r * T) * _norm_cdf(d2)
+        else:
+            price = strike_price * math.exp(-r * T) * _norm_cdf(-d2) - spot_price * _norm_cdf(-d1)
+
+        diff = price - option_price
+        if abs(diff) < 1e-4:
+            return sigma * 100.0
+
+        vega = spot_price * math.sqrt(T) * _norm_pdf(d1)
+        if vega < 1e-8:
+            break
+        sigma -= diff / vega
+        if sigma <= 0.001 or sigma > 5.0:
+            break
+    return None
+
+
+def calculate_greeks_for_symbol(
+    symbol: str, spot_price: float, vix_pct: float = 15.0, option_price: float | None = None
+) -> Dict[str, Optional[float]]:
     """Helper to calculate Option Greeks directly from a tradingsymbol."""
     parsed = parse_nfo_symbol(symbol)
     if not parsed:
@@ -81,6 +111,7 @@ def calculate_greeks_for_symbol(symbol: str, spot_price: float, vix_pct: float =
         expiry_date=parsed["expiry_date"],
         option_type=parsed["option_type"],
         vix_pct=vix_pct,
+        option_price=option_price,
     )
 
 
@@ -91,6 +122,7 @@ def calculate_greeks(
     option_type: str,
     vix_pct: float = 15.0,
     risk_free_rate: float = 0.07,
+    option_price: float | None = None,
 ) -> Dict[str, Optional[float]]:
     """Calculate Black-Scholes Option Greeks.
 
@@ -99,8 +131,9 @@ def calculate_greeks(
         strike_price: Strike price of option (e.g. 24500.0)
         expiry_date: Expiry date string (YYYY-MM-DD), date, or datetime object
         option_type: 'CE' / 'CALL' or 'PE' / 'PUT'
-        vix_pct: Volatility percentage (e.g. 15.2 for 15.2% India VIX)
+        vix_pct: Baseline Volatility percentage (e.g. 15.2 for 15.2% India VIX)
         risk_free_rate: Annual risk-free interest rate (default 7% = 0.07)
+        option_price: Optional option market price (LTP) to solve for exact IV.
 
     Returns:
         Dict containing delta, gamma, theta, vega, and iv.
@@ -122,7 +155,18 @@ def calculate_greeks(
     now = datetime.now()
     days_to_exp = max((exp_dt - now).total_seconds() / 86400.0, 0.25)
     T = days_to_exp / 365.0
-    sigma = max(vix_pct / 100.0, 0.01)
+
+    opt_type_upper = option_type.upper()
+    is_call = "CE" in opt_type_upper or "CALL" in opt_type_upper
+
+    eff_vix = vix_pct
+    if option_price and option_price > 0:
+        solved_iv = implied_volatility(spot_price, strike_price, T, option_price, is_call, risk_free_rate)
+        if not solved_iv or solved_iv <= 0:
+            return {"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None}
+        eff_vix = solved_iv
+
+    sigma = max(eff_vix / 100.0, 0.01)
 
     # Black-Scholes d1 and d2 calculations
     d1 = (math.log(spot_price / strike_price) + (risk_free_rate + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
@@ -156,5 +200,5 @@ def calculate_greeks(
         "gamma": round(gamma, 6),
         "theta": round(theta, 2),
         "vega": round(vega, 2),
-        "iv": round(vix_pct, 2),
+        "iv": round(eff_vix, 2),
     }

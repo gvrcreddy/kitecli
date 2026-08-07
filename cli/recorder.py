@@ -88,11 +88,21 @@ class DataRecorder:
         positions: list[dict[str, Any]] | None = None,
         account_name: str | None = None,
         charges: dict[str, Any] | None = None,
+        pos_intent: str | None = None,
+        is_settled_externally: int = 0,
     ) -> None:
         """Enqueue an executed order with market context (Greeks, Margins, Indicators, Positions, Charges)."""
+        ord_ts = order_data.get("order_timestamp") or order_data.get("exchange_timestamp")
+        if hasattr(ord_ts, "isoformat"):
+            ts_str = ord_ts.isoformat()
+        else:
+            ts_str = str(ord_ts or "")
+        if not ts_str:
+            ts_str = datetime.now().isoformat()
+
         self._queue.put({
             "type": "executed_order_context",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": ts_str,
             "user_id": user_id,
             "account_name": account_name,
             "order_data": order_data,
@@ -102,6 +112,8 @@ class DataRecorder:
             "index_values": index_values,
             "positions": positions or [],
             "charges": charges or {},
+            "pos_intent": pos_intent,
+            "is_settled_externally": is_settled_externally,
         })
 
     def enqueue_command(
@@ -286,7 +298,15 @@ class DataRecorder:
                     "brokerage": "REAL",
                     "stt": "REAL",
                     "gst": "REAL",
+                    "is_settled_externally": "INTEGER DEFAULT 0",
+                    "pos_intent": "TEXT",
                 }
+                for col_name, col_type in required_cols.items():
+                    if col_name not in existing_cols:
+                        try:
+                            cursor.execute(f"ALTER TABLE executed_order_context ADD COLUMN {col_name} {col_type};")
+                        except Exception:
+                            pass
         except Exception as exc:
             logger.warning("Schema migration for executed_order_context skipped: %s", exc)
 
@@ -465,8 +485,9 @@ class DataRecorder:
                         nifty_dist_sma_20_pct, nifty_dist_sma_50_pct, nifty_dist_sma_200_pct,
                         nifty_ret_1d_pct, nifty_ret_5d_pct, nifty_ret_20d_pct,
                         positions_snapshot, open_positions_count, total_unrealised_pnl, total_realised_pnl, grand_total_pnl,
-                        total_charges, brokerage, stt, gst
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        total_charges, brokerage, stt, gst,
+                        pos_intent, is_settled_externally
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ts,
@@ -515,6 +536,8 @@ class DataRecorder:
                         chg.get("brokerage"),
                         chg.get("stt"),
                         chg.get("gst"),
+                        item.get("pos_intent"),
+                        int(item.get("is_settled_externally", 0)),
                     ),
                 )
         conn.commit()

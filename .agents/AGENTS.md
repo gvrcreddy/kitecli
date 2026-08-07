@@ -43,6 +43,9 @@ These rules apply to all AI agents working on the `kitecli` repository. Follow t
     *   `_render_pnl_pane()` must rely **strictly and 100% on the SQLite database (`executed_order_context`)** as the sole authoritative source of truth for completed orders, prices, timestamps, and statutory charges. Do NOT merge un-hydrated in-memory order responses (`last_orders_response`) over DB records, as this overwrites valid timestamps with empty strings.
     *   **Transaction Type Normalization**: Order feeds and APIs emitting shorthand (`"B"` / `"S"`) must be normalized to `"BUY"` and `"SELL"` across DB inserts, memory structures, and FIFO trade pairing.
     *   **Overnight FIFO Trade Matching**: FIFO buy/sell trade pairing must run across the complete order history (`s_orders`) so opening legs opened on previous days match with closing legs. A trade leg is included in the period P&L if its **closing leg timestamp** (`max(buy_ts, sell_ts)`) falls within the selected period (`>= start_iso`).
+    *   **Position Reconciliation & External Settlement**:
+        *   `is_settled_externally = 1` marks legacy orphan orders that were closed prior to database recording.
+        *   `_render_pnl_pane()` filters out orders with `is_settled_externally = 1` from active FIFO trade matching so legacy orphan legs do not produce false realised P&L.
     *   **NIFTY F&O Options Week Cycle**: The weekly options cycle runs from **Wednesday 00:00:00 to Tuesday end of day**. `_get_pnl_date_range("week")` computes the week start date from the most recent Wednesday 00:00:00.
 *   **TUI Global Hotkeys**:
     *   Application exit is bound to `Ctrl+D` (`c-d`).

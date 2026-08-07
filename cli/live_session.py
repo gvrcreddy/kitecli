@@ -2317,6 +2317,19 @@ class KCLILiveSession:
         else:
             chg_dict = calculate_option_charges(0.0, o_price, o_qty, 0, 1, exch)
 
+        # Determine position intent (OPEN_LONG, OPEN_SHORT, CLOSE_LONG, CLOSE_SHORT)
+        pos_intent = None
+        sym_pos_qty = 0
+        for p in all_positions:
+            if p.get("tradingsymbol") == symbol:
+                sym_pos_qty = int(p.get("quantity", 0))
+                break
+
+        if tt in ["B", "BUY"]:
+            pos_intent = "OPEN_LONG" if sym_pos_qty >= 0 else "CLOSE_SHORT"
+        else:
+            pos_intent = "OPEN_SHORT" if sym_pos_qty <= 0 else "CLOSE_LONG"
+
         if hasattr(self, "recorder") and self.recorder:
             self.recorder.enqueue_executed_order_context(
                 user_id=user_id,
@@ -2328,6 +2341,7 @@ class KCLILiveSession:
                 positions=all_positions,
                 account_name=account_name,
                 charges=chg_dict,
+                pos_intent=pos_intent,
             )
 
     def _resolve_qty(self, qty_arg: str, symbol: str | None) -> tuple[str, str, str | None]:
@@ -4508,7 +4522,7 @@ class KCLILiveSession:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    SELECT timestamp, account_name, user_id, tradingsymbol, transaction_type, quantity, price, order_id, status
+                    SELECT timestamp, account_name, user_id, tradingsymbol, transaction_type, quantity, price, order_id, status, COALESCE(is_settled_externally, 0)
                     FROM executed_order_context
                     WHERE UPPER(status) = 'COMPLETE'
                     ORDER BY id ASC;
@@ -4530,6 +4544,7 @@ class KCLILiveSession:
                         "price": float(row[6]),
                         "order_id": oid,
                         "status": str(row[8]),
+                        "is_settled_externally": int(row[9] or 0),
                     }
                 conn.close()
         except Exception as exc:
@@ -4587,8 +4602,8 @@ class KCLILiveSession:
 
             for symbol, s_orders in trades_by_symbol.items():
                 # FIFO trade matching for completed legs across all available history
-                buys = [{"qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp"))} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("B", "BUY")]
-                sells = [{"qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp"))} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("S", "SELL")]
+                buys = [{"qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp"))} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("B", "BUY") and int(o.get("is_settled_externally", 0)) == 0]
+                sells = [{"qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp"))} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("S", "SELL") and int(o.get("is_settled_externally", 0)) == 0]
 
                 m_pnl = 0.0
                 matched_qty = 0

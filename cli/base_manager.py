@@ -157,3 +157,7 @@ class BaseBrokerManager(ABC):
     ) -> dict[str, Any]:
         """Calculate margin required for a proposed order. Default: fallback estimation."""
         return {"status": "error", "message": "not supported by this broker"}
+
+    def get_market_depth(self, symbol: str) -> dict[str, Any]:
+        """Fetch 5-depth order book, OHLC, and market stats for a symbol. Default: not supported."""
+        return {"status": "error", "message": "not supported by this broker"}

@@ -6,10 +6,13 @@ through the functions in this module so the CLI has a consistent,
 polished look.
 """
 
+from datetime import date, datetime
+from typing import Optional, Any
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from cli.greeks import get_position_expiry_info, format_expiry_header, format_strike_display
 
 console = Console()
 
@@ -70,12 +73,121 @@ def _format_pnl_pct(value: float) -> str:
     return f"{prefix}{value:.2f}%"
 
 
+def _build_account_positions_table(
+    positions: list[dict],
+    show_indices: bool = False,
+    start_idx: int = 1,
+    today: Optional[date] = None,
+) -> tuple[Table, int]:
+    """Build a grouped-by-expiry Table for an account's positions.
+
+    Returns:
+        (table, next_pos_idx)
+    """
+    table = Table(
+        show_header=True,
+        header_style="bold #58a6ff",
+        border_style="#30363d",
+        row_styles=["", "dim"],
+        pad_edge=True,
+        expand=True,
+    )
+    table.add_column("Symbol", style="bold #e6edf3", ratio=1)
+    table.add_column("Strike", style="bold #79c0ff", justify="center", no_wrap=True)
+    table.add_column("Lots/Qty", justify="right", no_wrap=True)
+    table.add_column("Avg Price", justify="right", no_wrap=True)
+    table.add_column("LTP", justify="right", no_wrap=True)
+    table.add_column("P&L", justify="right", no_wrap=True)
+
+    if not positions:
+        return table, start_idx
+
+    if today is None:
+        today = date.today()
+
+    # 1. Group positions by expiry
+    groups: dict[Optional[date], list[tuple[dict, dict]]] = {}
+    for pos in positions:
+        info = get_position_expiry_info(pos)
+        exp = info.get("expiry_date")
+        groups.setdefault(exp, []).append((info, pos))
+
+    # 2. Sort expiry keys: real dates ascending, None (Equity) at end
+    sorted_exp_keys = sorted([k for k in groups.keys() if k is not None])
+    if None in groups:
+        sorted_exp_keys.append(None)
+
+    pos_idx = start_idx
+    first_group = True
+
+    for exp_k in sorted_exp_keys:
+        items = groups[exp_k]
+        # Sort within group: strike ascending, CE before PE, tradingsymbol
+        items.sort(
+            key=lambda x: (
+                x[0].get("strike", 0.0),
+                0 if x[0].get("option_type") == "CE" else (1 if x[0].get("option_type") == "PE" else 2),
+                str(x[1].get("tradingsymbol", "")),
+            )
+        )
+
+        group_pnl = sum(float(p.get("pnl", 0)) for _, p in items)
+        date_str, dte_str = format_expiry_header(exp_k, today=today)
+
+        # Section header
+        if not first_group:
+            table.add_section()
+
+        pnl_col = _pnl_style(group_pnl)
+        pnl_sign = "+" if group_pnl > 0 else ""
+        header_title = Text.assemble(
+            ("📅 " + date_str, "bold #58a6ff"),
+            (f" ({dte_str})" if dte_str else "", "#8b949e"),
+        )
+        subtotal_title = Text(f"{pnl_sign}{_format_currency(group_pnl)}", style=f"bold {pnl_col}")
+        table.add_row(header_title, "", "", "", "", subtotal_title, style="bold")
+        table.add_section()
+
+        for info, pos in items:
+            pnl = float(pos.get("pnl", 0))
+            style = _pnl_style(pnl)
+            pos_sign = "+" if pnl > 0 else ""
+
+            symbol = str(pos.get("tradingsymbol", ""))
+            if show_indices:
+                symbol = f"[{pos_idx}] {symbol}"
+                pos_idx += 1
+
+            strike_display = format_strike_display(info)
+
+            lot_size = pos.get("lot_size", 1) or 1
+            qty = pos.get("quantity", 0)
+            if lot_size > 1:
+                lots = qty / lot_size
+                qty_display = f"{int(lots)}L" if lots == int(lots) else f"{lots:.1f}L"
+            else:
+                qty_display = str(qty)
+
+            table.add_row(
+                symbol,
+                strike_display,
+                qty_display,
+                _format_currency(float(pos.get("average_price", 0))),
+                _format_currency(float(pos.get("last_price", 0))),
+                Text(f"{pos_sign}{_format_currency(pnl)}", style=style),
+            )
+
+        first_group = False
+
+    return table, pos_idx
+
+
 def display_positions(accounts_data: list[dict]) -> None:
-    """Render positions tables for every account.
+    """Print a Rich table of open positions across all accounts.
 
     Args:
-        accounts_data: List of dicts, each with keys ``name``,
-            ``total_pnl``, and ``positions`` (list of position dicts).
+        accounts_data: List of account dicts, each with keys ``name``,
+                       ``total_pnl``, and ``positions``.
     """
     grand_total_pnl = 0.0
 
@@ -86,6 +198,7 @@ def display_positions(accounts_data: list[dict]) -> None:
         grand_total_pnl += total_pnl
 
         pnl_color = _pnl_style(total_pnl)
+
         header_text = Text.assemble(
             (f" {name} ", "bold #e6edf3"),
             (" │ ", "#8b949e"),
@@ -104,31 +217,7 @@ def display_positions(accounts_data: list[dict]) -> None:
             console.print()
             continue
 
-        table = Table(
-            show_header=True,
-            header_style="bold #58a6ff",
-            border_style="#30363d",
-            row_styles=["", "dim"],
-            pad_edge=True,
-            expand=True,
-        )
-        table.add_column("Symbol", style="bold #e6edf3", no_wrap=True)
-        table.add_column("Qty", justify="right")
-        table.add_column("Avg Price", justify="right")
-        table.add_column("LTP", justify="right")
-        table.add_column("P&L", justify="right")
-
-        for pos in positions:
-            pnl = float(pos.get("pnl", 0))
-            style = _pnl_style(pnl)
-
-            table.add_row(
-                str(pos.get("tradingsymbol", "")),
-                str(pos.get("quantity", 0)),
-                _format_currency(float(pos.get("average_price", 0))),
-                _format_currency(float(pos.get("last_price", 0))),
-                Text(_format_currency(pnl), style=style),
-            )
+        table, _ = _build_account_positions_table(positions, show_indices=False)
 
         panel = Panel(
             table,
@@ -181,7 +270,7 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
 
         pnl_color = _pnl_style(total_pnl)
 
-        margin_net  = account.get("margin_net")
+        margin_net = account.get("margin_net")
         margin_cash = account.get("margin_cash")
 
         header_parts: list[tuple[str, str]] = [
@@ -205,7 +294,6 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
 
         header_text = Text.assemble(*header_parts)
 
-
         if not positions:
             panel = Panel(
                 Text("  No open positions", style="#8b949e italic"),
@@ -217,46 +305,11 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
             capture_console.print()
             continue
 
-        table = Table(
-            show_header=True,
-            header_style="bold #58a6ff",
-            border_style="#30363d",
-            row_styles=["", "dim"],
-            pad_edge=True,
-            expand=True,
+        table, pos_idx = _build_account_positions_table(
+            positions,
+            show_indices=show_indices,
+            start_idx=pos_idx,
         )
-        table.add_column("Symbol", style="bold #e6edf3", no_wrap=True)
-        table.add_column("Lots/Qty", justify="right")
-        table.add_column("Avg Price", justify="right")
-        table.add_column("LTP", justify="right")
-        table.add_column("P&L", justify="right")
-
-        for pos in positions:
-            pnl = float(pos.get("pnl", 0))
-            style = _pnl_style(pnl)
-
-            symbol = str(pos.get("tradingsymbol", ""))
-            if show_indices:
-                symbol = f"[{pos_idx}] {symbol}"
-                pos_idx += 1
-
-            lot_size = pos.get("lot_size", 1) or 1
-            qty = pos.get("quantity", 0)
-            if lot_size > 1:
-                lots = qty / lot_size
-                # Show as integer lots if whole number, else 1 decimal
-                qty_display = f"{int(lots)}L" if lots == int(lots) else f"{lots:.1f}L"
-            else:
-                qty_display = str(qty)
-
-            table.add_row(
-                symbol,
-                qty_display,
-                _format_currency(float(pos.get("average_price", 0))),
-                _format_currency(float(pos.get("last_price", 0))),
-                Text(_format_currency(pnl), style=style),
-            )
-
 
         panel = Panel(
             table,

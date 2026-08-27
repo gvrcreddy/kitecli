@@ -17,6 +17,34 @@ from typing import Any
 logger = logging.getLogger("kitecli.recorder")
 
 
+def parse_to_iso_timestamp(ts_val: Any) -> str:
+    """Normalize any timestamp string (ISO, Kotak 'DD-Mon-YYYY HH:MM:SS', or standard space) to ISO format."""
+    if not ts_val:
+        return datetime.now().isoformat()
+    if hasattr(ts_val, "isoformat"):
+        return ts_val.isoformat()
+    s = str(ts_val).strip()
+    if not s:
+        return datetime.now().isoformat()
+
+    formats = [
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%d-%b-%Y %H:%M:%S",
+        "%d-%b-%Y %H:%M",
+        "%Y-%m-%d",
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.isoformat()
+        except ValueError:
+            pass
+    return s
+
+
 class DataRecorder:
     """Manages asynchronous batch persistence of trading logs to SQLite."""
 
@@ -93,12 +121,7 @@ class DataRecorder:
     ) -> None:
         """Enqueue an executed order with market context (Greeks, Margins, Indicators, Positions, Charges)."""
         ord_ts = order_data.get("order_timestamp") or order_data.get("exchange_timestamp")
-        if hasattr(ord_ts, "isoformat"):
-            ts_str = ord_ts.isoformat()
-        else:
-            ts_str = str(ord_ts or "")
-        if not ts_str:
-            ts_str = datetime.now().isoformat()
+        ts_str = parse_to_iso_timestamp(ord_ts)
 
         self._queue.put({
             "type": "executed_order_context",
@@ -310,11 +333,32 @@ class DataRecorder:
         except Exception as exc:
             logger.warning("Schema migration for executed_order_context skipped: %s", exc)
 
-        try:
-            conn.execute("UPDATE executed_order_context SET transaction_type = 'BUY' WHERE UPPER(transaction_type) = 'B';")
-            conn.execute("UPDATE executed_order_context SET transaction_type = 'SELL' WHERE UPPER(transaction_type) = 'S';")
-        except Exception:
-            pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conditional_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                user_id TEXT,
+                account_key TEXT,
+                account_name TEXT,
+                parent_order_ids TEXT NOT NULL,
+                parent_symbol TEXT NOT NULL,
+                parent_action TEXT NOT NULL,
+                parent_qty INTEGER NOT NULL,
+                parent_price REAL,
+                child_command_raw TEXT NOT NULL,
+                child_action TEXT NOT NULL,
+                child_symbol TEXT,
+                child_qty TEXT,
+                child_price REAL,
+                child_product TEXT DEFAULT 'NRML',
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                triggered_at TEXT,
+                child_order_ids TEXT,
+                failure_reason TEXT
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cond_orders_lookup ON conditional_orders(trade_date, status);")
 
         conn.commit()
 
@@ -459,7 +503,7 @@ class DataRecorder:
                 g = item.get("greeks", {})
                 ind = item.get("indicators", {})
                 pos_list = item.get("positions", [])
-                pos_json = json.dumps(pos_list) if pos_list else None
+                pos_json = json.dumps(pos_list, default=str) if pos_list else None
                 open_cnt = len([p for p in pos_list if p.get("quantity", 0) != 0])
                 total_unrealised = sum(float(p.get("unrealised", 0.0)) for p in pos_list if p.get("quantity", 0) != 0)
                 total_realised = sum(float(p.get("realised", 0.0)) for p in pos_list)
@@ -541,3 +585,208 @@ class DataRecorder:
                     ),
                 )
         conn.commit()
+
+    def get_connection(self) -> sqlite3.Connection:
+        """Return a configured SQLite connection with WAL mode enabled."""
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
+
+    def save_conditional_order(
+        self,
+        trade_date: str,
+        parent_order_ids: list[str],
+        parent_symbol: str,
+        parent_action: str,
+        parent_qty: int,
+        parent_price: float | None,
+        child_command_raw: str,
+        child_action: str,
+        child_symbol: str | None,
+        child_qty: str | None,
+        child_price: float | None,
+        child_product: str = "NRML",
+        user_id: str | None = None,
+        account_key: str | None = None,
+        account_name: str | None = None,
+    ) -> int:
+        """Synchronously persist a new conditional order to SQLite and return its inserted ID."""
+        parent_ids_json = json.dumps([str(oid) for oid in parent_order_ids])
+        now_iso = datetime.now().isoformat()
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO conditional_orders (
+                    trade_date, created_at, user_id, account_key, account_name,
+                    parent_order_ids, parent_symbol, parent_action, parent_qty, parent_price,
+                    child_command_raw, child_action, child_symbol, child_qty, child_price,
+                    child_product, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING');
+                """,
+                (
+                    trade_date,
+                    now_iso,
+                    user_id or "UNKNOWN",
+                    account_key,
+                    account_name,
+                    parent_ids_json,
+                    parent_symbol,
+                    parent_action.upper(),
+                    parent_qty,
+                    parent_price,
+                    child_command_raw,
+                    child_action.upper(),
+                    child_symbol,
+                    child_qty,
+                    child_price,
+                    child_product.upper() if child_product else "NRML",
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_pending_conditional_orders(self, today_str: str) -> list[dict[str, Any]]:
+        """Retrieve all active pending conditional orders for today."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM conditional_orders WHERE trade_date = ? AND status = 'PENDING' ORDER BY id ASC;",
+                (today_str,),
+            )
+            rows = cursor.fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["parent_order_ids"] = json.loads(d.get("parent_order_ids", "[]"))
+                except Exception:
+                    d["parent_order_ids"] = [d.get("parent_order_ids", "")]
+                try:
+                    d["child_order_ids"] = json.loads(d.get("child_order_ids", "[]")) if d.get("child_order_ids") else []
+                except Exception:
+                    d["child_order_ids"] = [d.get("child_order_ids", "")] if d.get("child_order_ids") else []
+                results.append(d)
+            return results
+
+    def get_all_conditional_orders_today(self, today_str: str) -> list[dict[str, Any]]:
+        """Retrieve all conditional orders for today (all statuses)."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM conditional_orders WHERE trade_date = ? ORDER BY id DESC;",
+                (today_str,),
+            )
+            rows = cursor.fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["parent_order_ids"] = json.loads(d.get("parent_order_ids", "[]"))
+                except Exception:
+                    d["parent_order_ids"] = [d.get("parent_order_ids", "")]
+                try:
+                    d["child_order_ids"] = json.loads(d.get("child_order_ids", "[]")) if d.get("child_order_ids") else []
+                except Exception:
+                    d["child_order_ids"] = [d.get("child_order_ids", "")] if d.get("child_order_ids") else []
+                results.append(d)
+            return results
+
+    def update_conditional_order_status(
+        self,
+        cond_id: int,
+        status: str,
+        child_order_ids: list[str] | str | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Update status and metadata of a conditional order."""
+        child_ids_str = None
+        if child_order_ids is not None:
+            if isinstance(child_order_ids, list):
+                child_ids_str = json.dumps([str(x) for x in child_order_ids])
+            else:
+                child_ids_str = json.dumps([str(child_order_ids)])
+
+        now_iso = datetime.now().isoformat() if status in ("TRIGGERED", "COMPLETE") else None
+
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            if status in ("TRIGGERED", "COMPLETE"):
+                cursor.execute(
+                    """
+                    UPDATE conditional_orders
+                    SET status = ?, triggered_at = COALESCE(triggered_at, ?), child_order_ids = COALESCE(?, child_order_ids), failure_reason = ?
+                    WHERE id = ?;
+                    """,
+                    (status, now_iso, child_ids_str, failure_reason, cond_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE conditional_orders
+                    SET status = ?, failure_reason = ?, child_order_ids = COALESCE(?, child_order_ids)
+                    WHERE id = ?;
+                    """,
+                    (status, failure_reason, child_ids_str, cond_id),
+                )
+            conn.commit()
+
+    def expire_old_conditional_orders(self, today_str: str) -> int:
+        """Expire all pending conditional orders from previous trading sessions."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE conditional_orders SET status = 'EXPIRED', failure_reason = 'Day ended / session rollover' WHERE trade_date != ? AND status = 'PENDING';",
+                (today_str,),
+            )
+            count = cursor.rowcount
+            conn.commit()
+            return count
+
+    def cancel_conditional_order(self, cond_id: int) -> bool:
+        """Cancel a specific pending conditional order by ID."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE conditional_orders SET status = 'CANCELLED', failure_reason = 'Cancelled by user' WHERE id = ? AND status = 'PENDING';",
+                (cond_id,),
+            )
+            count = cursor.rowcount
+            conn.commit()
+            return count > 0
+
+    def cancel_conditional_orders_by_parent(self, parent_order_id: str) -> list[int]:
+        """Cancel any pending conditional orders linked to a parent order ID."""
+        target_oid = str(parent_order_id).strip()
+        cancelled_ids = []
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, parent_order_ids FROM conditional_orders WHERE status = 'PENDING';"
+            )
+            rows = cursor.fetchall()
+            for r in rows:
+                cid = r["id"]
+                p_ids_raw = r["parent_order_ids"]
+                try:
+                    p_ids = json.loads(p_ids_raw)
+                except Exception:
+                    p_ids = [p_ids_raw]
+                if target_oid in [str(x) for x in p_ids]:
+                    cursor.execute(
+                        "UPDATE conditional_orders SET status = 'CANCELLED', failure_reason = 'Parent order cancelled' WHERE id = ?;",
+                        (cid,),
+                    )
+                    cancelled_ids.append(cid)
+            conn.commit()
+        return cancelled_ids

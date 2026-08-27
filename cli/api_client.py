@@ -636,3 +636,18 @@ class KCLIClient:
             return mgr.get_ltp_and_tokens(api_key, symbols)
         return {}
 
+    def get_market_depth(self, symbol: str) -> dict:
+        """Fetch 5-depth order book, OHLC, and market stats for a symbol."""
+        if hasattr(_kite_manager, "get_market_depth"):
+            res = _kite_manager.get_market_depth(symbol)
+            if res.get("status") == "success":
+                return res
+
+        for mgr in [_kotak_manager]:
+            if hasattr(mgr, "get_market_depth"):
+                res = mgr.get_market_depth(symbol)
+                if res.get("status") == "success":
+                    return res
+
+        return {"status": "error", "message": f"Market depth not available for symbol '{symbol}'"}
+

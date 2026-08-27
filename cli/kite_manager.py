@@ -1158,3 +1158,86 @@ class KiteAccountManager(BaseBrokerManager):
                 }
             return {"status": "error", "message": str(exc)}
 
+    def get_market_depth(self, symbol: str) -> dict[str, Any]:
+        """Fetch 5-depth order book, OHLC, volume, and statistics for a symbol."""
+        kite = None
+        for k in self.get_all_account_keys():
+            if self.is_authenticated(k):
+                kite = self._clients.get(k)
+                if kite:
+                    break
+        if not kite:
+            return {"status": "error", "message": "No authenticated Zerodha account available"}
+
+        clean_sym = symbol.strip().upper()
+        if ":" not in clean_sym:
+            if any(x in clean_sym for x in ["CE", "PE", "FUT"]):
+                pref_sym = f"NFO:{clean_sym}"
+            else:
+                pref_sym = f"NSE:{clean_sym}"
+        else:
+            pref_sym = clean_sym
+
+        try:
+            quote_res = kite.quote([pref_sym])
+            if not quote_res or pref_sym not in quote_res:
+                alt_sym = f"BSE:{clean_sym}" if pref_sym.startswith("NSE:") else (f"NSE:{clean_sym}" if pref_sym.startswith("BSE:") else pref_sym)
+                if alt_sym != pref_sym:
+                    quote_res = kite.quote([alt_sym])
+                    pref_sym = alt_sym
+
+            if not quote_res or pref_sym not in quote_res:
+                return {"status": "error", "message": f"Symbol {clean_sym} not found"}
+
+            q = quote_res[pref_sym]
+            depth = q.get("depth", {})
+            buy_depth = depth.get("buy", []) if isinstance(depth, dict) else []
+            sell_depth = depth.get("sell", []) if isinstance(depth, dict) else []
+            ohlc = q.get("ohlc", {}) if isinstance(q.get("ohlc"), dict) else {}
+
+            close_price = float(ohlc.get("close") or 0.0)
+            last_price = float(q.get("last_price") or 0.0)
+            net_change = float(q.get("net_change") or (last_price - close_price if close_price else 0.0))
+            change_pct = (net_change / close_price * 100) if close_price > 0 else 0.0
+
+            return {
+                "status": "success",
+                "symbol": clean_sym.split(":")[-1],
+                "instrument_token": q.get("instrument_token"),
+                "timestamp": str(q.get("timestamp") or ""),
+                "last_price": last_price,
+                "change": net_change,
+                "change_pct": change_pct,
+                "volume": int(q.get("volume") or 0),
+                "oi": int(q.get("oi") or 0),
+                "total_buy_quantity": int(q.get("buy_quantity") or sum(b.get("quantity", 0) for b in buy_depth)),
+                "total_sell_quantity": int(q.get("sell_quantity") or sum(s.get("quantity", 0) for s in sell_depth)),
+                "buy_depth": [
+                    {
+                        "price": float(b.get("price") or 0.0),
+                        "quantity": int(b.get("quantity") or 0),
+                        "orders": int(b.get("orders") or 0),
+                    }
+                    for b in buy_depth
+                ],
+                "sell_depth": [
+                    {
+                        "price": float(s.get("price") or 0.0),
+                        "quantity": int(s.get("quantity") or 0),
+                        "orders": int(s.get("orders") or 0),
+                    }
+                    for s in sell_depth
+                ],
+                "ohlc": {
+                    "open": float(ohlc.get("open") or 0.0),
+                    "high": float(ohlc.get("high") or 0.0),
+                    "low": float(ohlc.get("low") or 0.0),
+                    "close": close_price,
+                },
+                "lower_circuit_limit": float(q.get("lower_circuit_limit") or 0.0),
+                "upper_circuit_limit": float(q.get("upper_circuit_limit") or 0.0),
+            }
+        except Exception as exc:
+            logger.warning("Failed to fetch market depth for %s: %s", symbol, exc)
+            return {"status": "error", "message": str(exc)}
+

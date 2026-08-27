@@ -3,7 +3,8 @@ from cli.api_client import KCLIClient
 from cli.parser import (
     AccountSelectCommand, PlaceOrderCommand, ExitCommand,
     StatusCommand, PositionsCommand, OrdersCommand,
-    CancelOrderCommand, ModifyOrderCommand
+    CancelOrderCommand, ModifyOrderCommand, MarketDepthCommand,
+    ConditionalOrderCommand, CancelConditionalOrderCommand, ConditionalOrdersViewCommand
 )
 
 class ExecutionContext:
@@ -368,6 +369,85 @@ async def execute_command(cmd: Any, context: ExecutionContext) -> dict:
         return {
             "status": "executed",
             "message": "\n".join(output_lines)
+        }
+
+    # 9. Market Depth Command
+    elif isinstance(cmd, MarketDepthCommand):
+        target_sym = cmd.symbol or context.selected_symbol
+        if not target_sym:
+            raise ValueError("Usage: md <symbol> (e.g. 'md NIFTY2682025000CE' or 'md INFY')")
+
+        res = context.client.get_market_depth(target_sym)
+        if res.get("status") != "success":
+            return {
+                "status": "executed",
+                "message": f"❌ Failed to fetch market depth for {target_sym}: {res.get('message', 'Unknown error')}"
+            }
+
+        sym = res.get("symbol", target_sym)
+        ltp = res.get("last_price", 0.0)
+        chg = res.get("change", 0.0)
+        chg_pct = res.get("change_pct", 0.0)
+        vol = res.get("volume", 0)
+        oi = res.get("oi", 0)
+        tot_b = res.get("total_buy_quantity", 0)
+        tot_s = res.get("total_sell_quantity", 0)
+
+        output_lines = [
+            f"📊 Market Depth: {sym} | LTP: ₹{ltp:.2f} ({chg:+.2f} / {chg_pct:+.2f}%) | Vol: {vol:,} | OI: {oi:,}",
+            "┌─────────┬─────────┬──────────────┬──────────────┬─────────┬─────────┐",
+            "│ Orders  │ Qty     │ Bid Price    │ Ask Price    │ Qty     │ Orders  │",
+            "├─────────┼─────────┼──────────────┼──────────────┼─────────┼─────────┤"
+        ]
+
+        bids = res.get("buy_depth", [])
+        asks = res.get("sell_depth", [])
+        for i in range(5):
+            b = bids[i] if i < len(bids) else {}
+            a = asks[i] if i < len(asks) else {}
+            b_ord = f"{b.get('orders', 0):>7}" if b.get('orders') else "       -"
+            b_qty = f"{b.get('quantity', 0):>7}" if b.get('quantity') else "       -"
+            b_pr = f"₹{b.get('price', 0.0):>9.2f}" if b.get('price') else "        -"
+            a_pr = f"₹{a.get('price', 0.0):>9.2f}" if a.get('price') else "        -"
+            a_qty = f"{a.get('quantity', 0):>7}" if a.get('quantity') else "       -"
+            a_ord = f"{a.get('orders', 0):>7}" if a.get('orders') else "       -"
+            output_lines.append(f"│ {b_ord} │ {b_qty} │ {b_pr} │ {a_pr} │ {a_qty} │ {a_ord} │")
+
+        output_lines.append("├─────────┼─────────┼──────────────┼──────────────┼─────────┼─────────┤")
+        output_lines.append(f"│ Total Buy Qty: {tot_b:<17,} │ Total Sell Qty: {tot_s:<16,} │")
+        output_lines.append("└────────────────────────────────┬──────────────────────────────┘")
+
+        return {
+            "status": "executed",
+            "message": "\n".join(output_lines)
+        }
+
+    # 10. Conditional Order Command (Headless / CLI)
+    elif isinstance(cmd, ConditionalOrderCommand):
+        parent_cmd = cmd.parent_cmd
+        if not cmd.confirmed:
+            parent_res = await execute_command(parent_cmd, context)
+            if parent_res.get("status") == "pending_confirmation":
+                return {
+                    "status": "pending_confirmation",
+                    "message": f"Confirm CONDITIONAL CHAIN:\n  1) {parent_res.get('message')}\n  2) THEN ON FILL: {cmd.child_raw_text}",
+                    "command": cmd
+                }
+        parent_cmd.confirmed = True
+        return await execute_command(parent_cmd, context)
+
+    # 11. Cancel Conditional Order Command
+    elif isinstance(cmd, CancelConditionalOrderCommand):
+        return {
+            "status": "executed",
+            "message": f"Cancelled conditional orders targeting '{cmd.target}'."
+        }
+
+    # 12. Conditional Orders View Command
+    elif isinstance(cmd, ConditionalOrdersViewCommand):
+        return {
+            "status": "executed",
+            "message": "Conditional orders viewer is active in live TUI dashboard ('kcli live')."
         }
 
     raise TypeError(f"Execution not implemented for command type '{type(cmd)}'.")

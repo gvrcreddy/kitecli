@@ -11,6 +11,8 @@ MONTH_MAP = {
 MONTH_CODE_MAP = {
     "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6,
     "7": 7, "8": 8, "9": 9, "O": 10, "N": 11, "D": 12,
+    "01": 1, "02": 2, "03": 3, "04": 4, "05": 5, "06": 6,
+    "07": 7, "08": 8, "09": 9, "10": 10, "11": 11, "12": 12,
 }
 
 # Standard Normal Cumulative Distribution Function
@@ -45,8 +47,8 @@ def parse_nfo_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         exp_date = date(year, month, expiry_day)
         return {"underlying": underlying, "option_type": opt_type, "strike": strike, "expiry_date": exp_date}
 
-    # Pattern B: Weekly (e.g. NIFTY2672522500 -> YY=26, M=7, DD=25, STRIKE=22500)
-    m_weekly = re.match(r"^([A-Z]+)(\d{2})([1-9OND])(\d{2})(\d+(?:\.\d+)?)$", core)
+    # Pattern B: Weekly (e.g. NIFTY2672522500 -> YY=26, M=7, DD=25, STRIKE=22500, or NIFTY2690122800 -> YY=26, M=9, DD=01, STRIKE=22800)
+    m_weekly = re.match(r"^([A-Z]+)(\d{2})(0[1-9]|1[0-2]|[1-9OND])(\d{2})(\d+(?:\.\d+)?)$", core)
     if m_weekly:
         underlying, yy, m_code, dd_str, strike_str = m_weekly.groups()
         year = 2000 + int(yy)
@@ -67,6 +69,134 @@ def parse_nfo_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         return {"underlying": "NIFTY", "option_type": opt_type, "strike": strike, "expiry_date": exp_date}
 
     return None
+
+
+def get_position_expiry_info(pos: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract expiry date, strike, option type, and underlying from a position dict.
+
+    Returns a dict with:
+      - 'expiry_date': date object or None (for equity/non-expiring)
+      - 'underlying': str
+      - 'strike': float (0.0 for non-options)
+      - 'option_type': 'CE' | 'PE' | 'FUT' | 'EQ'
+      - 'is_option': bool
+      - 'is_future': bool
+    """
+    sym = str(pos.get("tradingsymbol", "")).strip().upper()
+
+    # 1. Check if pos has a direct expiry field
+    raw_exp = pos.get("expiry")
+    exp_date = None
+    if isinstance(raw_exp, date) and not isinstance(raw_exp, datetime):
+        exp_date = raw_exp
+    elif isinstance(raw_exp, datetime):
+        exp_date = raw_exp.date()
+    elif isinstance(raw_exp, str) and raw_exp:
+        try:
+            exp_date = datetime.strptime(raw_exp[:10], "%Y-%m-%d").date()
+        except Exception:
+            pass
+
+    # 2. If it's an option (ends with CE or PE)
+    if sym.endswith("CE") or sym.endswith("PE"):
+        parsed = parse_nfo_symbol(sym)
+        if parsed:
+            return {
+                "expiry_date": exp_date or parsed.get("expiry_date"),
+                "underlying": parsed.get("underlying", sym),
+                "strike": float(parsed.get("strike", 0.0)),
+                "option_type": parsed.get("option_type", "CE"),
+                "is_option": True,
+                "is_future": False,
+            }
+        opt_type = "PE" if sym.endswith("PE") else "CE"
+        return {
+            "expiry_date": exp_date,
+            "underlying": sym,
+            "strike": 0.0,
+            "option_type": opt_type,
+            "is_option": True,
+            "is_future": False,
+        }
+
+    # 3. If it's a future (ends with FUT)
+    if sym.endswith("FUT"):
+        m_fut = re.match(r"^([A-Z]+)(\d{2})([A-Z]{3})FUT$", sym)
+        if m_fut:
+            underlying, yy, mon_str = m_fut.groups()
+            year = 2000 + int(yy)
+            month = MONTH_MAP.get(mon_str, date.today().month)
+            cal = calendar.monthcalendar(year, month)
+            thursdays = [week[calendar.THURSDAY] for week in cal if week[calendar.THURSDAY] != 0]
+            expiry_day = thursdays[-1] if thursdays else 28
+            fut_exp = date(year, month, expiry_day)
+            return {
+                "expiry_date": exp_date or fut_exp,
+                "underlying": underlying,
+                "strike": 0.0,
+                "option_type": "FUT",
+                "is_option": False,
+                "is_future": True,
+            }
+        return {
+            "expiry_date": exp_date,
+            "underlying": sym,
+            "strike": 0.0,
+            "option_type": "FUT",
+            "is_option": False,
+            "is_future": True,
+        }
+
+    # 4. Equity / Other
+    return {
+        "expiry_date": exp_date,
+        "underlying": sym,
+        "strike": 0.0,
+        "option_type": "EQ",
+        "is_option": False,
+        "is_future": False,
+    }
+
+
+def format_expiry_header(exp_date: Optional[date], today: Optional[date] = None) -> tuple[str, str]:
+    """Return (title_label, dte_label).
+    e.g. ('28 AUG 2026', 'Today • 0 DTE') or ('04 SEP 2026', 'Next Week • 7 DTE') or ('EQUITY / OTHER', '')
+    """
+    if exp_date is None:
+        return "EQUITY / OTHER", ""
+
+    if today is None:
+        today = date.today()
+
+    dte = (exp_date - today).days
+    date_str = exp_date.strftime("%d %b %Y").upper()
+
+    if dte == 0:
+        dte_str = "Today • 0 DTE"
+    elif dte == 1:
+        dte_str = "Tomorrow • 1 DTE"
+    elif 2 <= dte <= 7:
+        dte_str = f"This Week • {dte} DTE"
+    elif 8 <= dte <= 14:
+        dte_str = f"Next Week • {dte} DTE"
+    elif dte > 14:
+        dte_str = f"{dte} DTE"
+    else:
+        dte_str = f"Expired ({abs(dte)}d ago)"
+
+    return date_str, dte_str
+
+
+def format_strike_display(info: Dict[str, Any]) -> str:
+    """Format human-readable strike/type string like '22800 PE', '51500 CE', 'FUT', 'EQ'."""
+    if info.get("is_option"):
+        strike = info.get("strike", 0.0)
+        strike_str = f"{int(strike)}" if strike == int(strike) else f"{strike:.1f}"
+        opt_type = info.get("option_type", "")
+        return f"{strike_str} {opt_type}"
+    elif info.get("is_future"):
+        return "FUT"
+    return "EQ"
 
 
 def implied_volatility(

@@ -1250,3 +1250,7 @@ class KotakTicker:
             }
         return {"status": "error", "message": "Kotak margin estimation unavailable"}
 
+    def get_market_depth(self, symbol: str) -> dict[str, Any]:
+        """Fetch market depth for Kotak Neo. Returns error if not directly available."""
+        return {"status": "error", "message": "Market depth via Kotak Neo SDK is not supported; delegated to primary Kite manager."}
+

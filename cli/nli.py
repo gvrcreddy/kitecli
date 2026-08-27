@@ -103,7 +103,7 @@ async def parse_natural_language(
         }
     }
     
-    prompt = json.dumps(context, indent=2)
+    prompt = json.dumps(context, indent=2, default=str)
     
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],

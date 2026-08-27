@@ -149,5 +149,181 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
         click_handler_pnl(mock_event)
         self.assertEqual(self.session.info_mode, "pnl")
 
+    @patch("cli.live_session.KCLILiveSession._update_info_buffer")
+    def test_md_tab_switching_and_rendering(self, mock_update_buffer):
+        fragments = self.session._get_tab_bar_text()
+        # Tab 6 is MD (index 11)
+        self.assertEqual(fragments[11][1], " MD ")
+        click_handler_md = fragments[11][2]
+
+        from prompt_toolkit.mouse_events import MouseEventType
+        mock_event = MagicMock()
+        mock_event.event_type = MouseEventType.MOUSE_UP
+
+        click_handler_md(mock_event)
+        self.assertEqual(self.session.info_mode, "md")
+
+        # Test empty symbol rendering
+        self.session.md_symbol = ""
+        rendered_empty = self.session._render_market_depth_pane()
+        self.assertIn("MARKET DEPTH", rendered_empty)
+        self.assertIn("No ticker symbol selected", rendered_empty)
+
+        # Test populated symbol rendering
+        self.session.md_symbol = "NIFTY2682025000CE"
+        self.client.get_market_depth.return_value = {
+            "status": "success",
+            "symbol": "NIFTY2682025000CE",
+            "last_price": 105.50,
+            "change": 4.50,
+            "change_pct": 4.45,
+            "volume": 1500000,
+            "oi": 2000000,
+            "total_buy_quantity": 50000,
+            "total_sell_quantity": 40000,
+            "buy_depth": [
+                {"orders": 5, "quantity": 500, "price": 105.45}
+            ],
+            "sell_depth": [
+                {"orders": 3, "quantity": 300, "price": 105.55}
+            ],
+            "ohlc": {"open": 101.0, "high": 108.0, "low": 100.0, "close": 101.0},
+            "lower_circuit_limit": 50.0,
+            "upper_circuit_limit": 160.0
+        }
+        rendered = self.session._render_market_depth_pane()
+        self.assertIn("NIFTY2682025000CE", rendered)
+        self.assertIn("BUY (BIDS)", rendered)
+        self.assertIn("SELL (ASKS)", rendered)
+        self.assertIn("105.45", rendered)
+        self.assertIn("105.55", rendered)
+
+    def test_orders_pane_live_ltp_display(self):
+        # Configure test response with open order
+        orders_resp = {
+            "accounts": [
+                {
+                    "name": "ZK8719",
+                    "status": "success",
+                    "orders": [
+                        {
+                            "order_id": "123456",
+                            "tradingsymbol": "NIFTY2682025000CE",
+                            "transaction_type": "BUY",
+                            "quantity": 100,
+                            "filled_quantity": 0,
+                            "order_type": "LIMIT",
+                            "price": 100.0,
+                            "product": "NRML",
+                            "status": "OPEN",
+                        }
+                    ]
+                }
+            ]
+        }
+        self.session.ws_symbol_ltp_cache["NIFTY2682025000CE"] = 105.25
+        rendered = self.session._render_orders_pane(orders_resp, "orders_pending")
+        self.assertIn("Placed Price", rendered)
+        self.assertIn("Live LTP", rendered)
+        self.assertIn("100.00", rendered)
+        self.assertIn("105.25", rendered)
+
+    def test_position_expiry_extraction_and_header(self):
+        from cli.greeks import get_position_expiry_info, format_expiry_header
+        import datetime
+
+        # Weekly option
+        p1 = {"tradingsymbol": "NIFTY2682824500CE"}
+        info1 = get_position_expiry_info(p1)
+        self.assertEqual(info1["expiry_date"], datetime.date(2026, 8, 28))
+        self.assertEqual(info1["strike"], 24500.0)
+        self.assertEqual(info1["option_type"], "CE")
+
+        # Monthly option
+        p2 = {"tradingsymbol": "NIFTY26JUL22500PE"}
+        info2 = get_position_expiry_info(p2)
+        self.assertEqual(info2["expiry_date"].month, 7)
+        self.assertEqual(info2["strike"], 22500.0)
+        self.assertEqual(info2["option_type"], "PE")
+
+        # Equity / Non-expiring
+        p3 = {"tradingsymbol": "INFY"}
+        info3 = get_position_expiry_info(p3)
+        self.assertIsNone(info3["expiry_date"])
+        self.assertEqual(info3["option_type"], "EQ")
+
+        # Header formatting
+        today = datetime.date(2026, 8, 28)
+        title, dte = format_expiry_header(datetime.date(2026, 8, 28), today=today)
+        self.assertEqual(title, "28 AUG 2026")
+        self.assertEqual(dte, "Today • 0 DTE")
+
+        title_eq, dte_eq = format_expiry_header(None, today=today)
+        self.assertEqual(title_eq, "EQUITY / OTHER")
+        self.assertEqual(dte_eq, "")
+
+        # Strike display formatting
+        from cli.greeks import format_strike_display
+        p_user = {"tradingsymbol": "NIFTY2690122800PE"}
+        info_user = get_position_expiry_info(p_user)
+        self.assertEqual(format_strike_display(info_user), "22800 PE")
+
+        self.assertEqual(format_strike_display(info1), "24500 CE")
+        self.assertEqual(format_strike_display(info2), "22500 PE")
+        self.assertEqual(format_strike_display(info3), "EQ")
+
+    def test_positions_rendered_expiry_wise(self):
+        from cli.display import render_positions_to_string
+        import datetime
+
+        accounts_data = [
+            {
+                "name": "Account1",
+                "api_key": "api_1",
+                "total_pnl": 2000.0,
+                "positions": [
+                    {
+                        "tradingsymbol": "NIFTY2690122800PE",
+                        "quantity": 50,
+                        "lot_size": 50,
+                        "average_price": 30.0,
+                        "last_price": 40.0,
+                        "pnl": 500.0,
+                    },
+                    {
+                        "tradingsymbol": "NIFTY2682824500CE",
+                        "quantity": 50,
+                        "lot_size": 50,
+                        "average_price": 10.0,
+                        "last_price": 40.0,
+                        "pnl": 1500.0,
+                    },
+                ]
+            }
+        ]
+
+        rendered = render_positions_to_string(accounts_data, width=100, show_indices=True)
+
+        # 28 AUG should come before 01 SEP chronologically
+        idx_28aug = rendered.find("28 AUG 2026")
+        idx_01sep = rendered.find("01 SEP 2026")
+        self.assertNotEqual(idx_28aug, -1)
+        self.assertNotEqual(idx_01sep, -1)
+        self.assertLess(idx_28aug, idx_01sep)
+
+        # Subtotals and values should be present
+        self.assertIn("+₹1,500.00", rendered)
+        self.assertIn("+₹500.00", rendered)
+
+        # Strike column should have human readable strikes
+        self.assertIn("Strike", rendered)
+        self.assertIn("24500 CE", rendered)
+        self.assertIn("22800 PE", rendered)
+
+        # Indices should be in chronological order
+        self.assertIn("[1] NIFTY2682824500CE", rendered)
+        self.assertIn("[2] NIFTY2690122800PE", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

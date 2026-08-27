@@ -29,7 +29,9 @@ from cli.display import render_positions_to_string
 from cli.recorder import DataRecorder
 from cli.parser import (
     parse_command_line, AccountSelectCommand, PlaceOrderCommand, ExitCommand,
-    StatusCommand, PositionsCommand, OrdersCommand, CancelOrderCommand, ModifyOrderCommand
+    StatusCommand, PositionsCommand, OrdersCommand, CancelOrderCommand, ModifyOrderCommand,
+    MarketDepthCommand, ConditionalOrderCommand, CancelConditionalOrderCommand,
+    ConditionalOrdersViewCommand
 )
 from cli.executor import ExecutionContext, resolve_symbol_or_id
 import json
@@ -404,15 +406,21 @@ class KCLILiveSession:
         except Exception as exc:
             logger.warning("Failed to load existing executed_order_context IDs: %s", exc)
 
+        # Conditional orders in-memory lookup: parent_order_id -> cond_dict
+        self.conditional_orders_map: dict[str, dict] = {}
+        self._init_conditional_orders()
+
         # Info pane state
-        # mode: "orders_pending" | "orders_executed" | "oc" | "advisor" | "pnl" | "help"
+        # mode: "orders_pending" | "orders_executed" | "oc" | "advisor" | "pnl" | "md" | "help"
         self.info_mode: str = "orders_pending"
         self.pnl_period: str = "month"  # "week" | "month" | "year"
+        self.md_symbol: str = ""
         self._last_oc_text: str = "Press F3 or run 'oc <UNDERLYING>' to fetch option chain."
         self._last_pending_text: str = "Fetching pending orders..."
         self._last_executed_text: str = "Fetching executed orders..."
         self._last_advisor_text: str = "Press F4 to view Tuesday Option Strangle Advisor plan."
         self._last_pnl_text: str = "Fetching P&L analytics..."
+        self._last_md_text: str = "Press F7 or run 'md <SYMBOL>' to fetch market depth."
         self._advisor_alerted_today: str | None = None
         self._last_advisor_time_check: float = 0.0
 
@@ -558,6 +566,27 @@ class KCLILiveSession:
         from functools import partial
         fn = partial(func, *args, **kwargs)
         return await loop.run_in_executor(None, fn)
+
+    def _run_coroutine_threadsafe(self, coro) -> None:
+        """Safely schedule a coroutine onto the main asyncio loop from any thread (e.g. Twisted WebSocket thread)."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(coro)
+        except RuntimeError:
+            target_loop = getattr(self, "_main_loop", None)
+            if not target_loop and hasattr(self, "app") and self.app and self.app.loop:
+                target_loop = self.app.loop
+            if target_loop and target_loop.is_running():
+                asyncio.run_coroutine_threadsafe(coro, target_loop)
+            else:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.run_coroutine_threadsafe(coro, loop)
+                    else:
+                        loop.create_task(coro)
+                except Exception as exc:
+                    logger.error("Failed to schedule coroutine threadsafe: %s", exc, exc_info=True)
 
     def update_prompt_label(self) -> None:
         """Update prompt label based on selected symbol and account contexts."""
@@ -1080,7 +1109,15 @@ class KCLILiveSession:
         ))
         fragments.append(("", " "))
 
-        # Tab 6: Help
+        # Tab 6: MD (Market Depth)
+        fragments.append((
+            "class:tab.active" if self.info_mode == "md" else "class:tab.inactive",
+            " MD ",
+            make_click_handler("md")
+        ))
+        fragments.append(("", " "))
+
+        # Tab 7: Help
         fragments.append((
             "class:tab.active" if self.info_mode == "help" else "class:tab.inactive",
             " Help ",
@@ -1440,6 +1477,11 @@ class KCLILiveSession:
                 user_id = self.api_key_to_user_id.get(api_key, "UNKNOWN")
                 self.recorder.enqueue_order(data, self.index_values, user_id)
                 self._handle_executed_order_context(api_key, data)
+
+            # Check and trigger any linked conditional orders
+            oid = str(data.get("order_id", "")).strip()
+            if oid and hasattr(self, "conditional_orders_map") and oid in self.conditional_orders_map:
+                self._check_conditional_triggers(oid, str(status or ""), int(filled or 0), data)
 
             # Trigger immediate refresh of positions and orders
             if hasattr(self, "app") and self.app and self.app.loop:
@@ -1811,13 +1853,35 @@ class KCLILiveSession:
                     self.last_positions_response = response
                     self._positions_version = getattr(self, "_positions_version", 0) + 1
 
+                    from cli.greeks import get_position_expiry_info
+
                     self.active_positions = []
                     self.position_id_map = {}
                     pos_idx = 1
                     new_tokens = set()
                     for acct in response.get("accounts", []):
-                        for pos in acct.get("positions", []):
-                            if pos.get("quantity", 0) != 0:
+                        acct_positions = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
+                        # Group by expiry
+                        groups = {}
+                        for pos in acct_positions:
+                            info = get_position_expiry_info(pos)
+                            exp_date = info.get("expiry_date")
+                            groups.setdefault(exp_date, []).append((info, pos))
+
+                        sorted_exp_keys = sorted([k for k in groups.keys() if k is not None])
+                        if None in groups:
+                            sorted_exp_keys.append(None)
+
+                        for exp_k in sorted_exp_keys:
+                            items = groups[exp_k]
+                            items.sort(
+                                key=lambda x: (
+                                    x[0].get("strike", 0.0),
+                                    0 if x[0].get("option_type") == "CE" else (1 if x[0].get("option_type") == "PE" else 2),
+                                    str(x[1].get("tradingsymbol", "")),
+                                )
+                            )
+                            for info, pos in items:
                                 pos["api_key"] = acct.get("api_key")
                                 pos["account_name"] = acct.get("name")
                                 # Annotate with lot size so the display layer can show lots.
@@ -1825,6 +1889,7 @@ class KCLILiveSession:
                                 lot_size = self.client.get_nfo_lot_sizes().get(sym, 1)
                                 pos["lot_size"] = lot_size
                                 pos["lots"] = pos.get("quantity", 0) / lot_size
+                                pos["expiry_date"] = exp_k.isoformat() if exp_k else None
                                 self.active_positions.append(pos)
                                 self.position_id_map[pos_idx] = pos
                                 pos_idx += 1
@@ -1877,6 +1942,16 @@ class KCLILiveSession:
                             for ord_item in acct.get("orders", []):
                                 if str(ord_item.get("status", "")).upper() == "COMPLETE":
                                     self._handle_executed_order_context(key, ord_item)
+
+                    # Trigger conditional orders returned via REST
+                    if hasattr(self, "conditional_orders_map") and self.conditional_orders_map:
+                        for acct in orders_resp.get("accounts", []):
+                            for ord_item in acct.get("orders", []):
+                                oid = str(ord_item.get("order_id", "")).strip()
+                                st = str(ord_item.get("status", "")).upper()
+                                filled = int(ord_item.get("filled_quantity", 0))
+                                if oid in self.conditional_orders_map:
+                                    self._check_conditional_triggers(oid, st, filled, ord_item)
 
                 # Indices REST snapshot (WebSocket ticks keep these live thereafter).
                 try:
@@ -2245,7 +2320,14 @@ class KCLILiveSession:
             return
 
         status = str(data.get("status", "")).upper()
-        filled_qty = int(data.get("filled_quantity") or data.get("quantity") or 0)
+        raw_filled = data.get("filled_quantity")
+        if raw_filled is not None and int(raw_filled) > 0:
+            filled_qty = int(raw_filled)
+        elif status == "COMPLETE":
+            filled_qty = int(data.get("quantity") or 0)
+        else:
+            filled_qty = 0
+
         if status != "COMPLETE" and filled_qty == 0:
             return
 
@@ -2256,10 +2338,18 @@ class KCLILiveSession:
 
         recorded_dict = getattr(self, "_executed_order_ids_recorded_dict", {})
         last_recorded_qty = recorded_dict.get(order_id, 0)
-        if filled_qty <= last_recorded_qty and order_id in recorded_dict:
+        last_status = getattr(self, "_executed_order_status_dict", {}).get(order_id, "")
+
+        if filled_qty <= last_recorded_qty and order_id in recorded_dict and last_status == status:
             return
+
         recorded_dict[order_id] = filled_qty
         self._executed_order_ids_recorded_dict = recorded_dict
+
+        if not hasattr(self, "_executed_order_status_dict"):
+            self._executed_order_status_dict = {}
+        self._executed_order_status_dict[order_id] = status
+
         executed_set = getattr(self, "_executed_order_ids_recorded", set())
         executed_set.add(order_id)
         self._executed_order_ids_recorded = executed_set
@@ -2343,6 +2433,329 @@ class KCLILiveSession:
                 charges=chg_dict,
                 pos_intent=pos_intent,
             )
+
+    def _init_conditional_orders(self) -> None:
+        """Re-hydrate active pending conditional orders from SQLite and expire previous sessions."""
+        if not getattr(self, "recorder", None):
+            return
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            # 1. Expire orders from previous trading sessions
+            expired_cnt = self.recorder.expire_old_conditional_orders(today_str)
+            if expired_cnt > 0:
+                logger.info("Expired %d stale conditional order(s) from previous days.", expired_cnt)
+
+            # 2. Re-hydrate pending conditional orders for today
+            pending = self.recorder.get_pending_conditional_orders(today_str)
+            for cond in pending:
+                p_ids = cond.get("parent_order_ids", [])
+                for oid in p_ids:
+                    self.conditional_orders_map[str(oid)] = cond
+            if pending:
+                logger.info("Re-hydrated %d active conditional order(s) for today.", len(pending))
+        except Exception as exc:
+            logger.warning("Failed to initialize conditional orders: %s", exc)
+
+    def _check_conditional_triggers(self, order_id: str, status: str, filled_qty: int = 0, ord_data: dict | None = None) -> None:
+        """Check if an order update completes or cancels any pending conditional child orders."""
+        oid = str(order_id).strip()
+        if not oid or not hasattr(self, "conditional_orders_map") or oid not in self.conditional_orders_map:
+            return
+
+        cond = self.conditional_orders_map[oid]
+        if cond.get("status") != "PENDING":
+            return
+
+        status_upper = str(status).upper()
+        p_ids = [str(x) for x in cond.get("parent_order_ids", [])]
+
+        if status_upper == "COMPLETE":
+            completed_legs = cond.setdefault("_completed_legs", set())
+            completed_legs.add(oid)
+
+            # Trigger only when all parent legs are complete (if parent was sliced across multiple orders)
+            if all(p in completed_legs for p in p_ids):
+                cond["status"] = "TRIGGERED"
+                cond_id = cond.get("id")
+
+                # Update SQLite status
+                if getattr(self, "recorder", None) and cond_id:
+                    self.recorder.update_conditional_order_status(cond_id, "TRIGGERED")
+
+                # Remove from active watch map
+                for p in p_ids:
+                    self.conditional_orders_map.pop(p, None)
+
+                # Prepare child order execution
+                child_action = str(cond.get("child_action", "SELL")).upper()
+                child_symbol = cond.get("child_symbol") or cond.get("parent_symbol")
+                child_qty_raw = cond.get("child_qty") or str(cond.get("parent_qty", 1))
+                child_price = cond.get("child_price")
+                child_product = cond.get("child_product", "NRML")
+                acct_key = cond.get("account_key")
+                target_keys = [acct_key] if (acct_key and acct_key != "ALL") else []
+
+                self.log_message(
+                    f"[#00ff00]⚡ CONDITIONAL TRIGGERED:[/#] Parent order {oid} is COMPLETE. "
+                    f"Placing secondary order: [bold]{cond.get('child_command_raw')}[/bold]..."
+                )
+
+                if child_action == "EXIT":
+                    self._run_coroutine_threadsafe(
+                        self.execute_exit(
+                            child_symbol,
+                            api_keys=target_keys,
+                            price=child_price,
+                        )
+                    )
+                else:
+                    self._run_coroutine_threadsafe(
+                        self.execute_order(
+                            child_symbol,
+                            child_action,
+                            str(child_qty_raw),
+                            str(child_price) if child_price else None,
+                            child_product,
+                            api_keys=target_keys,
+                        )
+                    )
+
+                if hasattr(self, "app") and self.app and self.app.loop:
+                    asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+
+        elif status_upper in ("CANCELLED", "REJECTED"):
+            cond["status"] = "CANCELLED"
+            cond_id = cond.get("id")
+            if getattr(self, "recorder", None) and cond_id:
+                self.recorder.update_conditional_order_status(
+                    cond_id,
+                    "CANCELLED",
+                    failure_reason=f"Parent order {oid} was {status_upper}",
+                )
+
+            for p in p_ids:
+                self.conditional_orders_map.pop(p, None)
+
+            self.log_message(
+                f"[#ff5555]⚠️ CONDITIONAL CANCELLED:[/#] Parent order {oid} was {status_upper}. "
+                f"Child order '{cond.get('child_command_raw')}' will not execute."
+            )
+            if hasattr(self, "app") and self.app and self.app.loop:
+                asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+
+    async def execute_conditional_order(self, cond_cmd: ConditionalOrderCommand, api_keys: list[str] = []) -> None:
+        """Place primary order and register secondary conditional order in SQLite upon success."""
+        parent_cmd = cond_cmd.parent_cmd
+        child_cmd = cond_cmd.child_cmd
+        child_raw = cond_cmd.child_raw_text
+
+        # 1. Resolve parent symbol & target keys
+        if isinstance(parent_cmd, PlaceOrderCommand):
+            symbol = parent_cmd.symbol_or_id
+            if symbol:
+                if symbol.isdigit():
+                    symbol, api_keys = resolve_symbol_or_id(
+                        ExecutionContext(self.client, self.active_positions, self.position_id_map, self.selected_symbol, self.selected_account_api_key or "ALL"),
+                        symbol
+                    )
+                else:
+                    symbol = symbol.upper()
+            else:
+                if not self.selected_symbol:
+                    self.log_message("[#ff0000]Error:[/#] No symbol specified for primary order.")
+                    return
+                symbol = self.selected_symbol
+                if not api_keys and self.selected_account_api_key:
+                    api_keys = [self.selected_account_api_key]
+
+            price = parent_cmd.price
+            order_type = "LIMIT" if price else "MARKET"
+            product = parent_cmd.product or "NRML"
+            exchange = "NFO" if (symbol.endswith("CE") or symbol.endswith("PE") or any(symbol.endswith(e) for e in ("FUT", "CE", "PE"))) else "NSE"
+            if exchange == "NSE" and product.upper() == "NRML":
+                product = "CNC"
+
+            target_keys = api_keys or [a.get("api_key") for a in self.accounts if a.get("api_key")]
+
+            # Resolve per-account quantity if omitted
+            account_orders = []
+            if not parent_cmd.quantity:
+                for k in target_keys:
+                    pos = next((p for p in self.active_positions if p.get("tradingsymbol") == symbol and p.get("api_key") == k and p.get("quantity", 0) != 0), None)
+                    if not pos:
+                        pos = next((p for p in self.active_positions if p.get("tradingsymbol") == symbol and p.get("quantity", 0) != 0), None)
+                    if not pos:
+                        continue
+                    account_orders.append((k, abs(pos.get("quantity", 0))))
+                if not account_orders:
+                    self.log_message("[#ff0000]Error:[/#] Omitted quantity for primary order, but no matching open position found.")
+                    return
+            else:
+                qty_val, qty_display, qty_err = self._resolve_qty(parent_cmd.quantity, symbol)
+                if qty_err:
+                    self.log_message(f"[#ff0000]Error in primary order:[/#] {qty_err}")
+                    return
+                for k in target_keys:
+                    account_orders.append((k, int(qty_val)))
+
+            # Execute parent orders
+            results = []
+            for k, q_int in account_orders:
+                name = self._get_account_name(k)
+                self.log_message(f"Placing primary {order_type} {parent_cmd.action} order for {q_int} {symbol} on account {name}...")
+                try:
+                    res = await self._run_api_call(
+                        self.client.place_order,
+                        api_keys=[k],
+                        tradingsymbol=symbol,
+                        exchange=exchange,
+                        transaction_type=parent_cmd.action.upper(),
+                        quantity=q_int,
+                        order_type=order_type,
+                        price=price,
+                        product=product.upper(),
+                    )
+                    for item in res.get("results", []):
+                        item["placed_qty"] = q_int
+                        results.append(item)
+                except Exception as exc:
+                    self.log_message(f"[#ff0000]Primary Order Execution Failed for {name}:[/#] {exc}")
+
+        elif isinstance(parent_cmd, ExitCommand):
+            raw_target = parent_cmd.target
+            if raw_target.isdigit():
+                symbol, api_keys = resolve_symbol_or_id(
+                    ExecutionContext(self.client, self.active_positions, self.position_id_map, self.selected_symbol, self.selected_account_api_key or "ALL"),
+                    raw_target
+                )
+            elif raw_target.lower() == "selected":
+                symbol = self.selected_symbol
+                if not symbol:
+                    self.log_message("[#ff0000]Error:[/#] No position selected to exit.")
+                    return
+            else:
+                symbol = raw_target.upper()
+
+            price = parent_cmd.price
+            price_desc = f" @{price:.2f}" if price is not None else ""
+            self.log_message(f"Exiting open positions for {symbol} across target accounts{price_desc}...")
+            try:
+                response = await self._run_api_call(
+                    self.client.exit_positions,
+                    api_keys=api_keys,
+                    tradingsymbol=symbol,
+                    price=price,
+                )
+            except Exception as exc:
+                self.log_message(f"[#ff0000]Exit Execution Failed:[/#] {exc}")
+                return
+
+            results = []
+            for res_item in response.get("results", []):
+                for placed_pos in res_item.get("orders_placed", []):
+                    results.append({
+                        "name": res_item.get("name"),
+                        "api_key": res_item.get("api_key"),
+                        "status": "success",
+                        "order_id": placed_pos.get("order_id"),
+                        "placed_qty": abs(placed_pos.get("quantity", 0)),
+                        "tradingsymbol": placed_pos.get("tradingsymbol", symbol),
+                    })
+
+        else:
+            self.log_message(f"[#ff0000]Unsupported primary command:[/#] {type(parent_cmd)}")
+            return
+
+        has_success = False
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        # Determine child details
+        child_action = "SELL"
+        child_sym = symbol
+        child_pr = None
+        child_prod = "NRML"
+
+        if isinstance(child_cmd, PlaceOrderCommand):
+            child_action = child_cmd.action.upper()
+            child_sym = child_cmd.symbol_or_id or symbol
+            child_pr = child_cmd.price
+            child_prod = child_cmd.product or "NRML"
+        elif isinstance(child_cmd, ExitCommand):
+            child_action = "EXIT"
+            child_sym = child_cmd.target if child_cmd.target != "selected" else symbol
+            child_pr = child_cmd.price
+
+        for res in results:
+            name = res.get("name", "Unknown")
+            status = res.get("status", "error")
+            msg = res.get("message", "")
+            ord_id = res.get("order_id")
+            api_k = res.get("api_key")
+            u_id = self.api_key_to_user_id.get(api_k, "UNKNOWN") if api_k else "UNKNOWN"
+            p_qty = res.get("placed_qty", 0)
+
+            # Child quantity: if child has explicit qty, resolve it; otherwise match parent's placed_qty!
+            if isinstance(child_cmd, PlaceOrderCommand) and child_cmd.quantity:
+                c_qty_val, _, _ = self._resolve_qty(child_cmd.quantity, child_sym)
+                child_q = str(c_qty_val)
+            else:
+                child_q = str(p_qty)
+
+            if status == "success" and ord_id:
+                has_success = True
+                leg_ids = [str(x).strip() for x in str(ord_id).split(",") if str(x).strip()]
+                self.log_message(f"[#00ff00]✓ {name}:[/#] Primary placed ({p_qty} qty). ID(s): {', '.join(leg_ids)}")
+
+                # Persist conditional order to SQLite
+                cond_id = self.recorder.save_conditional_order(
+                    trade_date=today_str,
+                    parent_order_ids=leg_ids,
+                    parent_symbol=symbol,
+                    parent_action=getattr(parent_cmd, "action", "EXIT").upper(),
+                    parent_qty=p_qty,
+                    parent_price=getattr(parent_cmd, "price", None),
+                    child_command_raw=child_raw,
+                    child_action=child_action,
+                    child_symbol=child_sym,
+                    child_qty=child_q,
+                    child_price=child_pr,
+                    child_product=child_prod,
+                    user_id=u_id,
+                    account_key=api_k,
+                    account_name=name,
+                )
+
+                # Add to in-memory watch map
+                cond_entry = {
+                    "id": cond_id,
+                    "trade_date": today_str,
+                    "parent_order_ids": leg_ids,
+                    "parent_symbol": symbol,
+                    "parent_action": getattr(parent_cmd, "action", "EXIT").upper(),
+                    "parent_qty": p_qty,
+                    "child_command_raw": child_raw,
+                    "child_action": child_action,
+                    "child_symbol": child_sym,
+                    "child_qty": child_q,
+                    "child_price": child_pr,
+                    "child_product": child_prod,
+                    "status": "PENDING",
+                    "account_key": api_k,
+                    "account_name": name,
+                }
+                for leg_id in leg_ids:
+                    self.conditional_orders_map[leg_id] = cond_entry
+
+                self.log_message(
+                    f"[#00e5ff]⏳ Conditional Order #{cond_id} Registered [@{name}]:[/#] "
+                    f"Will automatically execute '{child_action} {child_q} {child_sym}' once primary Order {', '.join(leg_ids)} is COMPLETE."
+                )
+            else:
+                self.log_message(f"[#ff0000]✗ {name}:[/#] Primary failed — {msg}")
+
+        if has_success:
+            if hasattr(self, "app") and self.app and self.app.loop:
+                asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
 
     def _resolve_qty(self, qty_arg: str, symbol: str | None) -> tuple[str, str, str | None]:
         """Resolve a quantity argument that may use the lot suffix (e.g. '2L').
@@ -2575,6 +2988,14 @@ class KCLILiveSession:
             msg = response.get("message", "")
             if status == "success":
                 self.log_message(f"[#00ff00]✓ Order cancelled successfully.[/#] ID: {order_id}")
+                # Also cancel any attached conditional orders
+                if hasattr(self, "recorder") and self.recorder:
+                    cancelled_cos = self.recorder.cancel_conditional_orders_by_parent(order_id)
+                    if cancelled_cos:
+                        to_del = [k for k, v in getattr(self, "conditional_orders_map", {}).items() if v.get("id") in cancelled_cos]
+                        for k in to_del:
+                            self.conditional_orders_map.pop(k, None)
+                        self.log_message(f"[#ff8700]Cancelled linked conditional order(s): {', '.join(f'#{x}' for x in cancelled_cos)}[/#]")
                 # Clear order selection after successful cancellation
                 if self.selected_order and self.selected_order.get("order_id") == order_id:
                     self.selected_order = None
@@ -2592,7 +3013,10 @@ class KCLILiveSession:
         if not getattr(self, "recorder", None):
             return
         user_id = self.api_key_to_user_id.get(api_key) if api_key else None
-        parsed_str = json.dumps(action) if isinstance(action, dict) else str(action)
+        try:
+            parsed_str = json.dumps(action, default=str) if isinstance(action, dict) else str(action)
+        except Exception:
+            parsed_str = str(action)
         self.recorder.enqueue_command(
             command_text=cmd_text,
             parsed_action=parsed_str,
@@ -2620,6 +3044,34 @@ class KCLILiveSession:
         commands = [c.strip() for c in raw_text.split("&&") if c.strip()]
         for cmd in commands:
             self._execute_single_command(cmd)
+
+    def _extract_custom_dates_from_cmd(self, cmd_text: str) -> list[str]:
+        """Extract and parse date tokens into ISO YYYY-MM-DD strings supporting DDMMYYYY, DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD."""
+        import re
+        tokens = re.findall(r"\b\d{8}\b|\b\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4}\b|\b\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}\b", cmd_text)
+        parsed = []
+        for t in tokens:
+            s = t.strip()
+            if len(s) == 8 and s.isdigit():
+                day, month, year = int(s[:2]), int(s[2:4]), int(s[4:])
+                try:
+                    parsed.append(datetime(year, month, day).strftime("%Y-%m-%d"))
+                    continue
+                except ValueError:
+                    pass
+            formats = [
+                "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+                "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+                "%d-%b-%Y", "%d %b %Y"
+            ]
+            for fmt in formats:
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    parsed.append(dt.strftime("%Y-%m-%d"))
+                    break
+                except ValueError:
+                    pass
+        return parsed
 
     def _execute_single_command(self, cmd: str) -> None:
         """Process a single command line."""
@@ -2694,6 +3146,13 @@ class KCLILiveSession:
                                 self._execute_single_command(sub_cmd)
                     finally:
                         self._skip_confirmation = False
+                elif p["type"] == "conditional":
+                    asyncio.create_task(
+                        self.execute_conditional_order(
+                            p["cmd"],
+                            api_keys=p.get("api_keys", []),
+                        )
+                    )
                 else:
                     asyncio.create_task(
                         self.execute_order(
@@ -2747,22 +3206,30 @@ class KCLILiveSession:
             return
         elif cmd_norm in ("pnl", "pl", "5", "/5", "/pnl") or cmd_norm.startswith("pnl ") or cmd_norm.startswith("pl "):
             self.info_mode = "pnl"
-            if "week" in cmd_norm or " w" in cmd_norm or cmd_norm == "pnl w":
+            dates = self._extract_custom_dates_from_cmd(cmd)
+            if dates:
+                self.pnl_period = "custom"
+                self.pnl_custom_start = dates[0]
+                self.pnl_custom_end = dates[1] if len(dates) >= 2 else dates[0]
+            elif "week" in cmd_norm or " w" in cmd_norm or cmd_norm == "pnl w":
                 self.pnl_period = "week"
             elif "year" in cmd_norm or " y" in cmd_norm or cmd_norm == "pnl y":
                 self.pnl_period = "year"
             elif "month" in cmd_norm or " m" in cmd_norm or cmd_norm == "pnl m":
                 self.pnl_period = "month"
+            elif "custom" in cmd_norm or " c" in cmd_norm or cmd_norm == "pnl c":
+                self.pnl_period = "custom"
             self._update_info_buffer()
             if hasattr(self, "app") and self.app:
                 self.app.invalidate()
             self.log_message(f"Switched info pane to [bold]P&L Analytics ({getattr(self, 'pnl_period', 'month').title()})[/bold].")
             return
-        elif self.info_mode == "pnl" and cmd_norm in ("w", "m", "y", "week", "month", "year", "1", "2", "3"):
+        elif self.info_mode == "pnl" and cmd_norm in ("w", "m", "y", "c", "week", "month", "year", "custom", "1", "2", "3", "4"):
             period_map = {
                 "w": "week", "week": "week", "1": "week",
                 "m": "month", "month": "month", "2": "month",
-                "y": "year", "year": "year", "3": "year"
+                "y": "year", "year": "year", "3": "year",
+                "c": "custom", "custom": "custom", "4": "custom",
             }
             self.pnl_period = period_map[cmd_norm]
             self._update_info_buffer()
@@ -2770,7 +3237,35 @@ class KCLILiveSession:
                 self.app.invalidate()
             self.log_message(f"P&L period switched to [bold]{self.pnl_period.title()}[/bold].")
             return
-        elif cmd_norm in ("help", "h", "6", "/6", "/help"):
+        elif self.info_mode == "pnl":
+            dates = self._extract_custom_dates_from_cmd(cmd)
+            if dates:
+                self.pnl_period = "custom"
+                self.pnl_custom_start = dates[0]
+                self.pnl_custom_end = dates[1] if len(dates) >= 2 else dates[0]
+                self._update_info_buffer()
+                if hasattr(self, "app") and self.app:
+                    self.app.invalidate()
+                self.log_message(f"P&L custom date range set to [bold]{self.pnl_custom_start} -> {self.pnl_custom_end}[/bold].")
+                return
+        elif cmd_norm in ("md", "depth", "marketdepth", "6", "/6", "/md") or cmd_norm.startswith("md ") or cmd_norm.startswith("depth ") or cmd_norm.startswith("marketdepth "):
+            parts = cmd.strip().split()
+            if len(parts) >= 2:
+                self.md_symbol = parts[1].strip().upper()
+            self.info_mode = "md"
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message(f"Switched info pane to [bold]Market Depth ({getattr(self, 'md_symbol', 'None')})[/bold].")
+            return
+        elif self.info_mode == "md" and not cmd_norm.startswith("/") and " " not in cmd.strip() and len(cmd.strip()) >= 2 and not cmd_norm.isdigit() and cmd_norm not in ("q", "quit", "exit", "help", "h"):
+            self.md_symbol = cmd.strip().upper()
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message(f"Market Depth symbol set to [bold]{self.md_symbol}[/bold].")
+            return
+        elif cmd_norm in ("help", "h", "7", "/7", "/help"):
             self.info_mode = "help"
             self._update_info_buffer()
             if hasattr(self, "app") and self.app:
@@ -2782,9 +3277,18 @@ class KCLILiveSession:
         try:
             parsed_cmds = parse_command_line(cmd)
             # If parsed commands match trading/API targets, handle them
-            if parsed_cmds and any(isinstance(pc, (AccountSelectCommand, PlaceOrderCommand, ExitCommand, CancelOrderCommand, ModifyOrderCommand, StatusCommand, PositionsCommand, OrdersCommand)) for pc in parsed_cmds):
+            if parsed_cmds and any(isinstance(pc, (AccountSelectCommand, PlaceOrderCommand, ExitCommand, CancelOrderCommand, ModifyOrderCommand, StatusCommand, PositionsCommand, OrdersCommand, MarketDepthCommand, ConditionalOrderCommand, CancelConditionalOrderCommand, ConditionalOrdersViewCommand)) for pc in parsed_cmds):
                 for parsed in parsed_cmds:
-                    if isinstance(parsed, AccountSelectCommand):
+                    if isinstance(parsed, MarketDepthCommand):
+                        if parsed.symbol:
+                            self.md_symbol = parsed.symbol.upper()
+                        self.info_mode = "md"
+                        self._update_info_buffer()
+                        if hasattr(self, "app") and self.app:
+                            self.app.invalidate()
+                        self.log_message(f"Switched info pane to [bold]Market Depth ({getattr(self, 'md_symbol', 'None')})[/bold].")
+                        continue
+                    elif isinstance(parsed, AccountSelectCommand):
                         raw_acc = parsed.account_name
                         if raw_acc.lower() in ("none", "clear", "null", "empty", "all"):
                             self.selected_account_name = None
@@ -3095,6 +3599,121 @@ class KCLILiveSession:
                                     )
                         if not found_any:
                             self.log_message("  No pending orders.")
+                        continue
+
+                    elif isinstance(parsed, ConditionalOrderCommand):
+                        parent_cmd = parsed.parent_cmd
+                        child_cmd = parsed.child_cmd
+                        api_keys = [self.selected_account_api_key] if self.selected_account_api_key else []
+
+                        # Validate parent order
+                        if isinstance(parent_cmd, PlaceOrderCommand):
+                            sym = parent_cmd.symbol_or_id
+                            if sym:
+                                if sym.isdigit():
+                                    sym, api_keys = resolve_symbol_or_id(ExecutionContext(self.client, self.active_positions, self.position_id_map, self.selected_symbol, self.selected_account_api_key or "ALL"), sym)
+                                else:
+                                    sym = sym.upper()
+                            else:
+                                if not self.selected_symbol:
+                                    self.log_message("[#ff0000]Error:[/#] No symbol specified and no active selection.")
+                                    continue
+                                sym = self.selected_symbol
+                                if not api_keys and self.selected_account_api_key:
+                                    api_keys = [self.selected_account_api_key]
+
+                            if not parent_cmd.quantity:
+                                matched_pos = None
+                                for pos_item in self.active_positions:
+                                    if pos_item.get("tradingsymbol") == sym and (not api_keys or pos_item.get("api_key") in api_keys):
+                                        matched_pos = pos_item
+                                        break
+                                if not matched_pos:
+                                    self.log_message("[#ff0000]Error:[/#] Omitted quantity for primary order, but no matching position found.")
+                                    continue
+                                p_qty_val = abs(matched_pos.get("quantity", 0))
+                                p_qty_disp = str(p_qty_val)
+                            else:
+                                p_qty_val, p_qty_disp, p_qty_err = self._resolve_qty(parent_cmd.quantity, sym)
+                                if p_qty_err:
+                                    self.log_message(f"[#ff0000]Error in primary order:[/#] {p_qty_err}")
+                                    continue
+
+                            parent_price_desc = f"@{parent_cmd.price:.2f}" if parent_cmd.price else "MARKET"
+                            parent_desc = f"{parent_cmd.action} {p_qty_disp} {sym} ({parent_cmd.product}) {parent_price_desc}"
+                        else:
+                            parent_desc = f"EXIT {parent_cmd.target}"
+
+                        child_desc = parsed.child_raw_text
+
+                        if getattr(self, "_skip_confirmation", False):
+                            asyncio.create_task(
+                                self.execute_conditional_order(parsed, api_keys=api_keys)
+                            )
+                            continue
+
+                        self.pending_order = {
+                            "type": "conditional",
+                            "cmd": parsed,
+                            "api_keys": api_keys,
+                        }
+                        self._log_command(
+                            cmd_text=cmd,
+                            action=self.pending_order,
+                            status="pending_confirmation",
+                            api_key=api_keys[0] if api_keys else None,
+                        )
+                        self.prompt_control.text = f" Confirm CONDITIONAL: 1) {parent_desc} THEN 2) {child_desc}? (y/n)> "
+                        self.log_message(
+                            f"[#ff8700]Pending Confirmation (Conditional Chain):[/#]\n"
+                            f"  1) {parent_desc}\n"
+                            f"  THEN once filled:\n"
+                            f"  2) {child_desc}\n"
+                            f"Press [bold]y[/bold] to confirm."
+                        )
+                        continue
+
+                    elif isinstance(parsed, CancelConditionalOrderCommand):
+                        target = parsed.target
+                        if target.lower() == "all":
+                            today_str = datetime.now().strftime("%Y-%m-%d")
+                            with self.recorder.get_connection() as conn:
+                                conn.execute("UPDATE conditional_orders SET status = 'CANCELLED', failure_reason = 'Cancelled by user' WHERE trade_date = ? AND status = 'PENDING';", (today_str,))
+                                conn.commit()
+                            self.conditional_orders_map.clear()
+                            self.log_message("[#00ff00]✓ Cancelled all active conditional orders for today.[/#]")
+                        else:
+                            try:
+                                cid = int(target)
+                                ok = self.recorder.cancel_conditional_order(cid)
+                                if ok:
+                                    to_remove = [k for k, v in self.conditional_orders_map.items() if v.get("id") == cid]
+                                    for k in to_remove:
+                                        self.conditional_orders_map.pop(k, None)
+                                    self.log_message(f"[#00ff00]✓ Cancelled conditional order #{cid}.[/#]")
+                                else:
+                                    self.log_message(f"[#ff8700]No pending conditional order found with ID #{cid}.[/#]")
+                            except ValueError:
+                                self.log_message(f"[#ff0000]Error:[/#] Invalid conditional order ID '{target}'. Usage: cancel co <id|all>")
+                        if hasattr(self, "app") and self.app and self.app.loop:
+                            asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+                        continue
+
+                    elif isinstance(parsed, ConditionalOrdersViewCommand):
+                        today_str = datetime.now().strftime("%Y-%m-%d")
+                        all_co = self.recorder.get_all_conditional_orders_today(today_str)
+                        if not all_co:
+                            self.log_message("[#58a6ff]Conditional Orders:[/#] No conditional orders recorded for today.")
+                        else:
+                            self.log_message(f"[#58a6ff]Conditional Orders Today ({len(all_co)}):[/#]")
+                            for co_item in all_co:
+                                cid = co_item.get("id")
+                                p_ids = ", ".join(str(x) for x in co_item.get("parent_order_ids", []))
+                                p_sym = co_item.get("parent_symbol", "")
+                                p_act = co_item.get("parent_action", "")
+                                c_raw = co_item.get("child_command_raw", "")
+                                st = co_item.get("status", "")
+                                self.log_message(f"  • [bold]#{cid}[/bold] | Parent: {p_act} {p_sym} (IDs: {p_ids}) -> Child: '{c_raw}' | Status: [bold]{st}[/bold]")
                         continue
                 return
         except Exception:
@@ -4289,6 +4908,30 @@ class KCLILiveSession:
         self.log_message(f"[#d787ff]Pending Translation:[/#] \"{translated_cmd}\" ({explanation}, conf={confidence:.2f}). Press [bold]y[/bold] to confirm.")
 
 
+    def get_symbol_ltp(self, symbol: str) -> float | None:
+        """Look up current LTP for a symbol from WebSocket caches or positions."""
+        if not symbol:
+            return None
+        sym_clean = symbol.strip().upper()
+        if hasattr(self, "ws_symbol_ltp_cache") and sym_clean in self.ws_symbol_ltp_cache:
+            return float(self.ws_symbol_ltp_cache[sym_clean])
+        for p in getattr(self, "active_positions", []):
+            if p.get("tradingsymbol", "").upper() == sym_clean and p.get("last_price"):
+                return float(p["last_price"])
+        resp = getattr(self, "last_positions_response", None)
+        if resp:
+            for acct in resp.get("accounts", []):
+                for p in acct.get("positions", []):
+                    if p.get("tradingsymbol", "").upper() == sym_clean and p.get("last_price"):
+                        return float(p["last_price"])
+        if hasattr(self, "oc_data") and self.oc_data:
+            for s in self.oc_data.get("strikes", []):
+                if s.get("ce_symbol") == sym_clean and s.get("ce_ltp"):
+                    return float(s["ce_ltp"])
+                if s.get("pe_symbol") == sym_clean and s.get("pe_ltp"):
+                    return float(s["pe_ltp"])
+        return None
+
     def _render_orders_pane(self, response: dict, mode: str) -> str:
         """Render pending or executed orders from a /api/orders response into tabular formatted text with status colors."""
         PENDING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED"}
@@ -4323,13 +4966,14 @@ class KCLILiveSession:
                 w_sym = max(18, max((len(str(o.get("tradingsymbol", ""))) for o in orders), default=18))
                 w_qty = max(9, max((len(f"{o.get('filled_quantity', 0)}/{o.get('quantity', 0)}") for o in orders), default=9))
                 w_price = 14
+                w_ltp = 9
                 w_prod = 5
                 w_status = max(10, max((len(str(o.get("status", ""))) for o in orders), default=10))
 
-                top_border = f"┌─{'─'*w_oid}─┬─{'─'*w_tx}─┬─{'─'*w_sym}─┬─{'─'*w_qty}─┬─{'─'*w_price}─┬─{'─'*w_prod}─┬─{'─'*w_status}─┐"
-                header_row = f"│ {'Order ID':<{w_oid}} │ {'Tx':<{w_tx}} │ {'Symbol':<{w_sym}} │ {'Qty':<{w_qty}} │ {'Type & Price':<{w_price}} │ {'Prod':<{w_prod}} │ {'Status':<{w_status}} │"
-                mid_border = f"├─{'─'*w_oid}─┼─{'─'*w_tx}─┼─{'─'*w_sym}─┼─{'─'*w_qty}─┼─{'─'*w_price}─┼─{'─'*w_prod}─┼─{'─'*w_status}─┤"
-                bot_border = f"└─{'─'*w_oid}─┴─{'─'*w_tx}─┴─{'─'*w_sym}─┴─{'─'*w_qty}─┴─{'─'*w_price}─┴─{'─'*w_prod}─┴─{'─'*w_status}─┘"
+                top_border = f"┌─{'─'*w_oid}─┬─{'─'*w_tx}─┬─{'─'*w_sym}─┬─{'─'*w_qty}─┬─{'─'*w_price}─┬─{'─'*w_ltp}─┬─{'─'*w_prod}─┬─{'─'*w_status}─┐"
+                header_row = f"│ {'Order ID':<{w_oid}} │ {'Tx':<{w_tx}} │ {'Symbol':<{w_sym}} │ {'Qty':<{w_qty}} │ {'Placed Price':<{w_price}} │ {'Live LTP':<{w_ltp}} │ {'Prod':<{w_prod}} │ {'Status':<{w_status}} │"
+                mid_border = f"├─{'─'*w_oid}─┼─{'─'*w_tx}─┼─{'─'*w_sym}─┼─{'─'*w_qty}─┼─{'─'*w_price}─┼─{'─'*w_ltp}─┼─{'─'*w_prod}─┼─{'─'*w_status}─┤"
+                bot_border = f"└─{'─'*w_oid}─┴─{'─'*w_tx}─┴─{'─'*w_sym}─┴─{'─'*w_qty}─┴─{'─'*w_price}─┴─{'─'*w_ltp}─┴─{'─'*w_prod}─┴─{'─'*w_status}─┘"
 
                 lines.append(top_border)
                 lines.append(header_row)
@@ -4353,6 +4997,9 @@ class KCLILiveSession:
                     else:
                         price_desc = f"{otype} @ {price:.2f}" if price else f"{otype} MKT"
 
+                    ltp = self.get_symbol_ltp(sym)
+                    ltp_desc = f"₹{ltp:.2f}" if ltp is not None else "-"
+
                     qty_desc = f"{filled}/{qty}"
                     status_desc = status
 
@@ -4374,6 +5021,7 @@ class KCLILiveSession:
                         f"{color_start}{sym:<{w_sym}}{color_end} │ "
                         f"{color_start}{qty_desc:<{w_qty}}{color_end} │ "
                         f"{color_start}{price_desc:<{w_price}}{color_end} │ "
+                        f"{color_start}{ltp_desc:<{w_ltp}}{color_end} │ "
                         f"{color_start}{product:<{w_prod}}{color_end} │ "
                         f"{color_start}{status_desc:<{w_status}}{color_end} │"
                     )
@@ -4382,6 +5030,57 @@ class KCLILiveSession:
 
         if not any_orders and mode == "orders_pending":
             lines.append("No open or recent orders across all accounts.")
+
+        # Conditional orders section (in Pending Orders view)
+        if mode == "orders_pending" and hasattr(self, "recorder") and self.recorder:
+            try:
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                cond_list = self.recorder.get_all_conditional_orders_today(today_str)
+                if cond_list:
+                    lines.append("")
+                    lines.append("⏳ Conditional / Chained Orders (Today):")
+                    w_cid = 4
+                    w_poid = 10
+                    w_sym = 18
+                    w_cond = 24
+                    w_st = 11
+
+                    c_top = f"┌─{'─'*w_cid}─┬─{'─'*w_poid}─┬─{'─'*w_sym}─┬─{'─'*w_cond}─┬─{'─'*w_st}─┐"
+                    c_hdr = f"│ {'ID':<{w_cid}} │ {'Parent ID':<{w_poid}} │ {'Symbol':<{w_sym}} │ {'Child Order (On Fill)':<{w_cond}} │ {'Status':<{w_st}} │"
+                    c_mid = f"├─{'─'*w_cid}─┼─{'─'*w_poid}─┼─{'─'*w_sym}─┼─{'─'*w_cond}─┼─{'─'*w_st}─┤"
+                    c_bot = f"└─{'─'*w_cid}─┴─{'─'*w_poid}─┴─{'─'*w_sym}─┴─{'─'*w_cond}─┴─{'─'*w_st}─┘"
+
+                    lines.append(c_top)
+                    lines.append(c_hdr)
+                    lines.append(c_mid)
+
+                    for co in cond_list:
+                        cid_str = str(co.get("id", ""))
+                        p_ids = co.get("parent_order_ids", [])
+                        p_oid_str = str(p_ids[0])[-8:] if p_ids else "-"
+                        sym_str = str(co.get("parent_symbol", ""))[:w_sym]
+                        child_cmd_str = str(co.get("child_command_raw", ""))[:w_cond]
+                        st_str = str(co.get("status", ""))
+
+                        if st_str == "PENDING":
+                            c_col = "\033[38;5;208m"  # Orange
+                        elif st_str in ("TRIGGERED", "COMPLETE"):
+                            c_col = "\033[38;5;48m"   # Green
+                        else:
+                            c_col = "\033[38;5;196m"  # Red
+                        c_end = "\033[0m"
+
+                        lines.append(
+                            f"│ {c_col}{cid_str:<{w_cid}}{c_end} │ "
+                            f"{c_col}{p_oid_str:<{w_poid}}{c_end} │ "
+                            f"{c_col}{sym_str:<{w_sym}}{c_end} │ "
+                            f"{c_col}{child_cmd_str:<{w_cond}}{c_end} │ "
+                            f"{c_col}{st_str:<{w_st}}{c_end} │"
+                        )
+                    lines.append(c_bot)
+            except Exception as exc:
+                logger.warning("Error rendering conditional orders in orders pane: %s", exc)
+
         return "\n".join(lines)
 
     def _build_help_text(self) -> str:
@@ -4399,9 +5098,11 @@ class KCLILiveSession:
 │ oc / chain    / 3     │ Ctrl + O  / F3        │ Option Chain Pane           │
 │ adv / advisor / 4     │ Ctrl + G  / F4        │ AI Expiry Advisor Pane      │
 │ pnl / pl      / 5     │ F5 / Esc+5            │ P&L Analytics (Week/Mo/Yr)  │
-│ h  / help     / 6     │ F6 / Esc+6            │ Help & Cheat Sheet Pane     │
+│ md / depth    / 6     │ F6 / Esc+6            │ Market Depth (5-level Book) │
+│ h  / help     / 7     │ F7 / Esc+7            │ Help & Cheat Sheet Pane     │
 └───────────────────────┴───────────────────────┴─────────────────────────────┘
   * Quick Navigation: Click directly on any tab title in the header bar.
+  * Market Depth Command: Type 'md <symbol>' (e.g. 'md NIFTY2682025000CE' or 'md INFY').
   * P&L Period Options: Type 'w' (Week), 'm' (Month), 'y' (Year) when P&L tab is active.
 
  2. ORDER PLACEMENT & TRADING
@@ -4436,7 +5137,19 @@ class KCLILiveSession:
 │                                  │ e.g. cancel 12345  /  cancel all (or c)  │
 └──────────────────────────────────┴──────────────────────────────────────────┘
 
- 4. ACCOUNT & SELECTION CONTROL
+ 4. CONDITIONAL / CHAINED ORDERS (THEN / ->)
+┌──────────────────────────────────┬──────────────────────────────────────────┐
+│ Command Syntax                   │ Description / Example                    │
+├──────────────────────────────────┼──────────────────────────────────────────┤
+│ <cmd1> THEN <cmd2>               │ Place Order 1; upon COMPLETE, place Order 2│
+│                                  │ e.g. buy 1L 150 THEN sell 1L 180         │
+│                                  │ e.g. buy NIFTY... 1L 120 -> exit 150     │
+│ cond / co                        │ View active and today's conditional orders│
+│ cancel co <id|all>               │ Cancel pending conditional order(s)      │
+│                                  │ e.g. cancel co 1  /  cancel co all       │
+└──────────────────────────────────┴──────────────────────────────────────────┘
+
+ 5. ACCOUNT & SELECTION CONTROL
 ┌──────────────────────────────────┬──────────────────────────────────────────┐
 │ Command Syntax / Action          │ Description / Example                    │
 ├──────────────────────────────────┼──────────────────────────────────────────┤
@@ -4482,19 +5195,41 @@ class KCLILiveSession:
             last_tue_prev_month = last_day_prev_month - timedelta(days=offset)
             start_dt = (last_tue_prev_month + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             label = f"Month (Wed {start_dt.strftime('%b %d')} -> Now)"
-            
+        elif period == "custom":
+            c_start = getattr(self, "pnl_custom_start", None)
+            c_end = getattr(self, "pnl_custom_end", None)
+            if not c_start:
+                c_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+            if not c_end:
+                c_end = now.strftime("%Y-%m-%d")
+
+            try:
+                start_dt = datetime.strptime(c_start, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+            except Exception:
+                start_dt = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+            try:
+                end_dt = datetime.strptime(c_end, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999)
+            except Exception:
+                end_dt = now
+
+            label = f"Custom Range ({start_dt.strftime('%b %d, %Y')} -> {end_dt.strftime('%b %d, %Y')})"
+            return start_dt, end_dt, label
+
         else:  # "year" (Financial Year starting April 1st)
             fy_year = now.year if now.month >= 4 else now.year - 1
             start_dt = datetime(fy_year, 4, 1, 0, 0, 0)
             label = f"FY Year (Apr 01, {fy_year} -> Now)"
-            
+
         return start_dt, now, label
 
     def _render_pnl_pane(self) -> str:
         """Render the P&L Analytics tab with Grand Total and Account-wise breakdown."""
         period = getattr(self, "pnl_period", "month")
-        start_dt, now_dt, period_label = self._get_pnl_date_range(period)
+        start_dt, end_dt, period_label = self._get_pnl_date_range(period)
+        now_dt = datetime.now()
         start_iso = start_dt.isoformat()
+        end_iso = end_dt.isoformat()
 
         # Build period selector buttons header line
         def _fmt_btn(p_key, p_name):
@@ -4505,8 +5240,11 @@ class KCLILiveSession:
         btn_week = _fmt_btn("week", "1: Week")
         btn_month = _fmt_btn("month", "2: Month")
         btn_year = _fmt_btn("year", "3: Year")
+        btn_custom = _fmt_btn("custom", "4: Custom Range")
 
-        header_selector = f"Period:  {btn_week}  │  {btn_month}  │  {btn_year}"
+        header_selector = f"Period:  {btn_week}  │  {btn_month}  │  {btn_year}  │  {btn_custom}"
+        if period == "custom":
+            header_selector += "  │  \033[90m(Type 'pnl YYYY-MM-DD YYYY-MM-DD' to set range)\033[0m"
 
         # Collect completed orders strictly from SQLite database (~/.kcli/data.db)
         executed_orders_map = {}
@@ -4522,7 +5260,7 @@ class KCLILiveSession:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    SELECT timestamp, account_name, user_id, tradingsymbol, transaction_type, quantity, price, order_id, status, COALESCE(is_settled_externally, 0)
+                    SELECT timestamp, account_name, user_id, tradingsymbol, transaction_type, quantity, price, order_id, status, COALESCE(is_settled_externally, 0), COALESCE(total_charges, 0.0)
                     FROM executed_order_context
                     WHERE UPPER(status) = 'COMPLETE'
                     ORDER BY id ASC;
@@ -4545,6 +5283,7 @@ class KCLILiveSession:
                         "order_id": oid,
                         "status": str(row[8]),
                         "is_settled_externally": int(row[9] or 0),
+                        "total_charges": float(row[10] or 0.0),
                     }
                 conn.close()
         except Exception as exc:
@@ -4580,9 +5319,29 @@ class KCLILiveSession:
         acct_summaries = {}
 
         def _to_iso_str(ts_val):
+            if not ts_val:
+                return ""
             if hasattr(ts_val, "isoformat"):
                 return ts_val.isoformat()
-            return str(ts_val or "")
+            s = str(ts_val).strip()
+            if not s:
+                return ""
+            formats = [
+                "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%d-%b-%Y %H:%M:%S",
+                "%d-%b-%Y %H:%M",
+                "%Y-%m-%d",
+            ]
+            for fmt in formats:
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    return dt.isoformat()
+                except ValueError:
+                    pass
+            return s
 
         for acct in all_acct_names:
             orders = acct_orders_map[acct]
@@ -4595,20 +5354,28 @@ class KCLILiveSession:
             from cli.charges import calculate_option_charges
 
             realised_pnl = 0.0
-            total_acct_charges = 0.0
             closed_cnt = 0
             win_cnt = 0
             trade_rows = []
 
+            # Calculate total charges strictly for trades EXECUTED within the selected period
+            total_acct_charges = sum(
+                float(o.get("total_charges") or 0.0)
+                for o in orders
+                if int(o.get("is_settled_externally", 0)) == 0
+                and start_iso <= _to_iso_str(o.get("timestamp")) <= end_iso
+            )
+
             for symbol, s_orders in trades_by_symbol.items():
                 # FIFO trade matching for completed legs across all available history
-                buys = [{"qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp"))} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("B", "BUY") and int(o.get("is_settled_externally", 0)) == 0]
-                sells = [{"qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp"))} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("S", "SELL") and int(o.get("is_settled_externally", 0)) == 0]
+                buys = [{"qty": int(o["quantity"]), "orig_qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp")), "chg": float(o.get("total_charges") or 0.0)} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("B", "BUY") and int(o.get("is_settled_externally", 0)) == 0]
+                sells = [{"qty": int(o["quantity"]), "orig_qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp")), "chg": float(o.get("total_charges") or 0.0)} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("S", "SELL") and int(o.get("is_settled_externally", 0)) == 0]
 
                 m_pnl = 0.0
                 matched_qty = 0
                 b_val_matched = 0.0
                 s_val_matched = 0.0
+                m_chg = 0.0
                 b_idx, s_idx = 0, 0
 
                 while b_idx < len(buys) and s_idx < len(sells):
@@ -4617,11 +5384,20 @@ class KCLILiveSession:
                     match_q = min(b["qty"], s["qty"])
                     if match_q > 0:
                         close_ts = max(b["ts"], s["ts"])
-                        if close_ts >= start_iso:
+                        b_ratio = match_q / b["orig_qty"] if b["orig_qty"] > 0 else 1.0
+                        s_ratio = match_q / s["orig_qty"] if s["orig_qty"] > 0 else 1.0
+
+                        b_chg = b_ratio * b["chg"] if start_iso <= b["ts"] <= end_iso else 0.0
+                        s_chg = s_ratio * s["chg"] if start_iso <= s["ts"] <= end_iso else 0.0
+                        leg_chg = b_chg + s_chg
+
+                        if start_iso <= close_ts <= end_iso:
                             m_pnl += (s["price"] - b["price"]) * match_q
                             matched_qty += match_q
                             b_val_matched += match_q * b["price"]
                             s_val_matched += match_q * s["price"]
+                            m_chg += leg_chg
+
                         b["qty"] -= match_q
                         s["qty"] -= match_q
                     if b["qty"] == 0:
@@ -4650,11 +5426,7 @@ class KCLILiveSession:
                         win_cnt += 1
                     avg_b = b_val_matched / matched_qty if matched_qty > 0 else 0.0
                     avg_s = s_val_matched / matched_qty if matched_qty > 0 else 0.0
-                    b_cnt = max(1, b_idx)
-                    s_cnt = max(1, s_idx)
-                    chg_info = calculate_option_charges(avg_b, avg_s, matched_qty, b_cnt, s_cnt)
-                    c_val = chg_info["total_charges"]
-                    total_acct_charges += c_val
+                    c_val = round(m_chg, 2)
                     trade_rows.append({"symbol": symbol, "qty": matched_qty, "buy_price": avg_b, "sell_price": avg_s, "pnl": m_pnl, "charges": c_val, "net_pnl": m_pnl - c_val})
 
                 if is_expired and net_qty != 0:
@@ -4830,6 +5602,120 @@ class KCLILiveSession:
 
         return "\n".join(lines)
 
+    def _render_market_depth_pane(self) -> str:
+        """Render 5-depth order book, OHLC, volume, and statistics for self.md_symbol."""
+        sym = getattr(self, "md_symbol", "").strip().upper()
+        if not sym:
+            return """┌─────────────────────────────────────────────────────────────────────────────┐
+│                            MARKET DEPTH (5-LEVEL)                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+ No ticker symbol selected.
+
+ To view market depth for any ticker, type:
+   md <symbol>        (e.g. 'md NIFTY2682025000CE' or 'md INFY' or 'md RELIANCE')
+   depth <symbol>
+
+ Or enter any symbol directly in the prompt below while MD tab is active.
+"""
+
+        res = self.client.get_market_depth(sym)
+        if res.get("status") != "success":
+            err_msg = res.get("message", "Unknown error")
+            return f"""┌─────────────────────────────────────────────────────────────────────────────┐
+│                     MARKET DEPTH: {sym:<41} │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+ ❌ Failed to fetch market depth: {err_msg}
+
+ Enter a valid symbol with:
+   md <symbol> (e.g. 'md NIFTY2682025000CE' or 'md INFY')
+"""
+
+        ltp = float(res.get("last_price", 0.0))
+        chg = float(res.get("change", 0.0))
+        chg_pct = float(res.get("change_pct", 0.0))
+        vol = int(res.get("volume", 0))
+        oi = int(res.get("oi", 0))
+        tot_b = int(res.get("total_buy_quantity", 0))
+        tot_s = int(res.get("total_sell_quantity", 0))
+        ohlc = res.get("ohlc", {})
+        open_pr = float(ohlc.get("open", 0.0))
+        high_pr = float(ohlc.get("high", 0.0))
+        low_pr = float(ohlc.get("low", 0.0))
+        close_pr = float(ohlc.get("close", 0.0))
+        lc = float(res.get("lower_circuit_limit", 0.0))
+        uc = float(res.get("upper_circuit_limit", 0.0))
+
+        c_green = "\033[38;5;48m"
+        c_red = "\033[38;5;196m"
+        c_cyan = "\033[38;5;51m"
+        c_bold = "\033[1m"
+        c_reset = "\033[0m"
+
+        ltp_color = c_green if chg >= 0 else c_red
+        chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
+
+        lines = []
+        lines.append(f"┌─ {c_bold}{sym}{c_reset} {'─' * max(2, 60 - len(sym))}┐")
+        lines.append(
+            f"│ LTP: {ltp_color}{c_bold}₹{ltp:<9.2f}{c_reset} {ltp_color}{chg_str:<16}{c_reset} "
+            f"Vol: {c_cyan}{vol:<10,}{c_reset} OI: {c_cyan}{oi:<9,}{c_reset} │"
+        )
+        lines.append("├───────────────────────────────┬───────────────────────────────┤")
+        lines.append(f"│ {c_green}{c_bold}{'BUY (BIDS)':^29}{c_reset} │ {c_red}{c_bold}{'SELL (ASKS)':^29}{c_reset} │")
+        lines.append("├───────┬──────────┬────────────┼────────────┬──────────┬───────┤")
+        lines.append("│ Orders│ Quantity │  Bid Price │  Ask Price │ Quantity │ Orders│")
+        lines.append("├───────┼──────────┼────────────┼────────────┼──────────┼───────┤")
+
+        bids = res.get("buy_depth", [])
+        asks = res.get("sell_depth", [])
+
+        for i in range(5):
+            b = bids[i] if i < len(bids) else {}
+            a = asks[i] if i < len(asks) else {}
+
+            b_ord = f"{b.get('orders', 0):>5}" if b.get('orders') else "    -"
+            b_qty = f"{b.get('quantity', 0):>8,}" if b.get('quantity') else "       -"
+            b_pr = f"₹{b.get('price', 0.0):>9.2f}" if b.get('price') else "         -"
+
+            a_pr = f"₹{a.get('price', 0.0):>9.2f}" if a.get('price') else "         -"
+            a_qty = f"{a.get('quantity', 0):>8,}" if a.get('quantity') else "       -"
+            a_ord = f"{a.get('orders', 0):>5}" if a.get('orders') else "    -"
+
+            lines.append(
+                f"│ {b_ord} │ {b_qty} │ {c_green}{b_pr}{c_reset} │ "
+                f"{c_red}{a_pr}{c_reset} │ {a_qty} │ {a_ord} │"
+            )
+
+        lines.append("├───────┴──────────┴────────────┼────────────┴──────────┴───────┤")
+        lines.append(
+            f"│ Total Buy: {c_green}{c_bold}{tot_b:>17,}{c_reset} │ "
+            f"Total Sell: {c_red}{c_bold}{tot_s:>16,}{c_reset} │"
+        )
+
+        tot_both = tot_b + tot_s
+        if tot_both > 0:
+            b_pct = int(round((tot_b / tot_both) * 100))
+            s_pct = 100 - b_pct
+            b_bars = int(round((b_pct / 100) * 28))
+            s_bars = 28 - b_bars
+            bar_visual = f"{c_green}{'█' * b_bars}{c_reset}{c_red}{'█' * s_bars}{c_reset}"
+            lines.append(f"│ Buy {b_pct:>2}% [{bar_visual}] {s_pct:>2}% Sell │")
+
+        lines.append("├───────────────────────────────┴───────────────────────────────┤")
+        lines.append("│ STATISTICS                                                    │")
+        lines.append(
+            f"│ Open: ₹{open_pr:<8.2f} High: ₹{high_pr:<8.2f} Low: ₹{low_pr:<8.2f} Close: ₹{close_pr:<8.2f}│"
+        )
+        if lc > 0 or uc > 0:
+            lines.append(
+                f"│ Lower Circuit: ₹{lc:<10.2f} Upper Circuit: ₹{uc:<16.2f}│"
+            )
+        lines.append("└───────────────────────────────────────────────────────────────┘")
+
+        return "\n".join(lines)
+
     def _update_info_buffer(self, reset_scroll: bool = True) -> None:
         """Push current info_mode text into the info control.
 
@@ -4856,6 +5742,12 @@ class KCLILiveSession:
             except Exception as exc:
                 self._last_pnl_text = f"=== P&L Analytics ===\n\nFailed to calculate P&L: {exc}"
             text = self._last_pnl_text
+        elif self.info_mode == "md":
+            try:
+                self._last_md_text = self._render_market_depth_pane()
+            except Exception as exc:
+                self._last_md_text = f"=== Market Depth ===\n\nFailed to calculate depth: {exc}"
+            text = self._last_md_text
         elif self.info_mode == "help":
             text = self._build_help_text()
         else:
@@ -4910,6 +5802,10 @@ class KCLILiveSession:
 
     async def run(self) -> None:
         """Launch the interactive prompt_toolkit dashboard."""
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
         # Keep noisy third-party WebSocket loggers off the full-screen TUI.
         _silence_websocket_loggers()
         # ── UI Controls ─────────────────────────────────────────────
@@ -5008,7 +5904,7 @@ class KCLILiveSession:
             if mouse_event.event_type == MouseEventType.MOUSE_UP:
                 if self.info_mode == "pnl":
                     v_scroll = getattr(self._info_control, "vertical_scroll_position", 0)
-                    if mouse_event.position.y - v_scroll == 0:
+                    if mouse_event.position.y == 0 or mouse_event.position.y - v_scroll == 0:
                         x = mouse_event.position.x
                         if 8 <= x <= 20:
                             self.pnl_period = "week"
@@ -5030,6 +5926,13 @@ class KCLILiveSession:
                             if hasattr(self, "app") and self.app:
                                 self.app.invalidate()
                             self.log_message("P&L period switched to [bold]Year[/bold].")
+                            return res
+                        elif 51 <= x <= 75:
+                            self.pnl_period = "custom"
+                            self._update_info_buffer()
+                            if hasattr(self, "app") and self.app:
+                                self.app.invalidate()
+                            self.log_message("P&L period switched to [bold]Custom Range[/bold].")
                             return res
 
                 if hasattr(self._info_control, "buffer"):
@@ -5299,6 +6202,14 @@ class KCLILiveSession:
         @kb.add("escape", "6")
         @kb.add("f6")
         def _c6(event):
+            self.info_mode = "md"
+            self._update_info_buffer()
+            event.app.invalidate()
+
+        @kb.add("c-7")
+        @kb.add("escape", "7")
+        @kb.add("f7")
+        def _c7(event):
             self.info_mode = "help"
             self._update_info_buffer()
             event.app.invalidate()

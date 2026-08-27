@@ -159,5 +159,17 @@ class TestCLIParser(unittest.IsolatedAsyncioTestCase):
             mock_cancel.assert_any_call("111111", "api_zk")
             mock_cancel.assert_any_call("222222", "api_wvv")
 
+    async def test_market_depth_command_parsing(self):
+        from cli.parser import parse_command_line, MarketDepthCommand
+        cmds = parse_command_line("md NIFTY2682025000CE")
+        self.assertEqual(len(cmds), 1)
+        self.assertIsInstance(cmds[0], MarketDepthCommand)
+        self.assertEqual(cmds[0].symbol, "NIFTY2682025000CE")
+
+        # Test command execution in live session
+        self.session._execute_single_command("md INFY")
+        self.assertEqual(self.session.info_mode, "md")
+        self.assertEqual(self.session.md_symbol, "INFY")
+
 if __name__ == "__main__":
     unittest.main()

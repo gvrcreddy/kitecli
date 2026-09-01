@@ -1009,6 +1009,109 @@ class KiteAccountManager(BaseBrokerManager):
             logger.warning("get_margins failed for api_key=%s…: %s", api_key[:8], exc)
             return {"net": None, "cash": None, "collateral": None}
 
+    def get_holdings(self, api_key: str) -> list[dict[str, Any]]:
+        """Fetch stock/equity and mutual fund holdings for an account using normalised schema.
+
+        Normalised schema:
+            tradingsymbol, exchange, isin, quantity, t1_quantity, collateral_quantity,
+            average_price, last_price, close_price, pnl, pnl_pct,
+            day_change, day_change_pct, investment_value, current_value, instrument_type
+        """
+        kite = self._clients.get(api_key)
+        if not kite or not self.is_authenticated(api_key):
+            return []
+        
+        result = []
+
+        # 1. Fetch equity/CNC holdings (including free demat, T1, and pledged/collateral)
+        try:
+            raw_holdings = kite.holdings()
+            for h in raw_holdings:
+                qty = float(h.get("quantity") or 0.0)
+                t1_qty = float(h.get("t1_quantity") or 0.0)
+                collateral_qty = float(h.get("collateral_quantity") or 0.0)
+                total_qty = qty + t1_qty + collateral_qty
+                if total_qty == 0:
+                    continue
+                avg_price = float(h.get("average_price") or 0.0)
+                ltp = float(h.get("last_price") or avg_price)
+                close_price = float(h.get("close_price") or ltp)
+                
+                investment_val = total_qty * avg_price
+                current_val = total_qty * ltp
+                pnl = current_val - investment_val
+                pnl_pct = (pnl / investment_val * 100.0) if investment_val > 0 else 0.0
+                
+                # Day change
+                day_change = (ltp - close_price) * total_qty
+                day_change_pct = ((ltp - close_price) / close_price * 100.0) if close_price > 0 else float(h.get("day_change_percentage") or 0.0)
+                
+                result.append({
+                    "tradingsymbol": str(h.get("tradingsymbol") or ""),
+                    "exchange": str(h.get("exchange") or "NSE"),
+                    "isin": str(h.get("isin") or ""),
+                    "quantity": int(total_qty) if total_qty.is_integer() else total_qty,
+                    "t1_quantity": int(t1_qty) if t1_qty.is_integer() else t1_qty,
+                    "collateral_quantity": int(collateral_qty) if collateral_qty.is_integer() else collateral_qty,
+                    "average_price": avg_price,
+                    "last_price": ltp,
+                    "close_price": close_price,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                    "day_change": day_change,
+                    "day_change_pct": day_change_pct,
+                    "investment_value": investment_val,
+                    "current_value": current_val,
+                    "instrument_token": h.get("instrument_token"),
+                    "instrument_type": "EQ",
+                })
+        except Exception as exc:
+            logger.warning("kite.holdings failed for api_key=%s…: %s", api_key[:8], exc)
+
+        # 2. Fetch Mutual Fund holdings (Coin / BSE StAR MF)
+        try:
+            if hasattr(kite, "mf_holdings"):
+                raw_mf_holdings = kite.mf_holdings()
+                for mf in raw_mf_holdings:
+                    qty = float(mf.get("quantity") or 0.0)
+                    if qty == 0:
+                        continue
+                    avg_nav = float(mf.get("average_price") or 0.0)
+                    last_nav = float(mf.get("last_price") or avg_nav)
+                    fund_name = str(mf.get("fund") or mf.get("tradingsymbol") or "Mutual Fund")
+                    isin = str(mf.get("isin") or "")
+                    
+                    investment_val = qty * avg_nav
+                    current_val = qty * last_nav
+                    pnl = current_val - investment_val
+                    pnl_pct = (pnl / investment_val * 100.0) if investment_val > 0 else 0.0
+                    day_change = float(mf.get("day_change") or 0.0)
+                    day_change_pct = float(mf.get("day_change_percentage") or 0.0)
+
+                    result.append({
+                        "tradingsymbol": fund_name,
+                        "exchange": "MF",
+                        "isin": isin,
+                        "quantity": int(qty) if qty.is_integer() else qty,
+                        "t1_quantity": 0,
+                        "collateral_quantity": 0,
+                        "average_price": avg_nav,
+                        "last_price": last_nav,
+                        "close_price": last_nav,
+                        "pnl": pnl,
+                        "pnl_pct": pnl_pct,
+                        "day_change": day_change,
+                        "day_change_pct": day_change_pct,
+                        "investment_value": investment_val,
+                        "current_value": current_val,
+                        "instrument_token": None,
+                        "instrument_type": "MF",
+                    })
+        except Exception as exc:
+            logger.debug("kite.mf_holdings failed or not supported for api_key=%s…: %s", api_key[:8], exc)
+
+        return result
+
     def get_nfo_lot_sizes(self) -> dict[str, int]:
         """Return the cached NFO tradingsymbol → lot_size map.
 

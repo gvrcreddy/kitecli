@@ -12,7 +12,7 @@ import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 logger = logging.getLogger("kitecli.recorder")
 
@@ -358,7 +358,29 @@ class DataRecorder:
                 failure_reason TEXT
             );
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cond_orders_lookup ON conditional_orders(trade_date, status);")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                trigger_time TEXT NOT NULL,
+                account_key TEXT,
+                account_name TEXT,
+                command_raw TEXT NOT NULL,
+                action TEXT NOT NULL,
+                symbol_or_id TEXT,
+                quantity TEXT,
+                price REAL,
+                product TEXT DEFAULT 'NRML',
+                is_conditional INTEGER DEFAULT 0,
+                child_command_raw TEXT,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                executed_at TEXT,
+                order_ids TEXT,
+                conditional_id INTEGER,
+                failure_reason TEXT
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sched_orders_lookup ON scheduled_orders(status, trigger_time);")
 
         conn.commit()
 
@@ -790,3 +812,148 @@ class DataRecorder:
                     cancelled_ids.append(cid)
             conn.commit()
         return cancelled_ids
+
+    def save_scheduled_order(
+        self,
+        trigger_time: str,
+        command_raw: str,
+        action: str,
+        symbol_or_id: Optional[str],
+        quantity: Optional[str],
+        price: Optional[float],
+        product: str = "NRML",
+        account_key: Optional[str] = None,
+        account_name: Optional[str] = None,
+        is_conditional: bool = False,
+        child_command_raw: Optional[str] = None,
+    ) -> int:
+        """Save a new scheduled order to SQLite and return its auto-increment ID."""
+        now_str = datetime.now().isoformat()
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO scheduled_orders (
+                    created_at, trigger_time, account_key, account_name,
+                    command_raw, action, symbol_or_id, quantity, price, product,
+                    is_conditional, child_command_raw, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING');
+                """,
+                (
+                    now_str,
+                    trigger_time,
+                    account_key,
+                    account_name,
+                    command_raw,
+                    action.upper(),
+                    symbol_or_id,
+                    quantity,
+                    price,
+                    product,
+                    1 if is_conditional else 0,
+                    child_command_raw,
+                ),
+            )
+            sched_id = cursor.lastrowid
+            conn.commit()
+            return sched_id
+
+    def get_pending_scheduled_orders(self) -> list[dict[str, Any]]:
+        """Fetch all PENDING scheduled orders."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM scheduled_orders WHERE status = 'PENDING' ORDER BY trigger_time ASC, id ASC;"
+            )
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    def get_all_scheduled_orders_today(self, today_date_str: str) -> list[dict[str, Any]]:
+        """Fetch all scheduled orders registered or triggered today."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM scheduled_orders WHERE trigger_time LIKE ? OR created_at LIKE ? ORDER BY trigger_time DESC, id DESC;",
+                (f"{today_date_str}%", f"{today_date_str}%"),
+            )
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    def update_scheduled_order_status(
+        self,
+        sched_id: int,
+        status: str,
+        executed_at: Optional[str] = None,
+        order_ids: Optional[list[str] | str] = None,
+        conditional_id: Optional[int] = None,
+        failure_reason: Optional[str] = None,
+    ) -> None:
+        """Update execution status and metadata for a scheduled order."""
+        if isinstance(order_ids, list):
+            order_ids_str = json.dumps(order_ids)
+        else:
+            order_ids_str = str(order_ids) if order_ids is not None else None
+
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            if status == "TRIGGERED":
+                cursor.execute(
+                    """
+                    UPDATE scheduled_orders
+                    SET status = ?, executed_at = ?, order_ids = ?, conditional_id = ?, failure_reason = NULL
+                    WHERE id = ?;
+                    """,
+                    (status, executed_at or datetime.now().isoformat(), order_ids_str, conditional_id, sched_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE scheduled_orders
+                    SET status = ?, failure_reason = ?
+                    WHERE id = ?;
+                    """,
+                    (status, failure_reason, sched_id),
+                )
+            conn.commit()
+
+    def cancel_scheduled_order(self, sched_id: int) -> bool:
+        """Cancel a specific pending scheduled order by ID."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE scheduled_orders SET status = 'CANCELLED', failure_reason = 'Cancelled by user' WHERE id = ? AND status = 'PENDING';",
+                (sched_id,),
+            )
+            count = cursor.rowcount
+            conn.commit()
+            return count > 0
+
+    def cancel_all_scheduled_orders(self) -> int:
+        """Cancel all pending scheduled orders."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE scheduled_orders SET status = 'CANCELLED', failure_reason = 'Cancelled by user' WHERE status = 'PENDING';"
+            )
+            count = cursor.rowcount
+            conn.commit()
+            return count
+
+    def expire_old_scheduled_orders(self, today_date_str: str) -> int:
+        """Expire all pending scheduled orders with target trigger_time before today."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE scheduled_orders SET status = 'EXPIRED', failure_reason = 'Passed trigger window' WHERE trigger_time < ? AND status = 'PENDING';",
+                (today_date_str,),
+            )
+            count = cursor.rowcount
+            conn.commit()
+            return count

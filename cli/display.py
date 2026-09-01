@@ -404,6 +404,337 @@ def display_status(accounts: list[dict]) -> None:
     )
 
 
+# ── Holdings Display ───────────────────────────────────────────────
+
+def _clean_instrument_name(name: str) -> str:
+    """Clean up verbose mutual fund or stock names for compact table display."""
+    import re
+    s = name.strip()
+    # Mutual fund scheme name compressions
+    s = re.sub(r"\s*-\s*DIRECT\s+PLAN\s*-\s*GROWTH(?:\s+OPTION)?", " (Dir-Gr)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*-\s*DIRECT\s+PLAN\s*-\s*IDCW(?:\s+OPTION)?", " (Dir-IDCW)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*-\s*DIRECT\s+PLAN", " (Dir)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*-\s*REGULAR\s+PLAN\s*-\s*GROWTH(?:\s+OPTION)?", " (Reg-Gr)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*-\s*REGULAR\s+PLAN", " (Reg)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*-\s*GROWTH\s+PLAN", " (Gr)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*-\s*GROWTH\s+OPTION", " (Gr)", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+FUND\s+OF\s+FUND", " FoF", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+INDEX\s+FUND", " Index", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+ETF\s+FUND\s+OF\s+FUND", " ETF FoF", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
+def _build_holdings_summary_table(accounts_data: list[dict]) -> Table:
+    """Build a summary Table showing total holdings metrics per account."""
+    table = Table(
+        show_header=True,
+        header_style="bold #58a6ff",
+        border_style="#30363d",
+        row_styles=["", "dim"],
+        pad_edge=True,
+        expand=False,
+    )
+    table.add_column("Account", style="bold #e6edf3", no_wrap=True)
+    table.add_column("Invested", justify="right", no_wrap=True)
+    table.add_column("Current Value", justify="right", no_wrap=True)
+    table.add_column("Total P&L", justify="right", no_wrap=True)
+    table.add_column("P&L %", justify="right", no_wrap=True)
+    table.add_column("Day P&L", justify="right", no_wrap=True)
+
+    for acct in accounts_data:
+        name = acct.get("name", "Unknown")
+        status = acct.get("status", "success")
+        holdings = acct.get("holdings", [])
+        
+        if status != "success" and not holdings:
+            table.add_row(
+                name,
+                "₹0.00",
+                "₹0.00",
+                Text(f"✗ {status}", style="#f85149"),
+                "0.00%",
+                "₹0.00",
+            )
+            continue
+
+        tot_inv = float(acct.get("total_investment", 0.0))
+        tot_cur = float(acct.get("total_current_value", 0.0))
+        tot_pnl = tot_cur - tot_inv
+        tot_day = float(acct.get("total_day_change", 0.0))
+        pnl_pct = (tot_pnl / tot_inv * 100.0) if tot_inv > 0 else 0.0
+
+        pnl_color = _pnl_style(tot_pnl)
+        day_color = _pnl_style(tot_day)
+
+        table.add_row(
+            name,
+            _format_currency(tot_inv),
+            _format_currency(tot_cur),
+            Text(_format_currency(tot_pnl), style=f"bold {pnl_color}"),
+            Text(_format_pnl_pct(pnl_pct), style=f"bold {pnl_color}"),
+            Text(_format_currency(tot_day), style=day_color),
+        )
+
+    # Total Row at the bottom of the table
+    if accounts_data:
+        grand_inv = sum(float(a.get("total_investment", 0.0)) for a in accounts_data)
+        grand_cur = sum(float(a.get("total_current_value", 0.0)) for a in accounts_data)
+        grand_pnl = grand_cur - grand_inv
+        grand_day = sum(float(a.get("total_day_change", 0.0)) for a in accounts_data)
+        grand_pnl_pct = (grand_pnl / grand_inv * 100.0) if grand_inv > 0 else 0.0
+
+        pnl_color = _pnl_style(grand_pnl)
+        day_color = _pnl_style(grand_day)
+
+        table.add_section()
+        table.add_row(
+            Text("Total", style="bold #e6edf3"),
+            Text(_format_currency(grand_inv), style="bold #e6edf3"),
+            Text(_format_currency(grand_cur), style="bold #e6edf3"),
+            Text(_format_currency(grand_pnl), style=f"bold {pnl_color}"),
+            Text(_format_pnl_pct(grand_pnl_pct), style=f"bold {pnl_color}"),
+            Text(_format_currency(grand_day), style=f"bold {day_color}"),
+        )
+
+    return table
+
+
+def _build_account_deep_holdings_table(holdings: list[dict]) -> Table:
+    """Build a detailed constituents Table for an account's holdings."""
+    table = Table(
+        show_header=True,
+        header_style="bold #58a6ff",
+        border_style="#30363d",
+        row_styles=["", "dim"],
+        pad_edge=True,
+        expand=False,
+    )
+    table.add_column("Symbol", style="bold #e6edf3", max_width=32, no_wrap=True, overflow="ellipsis")
+    table.add_column("Qty", justify="right", style="#79c0ff", no_wrap=True)
+    table.add_column("Avg", justify="right", no_wrap=True)
+    table.add_column("LTP", justify="right", no_wrap=True)
+    table.add_column("Invested", justify="right", no_wrap=True)
+    table.add_column("Current", justify="right", no_wrap=True)
+    table.add_column("Total P&L", justify="right", no_wrap=True)
+    table.add_column("P&L %", justify="right", no_wrap=True)
+
+    # Sort holdings alphabetically by tradingsymbol
+    sorted_holdings = sorted(holdings, key=lambda h: str(h.get("tradingsymbol", "")))
+
+    for h in sorted_holdings:
+        raw_sym = str(h.get("tradingsymbol", "?"))
+        sym = _clean_instrument_name(raw_sym)
+        is_mf = (h.get("exchange") == "MF" or h.get("instrument_type") == "MF")
+        sym_style = "italic #79c0ff" if is_mf else "bold #e6edf3"
+        
+        qty_val = float(h.get("quantity", 0))
+        qty_fmt = f"{int(qty_val)}" if qty_val.is_integer() else f"{qty_val:,.2f}"
+
+        avg = float(h.get("average_price", 0.0))
+        ltp = float(h.get("last_price", avg))
+        inv = float(h.get("investment_value", qty_val * avg))
+        cur = float(h.get("current_value", qty_val * ltp))
+        pnl = cur - inv
+        pnl_pct = (pnl / inv * 100.0) if inv > 0 else 0.0
+
+        pnl_color = _pnl_style(pnl)
+
+        table.add_row(
+            Text(sym, style=sym_style),
+            qty_fmt,
+            f"{avg:,.2f}",
+            f"{ltp:,.2f}",
+            _format_currency(inv),
+            _format_currency(cur),
+            Text(_format_currency(pnl), style=f"bold {pnl_color}"),
+            Text(_format_pnl_pct(pnl_pct), style=f"bold {pnl_color}"),
+        )
+
+    # Total Row for multiple constituents
+    if len(sorted_holdings) > 1:
+        tot_qty = sum(float(h.get("quantity", 0)) for h in sorted_holdings)
+        tot_qty_str = f"{int(tot_qty)}" if tot_qty.is_integer() else f"{tot_qty:,.2f}"
+        tot_inv = sum(float(h.get("investment_value", float(h.get("quantity", 0)) * float(h.get("average_price", 0.0)))) for h in sorted_holdings)
+        tot_cur = sum(float(h.get("current_value", float(h.get("quantity", 0)) * float(h.get("last_price", 0.0)))) for h in sorted_holdings)
+        tot_pnl = tot_cur - tot_inv
+        tot_pnl_pct = (tot_pnl / tot_inv * 100.0) if tot_inv > 0 else 0.0
+
+        pnl_color = _pnl_style(tot_pnl)
+
+        table.add_section()
+        table.add_row(
+            Text("Total", style="bold #e6edf3"),
+            Text(tot_qty_str, style="bold #79c0ff"),
+            Text("-", style="#8b949e", justify="right"),
+            Text("-", style="#8b949e", justify="right"),
+            Text(_format_currency(tot_inv), style="bold #e6edf3"),
+            Text(_format_currency(tot_cur), style="bold #e6edf3"),
+            Text(_format_currency(tot_pnl), style=f"bold {pnl_color}"),
+            Text(_format_pnl_pct(tot_pnl_pct), style=f"bold {pnl_color}"),
+        )
+
+    return table
+
+
+def display_holdings(holdings_data: dict, deep: bool = False, target_account: Optional[str] = None) -> None:
+    """Print a Rich table of stock holdings across accounts.
+
+    Args:
+        holdings_data: Dict returned by client.get_holdings().
+        deep: If True, show full constituent stock breakdowns.
+        target_account: Optional account name or ID to filter single-account deep-dive.
+    """
+    accounts = holdings_data.get("accounts", [])
+    if not accounts:
+        display_info("No holdings data available.")
+        return
+
+    # Filter by account if requested
+    if target_account:
+        target_norm = target_account.strip().lower()
+        if target_norm.isdigit():
+            idx = int(target_norm) - 1
+            if 0 <= idx < len(accounts):
+                accounts = [accounts[idx]]
+            else:
+                display_error(f"Invalid account index: {target_account}")
+                return
+        else:
+            accounts = [a for a in accounts if a.get("name", "").lower() == target_norm or a.get("api_key", "").lower() == target_norm]
+            if not accounts:
+                display_error(f"Account '{target_account}' not found.")
+                return
+        deep = True  # Single account drill-down defaults to deep view
+
+    if not deep:
+        # Summary View
+        table = _build_holdings_summary_table(accounts)
+        console.print(table)
+        console.print()
+    else:
+        # Deep View: Per-account constituent tables
+        for acct in accounts:
+            name = acct.get("name", "Unknown")
+            broker = str(acct.get("broker", "zerodha")).title()
+            holdings = acct.get("holdings", [])
+            tot_cur = float(acct.get("total_current_value", 0.0))
+            tot_inv = float(acct.get("total_investment", 0.0))
+            tot_pnl = tot_cur - tot_inv
+            pnl_pct = (tot_pnl / tot_inv * 100.0) if tot_inv > 0 else 0.0
+            pnl_color = _pnl_style(tot_pnl)
+
+            header_text = Text.assemble(
+                (f" {name} ({broker}) ", "bold #e6edf3"),
+                (" │ ", "#8b949e"),
+                ("Invested: ", "#8b949e"),
+                (f"{_format_currency(tot_inv)} ", "bold"),
+                (" │ ", "#8b949e"),
+                ("Current: ", "#8b949e"),
+                (f"{_format_currency(tot_cur)} ", "bold"),
+                (" │ ", "#8b949e"),
+                ("P&L: ", "bold"),
+                (f"{_format_currency(tot_pnl)} ({_format_pnl_pct(pnl_pct)})", f"bold {pnl_color}"),
+            )
+
+            if not holdings:
+                panel = Panel(
+                    Text("  No stock holdings in this account.", style="#8b949e italic"),
+                    title=header_text,
+                    border_style="#30363d",
+                    padding=(1, 2),
+                )
+            else:
+                table = _build_account_deep_holdings_table(holdings)
+                panel = Panel(
+                    table,
+                    title=header_text,
+                    border_style=pnl_color,
+                    padding=(0, 1),
+                )
+            console.print(panel)
+            console.print()
+
+
+def render_holdings_to_string(
+    holdings_data: dict,
+    width: int = 100,
+    deep: bool = False,
+    target_account: Optional[str] = None
+) -> str:
+    """Render holdings to an ANSI string for the live session TUI."""
+    from io import StringIO
+    from rich.console import Console
+
+    string_io = StringIO()
+    capture_console = Console(
+        file=string_io,
+        width=max(width, 100),
+        force_terminal=True,
+        color_system="truecolor",
+    )
+    accounts = holdings_data.get("accounts", [])
+    if not accounts:
+        return "No holdings data available."
+
+    if target_account:
+        target_norm = target_account.strip().lower()
+        if target_norm.isdigit():
+            idx = int(target_norm) - 1
+            if 0 <= idx < len(accounts):
+                accounts = [accounts[idx]]
+        else:
+            filtered = [a for a in accounts if a.get("name", "").lower() == target_norm or a.get("api_key", "").lower() == target_norm]
+            if filtered:
+                accounts = filtered
+        deep = True
+
+    if not deep:
+        table = _build_holdings_summary_table(accounts)
+        capture_console.print(table)
+    else:
+        for acct in accounts:
+            name = acct.get("name", "Unknown")
+            broker = str(acct.get("broker", "zerodha")).title()
+            holdings = acct.get("holdings", [])
+            tot_cur = float(acct.get("total_current_value", 0.0))
+            tot_inv = float(acct.get("total_investment", 0.0))
+            tot_pnl = tot_cur - tot_inv
+            pnl_pct = (tot_pnl / tot_inv * 100.0) if tot_inv > 0 else 0.0
+            pnl_color = _pnl_style(tot_pnl)
+
+            header_text = Text.assemble(
+                (f" {name} ({broker}) ", "bold #e6edf3"),
+                (" │ ", "#8b949e"),
+                ("Invested: ", "#8b949e"),
+                (f"{_format_currency(tot_inv)} ", "bold"),
+                (" │ ", "#8b949e"),
+                ("Current: ", "#8b949e"),
+                (f"{_format_currency(tot_cur)} ", "bold"),
+                (" │ ", "#8b949e"),
+                ("P&L: ", "bold"),
+                (f"{_format_currency(tot_pnl)} ({_format_pnl_pct(pnl_pct)})", f"bold {pnl_color}"),
+            )
+
+            if not holdings:
+                panel = Panel(
+                    Text("  No stock holdings in this account.", style="#8b949e italic"),
+                    title=header_text,
+                    border_style="#30363d",
+                    padding=(0, 1),
+                )
+            else:
+                table = _build_account_deep_holdings_table(holdings)
+                panel = Panel(
+                    table,
+                    title=header_text,
+                    border_style=pnl_color,
+                    padding=(0, 1),
+                )
+            capture_console.print(panel)
+
+    return string_io.getvalue()
+
+
 # ── Simple messages ────────────────────────────────────────────────
 
 def display_error(message: str) -> None:

@@ -127,6 +127,12 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
             # Week P&L date range (recent Wednesday Jul 29)
             s, e, l = self.session._get_pnl_date_range("week")
             self.assertEqual(s.strftime("%Y-%m-%d"), "2026-07-29")
+
+            # Last Week P&L date range (previous Wednesday Jul 22 -> Tuesday Jul 28)
+            s_lw, e_lw, l_lw = self.session._get_pnl_date_range("last_week")
+            self.assertEqual(s_lw.strftime("%Y-%m-%d"), "2026-07-22")
+            self.assertEqual(e_lw.strftime("%Y-%m-%d"), "2026-07-28")
+            self.assertIn("Last Week", l_lw)
             
             # Month P&L date range (day after last month's last Tuesday -> Wed Jul 01)
             s, e, l = self.session._get_pnl_date_range("month")
@@ -138,6 +144,7 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
 
     @patch("cli.live_session.KCLILiveSession._update_info_buffer")
     def test_pnl_tab_switching(self, mock_update_buffer):
+        self.session.pnl_period = "month"  # manually set to something else
         fragments = self.session._get_tab_bar_text()
         # Tab 5 is P&L
         click_handler_pnl = fragments[9][2]
@@ -148,6 +155,7 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
         
         click_handler_pnl(mock_event)
         self.assertEqual(self.session.info_mode, "pnl")
+        self.assertEqual(self.session.pnl_period, "week")
 
     @patch("cli.live_session.KCLILiveSession._update_info_buffer")
     def test_md_tab_switching_and_rendering(self, mock_update_buffer):
@@ -323,6 +331,66 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
         # Indices should be in chronological order
         self.assertIn("[1] NIFTY2682824500CE", rendered)
         self.assertIn("[2] NIFTY2690122800PE", rendered)
+
+    def test_holdings_tab_switching_and_rendering(self):
+        # Configure test holdings response
+        self.session.last_holdings_response = {
+            "accounts": [
+                {
+                    "name": "ZK8719",
+                    "broker": "zerodha",
+                    "status": "success",
+                    "total_investment": 25000.0,
+                    "total_current_value": 26000.0,
+                    "total_pnl": 1000.0,
+                    "total_day_change": 500.0,
+                    "holdings": [
+                        {
+                            "tradingsymbol": "RELIANCE",
+                            "exchange": "NSE",
+                            "quantity": 10,
+                            "average_price": 2500.0,
+                            "last_price": 2600.0,
+                            "investment_value": 25000.0,
+                            "current_value": 26000.0,
+                            "pnl": 1000.0,
+                            "pnl_pct": 4.0,
+                            "day_change": 500.0,
+                        }
+                    ]
+                }
+            ],
+            "grand_total_investment": 25000.0,
+            "grand_total_current_value": 26000.0,
+            "grand_total_pnl": 1000.0,
+            "grand_total_day_change": 500.0,
+            "status": "success",
+        }
+
+        # 1. Summary view
+        self.session.info_mode = "holdings"
+        self.session.holdings_view_mode = "summary"
+        rendered = self.session._render_holdings_pane()
+        self.assertIn("ZK8719", rendered)
+        self.assertIn("Invested", rendered)
+        self.assertIn("Total", rendered)
+        self.assertIn("25,000.00", rendered)
+        self.assertIn("26,000.00", rendered)
+        self.assertIn("1,000.00", rendered)
+
+        # 2. Deep constituent view
+        self.session.holdings_view_mode = "deep"
+        rendered_deep = self.session._render_holdings_pane()
+        self.assertIn("Zerodha", rendered_deep)
+        self.assertIn("RELIANCE", rendered_deep)
+        self.assertIn("2,500.00", rendered_deep)
+        self.assertIn("2,600.00", rendered_deep)
+
+        # 3. Tab fragments check
+        tabs = self.session._get_tab_bar_text()
+        tab_names = [frag[1].strip() for frag in tabs if len(frag) >= 2 and frag[1].strip()]
+        self.assertIn("Holdings", tab_names)
+        self.assertEqual(tab_names.index("Holdings"), tab_names.index("MD") + 1)
 
 
 if __name__ == "__main__":

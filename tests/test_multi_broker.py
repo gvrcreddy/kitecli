@@ -590,6 +590,132 @@ class TestApiClientBrokerRouting(unittest.TestCase):
         ticker._on_error("unauthorized session")
         self.assertEqual(last_error_code, 403)
 
+    def test_kite_get_holdings_normalisation(self):
+        from cli.kite_manager import KiteAccountManager
+        mgr = KiteAccountManager()
+        mock_kite = MagicMock()
+        mock_kite.holdings.return_value = [
+            {
+                "tradingsymbol": "RELIANCE",
+                "exchange": "NSE",
+                "isin": "INE002A01018",
+                "quantity": 10,
+                "t1_quantity": 0,
+                "average_price": 2500.0,
+                "last_price": 2600.0,
+                "close_price": 2550.0,
+                "instrument_token": 738561,
+            }
+        ]
+        mock_kite.mf_holdings.return_value = [
+            {
+                "fund": "Nippon Small Cap Fund",
+                "tradingsymbol": "INF204K01W01",
+                "isin": "INF204K01W01",
+                "quantity": 100.5,
+                "average_price": 50.0,
+                "last_price": 60.0,
+                "pnl": 1005.0,
+                "day_change": 50.0,
+            }
+        ]
+        mgr._clients["z1"] = mock_kite
+        mgr._authenticated["z1"] = True
+
+        holdings = mgr.get_holdings("z1")
+        self.assertEqual(len(holdings), 2)
+        h = holdings[0]
+        self.assertEqual(h["tradingsymbol"], "RELIANCE")
+        self.assertEqual(h["quantity"], 10)
+        self.assertEqual(h["investment_value"], 25000.0)
+        self.assertEqual(h["current_value"], 26000.0)
+        self.assertEqual(h["pnl"], 1000.0)
+        self.assertAlmostEqual(h["pnl_pct"], 4.0)
+        self.assertEqual(h["day_change"], 500.0)
+        
+        mf_h = holdings[1]
+        self.assertEqual(mf_h["tradingsymbol"], "Nippon Small Cap Fund")
+        self.assertEqual(mf_h["quantity"], 100.5)
+        self.assertEqual(mf_h["exchange"], "MF")
+        self.assertEqual(mf_h["investment_value"], 5025.0)
+
+    def test_kotak_get_holdings_normalisation(self):
+        from cli.kotak_manager import KotakAccountManager
+        mgr = KotakAccountManager()
+        mock_neo = MagicMock()
+        mock_neo.holdings.return_value = {
+            "data": [
+                {
+                    "displaySymbol": "INFY",
+                    "exchangeSegment": "nse_cm",
+                    "exchangeIdentifier": "INE009A01021",
+                    "quantity": 20,
+                    "t1Quantity": 5,
+                    "averagePrice": 1400.0,
+                    "holdingCost": 35000.0,
+                    "mktValue": 36250.0,
+                    "closingPrice": 1420.0,
+                }
+            ]
+        }
+        mgr._clients["k1"] = mock_neo
+        mgr._authenticated["k1"] = True
+
+        holdings = mgr.get_holdings("k1")
+        self.assertEqual(len(holdings), 1)
+        h = holdings[0]
+        self.assertEqual(h["tradingsymbol"], "INFY")
+        self.assertEqual(h["quantity"], 25) # 20 + 5 T1
+        self.assertEqual(h["investment_value"], 35000.0) # 25 * 1400
+        self.assertEqual(h["current_value"], 36250.0) # 25 * 1450
+        self.assertEqual(h["pnl"], 1250.0)
+        self.assertEqual(h["day_change"], 750.0) # (1450 - 1420) * 25
+
+    def test_api_client_get_holdings_aggregation(self):
+        from cli.api_client import KCLIClient
+        with patch("cli.api_client._kite_manager") as mock_km, patch("cli.api_client._get_kotak_manager") as mock_get_kotak:
+            mock_kotak_mgr = MagicMock()
+            mock_kotak_mgr.broker_name = "kotak"
+            mock_kotak_mgr.get_account_info.return_value = {"name": "Kotak1", "authenticated": True}
+            mock_kotak_mgr.get_holdings.return_value = [
+                {
+                    "tradingsymbol": "TCS",
+                    "quantity": 5,
+                    "investment_value": 15000.0,
+                    "current_value": 16000.0,
+                    "pnl": 1000.0,
+                    "day_change": 200.0,
+                }
+            ]
+            mock_get_kotak.return_value = mock_kotak_mgr
+
+            mock_km.broker_name = "zerodha"
+            mock_km.get_account_info.return_value = {"name": "Zerodha1", "authenticated": True}
+            mock_km.get_holdings.return_value = [
+                {
+                    "tradingsymbol": "RELIANCE",
+                    "quantity": 10,
+                    "investment_value": 25000.0,
+                    "current_value": 26000.0,
+                    "pnl": 1000.0,
+                    "day_change": 500.0,
+                }
+            ]
+
+            accounts = [
+                {"name": "Zerodha1", "api_key": "z1", "broker": "zerodha"},
+                {"name": "Kotak1", "api_key": "k1", "broker": "kotak"},
+            ]
+            client = KCLIClient(accounts)
+            result = client.get_holdings(["z1", "k1"])
+
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(len(result["accounts"]), 2)
+            self.assertEqual(result["grand_total_investment"], 40000.0)
+            self.assertEqual(result["grand_total_current_value"], 42000.0)
+            self.assertEqual(result["grand_total_pnl"], 2000.0)
+            self.assertEqual(result["grand_total_day_change"], 700.0)
+
 
 if __name__ == "__main__":
     unittest.main()

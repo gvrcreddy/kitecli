@@ -144,6 +144,20 @@ class TestCLIParser(unittest.IsolatedAsyncioTestCase):
             mock_mod.assert_any_call("111111", "50", "1.55", "api_zk")
             mock_mod.assert_any_call("222222", "50", "1.55", "api_wvv")
 
+    async def test_order_price_only_modify(self):
+        # order <symbol> <price> (modifying price only, retaining each order's qty)
+        self.session._execute_single_command("order NIFTY26JUN22200PE 1.75")
+        self.assertIsNotNone(self.session.pending_order)
+        self.assertEqual(self.session.pending_order["type"], "modify_multi")
+        self.assertEqual(len(self.session.pending_order["orders"]), 2)
+        self.assertEqual(self.session.pending_order["price"], "1.75")
+
+        with patch.object(self.session, "execute_modify", return_value=None) as mock_mod:
+            self.session._execute_single_command("y")
+            self.assertEqual(mock_mod.call_count, 2)
+            mock_mod.assert_any_call("111111", "50", "1.75", "api_zk")
+            mock_mod.assert_any_call("222222", "50", "1.75", "api_wvv")
+
     async def test_multi_order_cancel_by_symbol(self):
         # cancel <symbol>
         # Should match both pending orders for NIFTY26JUN22200PE
@@ -170,6 +184,101 @@ class TestCLIParser(unittest.IsolatedAsyncioTestCase):
         self.session._execute_single_command("md INFY")
         self.assertEqual(self.session.info_mode, "md")
         self.assertEqual(self.session.md_symbol, "INFY")
+
+    async def test_order_selection_commands(self):
+        from cli.parser import parse_command_line, OrderSelectCommand
+        
+        # Verify parser generates OrderSelectCommand for s o, s order, select o, select order
+        for text in ("s o 111111", "s order 111111", "select o 111111", "select order 111111"):
+            cmds = parse_command_line(text)
+            self.assertEqual(len(cmds), 1)
+            self.assertIsInstance(cmds[0], OrderSelectCommand)
+            self.assertEqual(cmds[0].target, "111111")
+
+        # Test execution in live session: s o 111111
+        self.session._execute_single_command("s o 111111")
+        self.assertIsNotNone(self.session.selected_order)
+        self.assertEqual(self.session.selected_order["order_id"], "111111")
+        self.assertEqual(self.session.selected_order["account_name"], "ZK8719")
+
+        # Test modify on selected order: order 1.85
+        self.session._execute_single_command("order 1.85")
+        self.assertIsNotNone(self.session.pending_order)
+        self.assertEqual(self.session.pending_order["type"], "modify")
+        self.assertEqual(self.session.pending_order["order_id"], "111111")
+        self.assertEqual(self.session.pending_order["price"], "1.85")
+
+        # Test cancel on selected order: cancel
+        self.session.pending_order = None
+        self.session._execute_single_command("cancel")
+        self.assertIsNotNone(self.session.pending_order)
+        self.assertEqual(self.session.pending_order["type"], "cancel")
+        self.assertEqual(self.session.pending_order["order_id"], "111111")
+
+        # Test clearing order selection: s o none
+        self.session.pending_order = None
+        self.session._execute_single_command("s o none")
+        self.assertIsNone(self.session.selected_order)
+
+    async def test_account_and_position_selection(self):
+        from cli.parser import parse_command_line, AccountSelectCommand, PositionSelectCommand
+
+        # Account selection
+        cmds = parse_command_line("s a ZK8719")
+        self.assertEqual(len(cmds), 1)
+        self.assertIsInstance(cmds[0], AccountSelectCommand)
+        self.assertEqual(cmds[0].account_name, "ZK8719")
+
+        self.session._execute_single_command("s a ZK8719")
+        self.assertEqual(self.session.selected_account_name, "ZK8719")
+
+        # Position selection
+        cmds = parse_command_line("select 1")
+        self.assertEqual(len(cmds), 1)
+        self.assertIsInstance(cmds[0], PositionSelectCommand)
+        self.assertEqual(cmds[0].target, "1")
+
+        self.session._execute_single_command("select 1")
+        self.assertEqual(self.session.selected_symbol, "NIFTY26JUN22200PE")
+
+        # Deselect / Clear selection
+        self.session._execute_single_command("deselect")
+        self.assertIsNone(self.session.selected_symbol)
+        self.assertIsNone(self.session.selected_account_name)
+
+    async def test_holdings_command_parsing(self):
+        from cli.parser import parse_command_line, HoldingsCommand
+
+        # Basic holdings
+        cmds = parse_command_line("holdings")
+        self.assertEqual(len(cmds), 1)
+        self.assertIsInstance(cmds[0], HoldingsCommand)
+        self.assertFalse(cmds[0].deep)
+        self.assertIsNone(cmds[0].account)
+
+        # Portfolio alias
+        cmds = parse_command_line("port deep")
+        self.assertEqual(len(cmds), 1)
+        self.assertIsInstance(cmds[0], HoldingsCommand)
+        self.assertTrue(cmds[0].deep)
+        self.assertIsNone(cmds[0].account)
+
+        # Account target
+        cmds = parse_command_line("holdings ZK8719")
+        self.assertEqual(len(cmds), 1)
+        self.assertIsInstance(cmds[0], HoldingsCommand)
+        self.assertTrue(cmds[0].deep)
+        self.assertEqual(cmds[0].account, "ZK8719")
+
+        # Live session execution
+        self.session._execute_single_command("port")
+        self.assertEqual(self.session.info_mode, "holdings")
+        self.assertEqual(self.session.holdings_view_mode, "summary")
+
+        self.session._execute_single_command("holdings deep")
+        self.assertEqual(self.session.info_mode, "holdings")
+        self.assertEqual(self.session.holdings_view_mode, "deep")
+
 
 if __name__ == "__main__":
     unittest.main()

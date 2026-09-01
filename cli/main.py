@@ -19,6 +19,7 @@ from cli.display import (
     display_info,
     display_login_urls,
     display_positions,
+    display_holdings,
     display_status,
     display_success,
 )
@@ -178,6 +179,65 @@ def positions() -> None:
         raise typer.Exit()
 
     display_positions(accounts_data)
+
+
+@app.command("holdings")
+def holdings(
+    account: Optional[str] = typer.Option(
+        None,
+        "--account",
+        "-a",
+        help="Target a single account by name or index for deep-dive breakdown.",
+    ),
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        "-d",
+        help="Display full constituent breakdown across accounts.",
+    ),
+) -> None:
+    """[bold]View holdings[/bold] — fetch and display stock portfolio across all accounts."""
+    display_banner()
+
+    config = _load_config_or_exit()
+    client = _build_client(config)
+
+    accounts = config.get("accounts", [])
+    api_keys = [acct.get("api_key", "") for acct in accounts]
+
+    try:
+        display_info("Fetching holdings…")
+        console.print()
+        result = client.get_holdings(api_keys)
+    except KCLIClientError as exc:
+        display_error(str(exc))
+        raise typer.Exit(code=1)
+
+    accounts_data = result.get("accounts", [])
+    if not accounts_data:
+        display_info("No holdings data returned.")
+        raise typer.Exit()
+
+    display_holdings(result, deep=deep, target_account=account)
+
+
+@app.command("portfolio")
+def portfolio(
+    account: Optional[str] = typer.Option(
+        None,
+        "--account",
+        "-a",
+        help="Target a single account by name or index for deep-dive breakdown.",
+    ),
+    deep: bool = typer.Option(
+        False,
+        "--deep",
+        "-d",
+        help="Display full constituent breakdown across accounts.",
+    ),
+) -> None:
+    """[bold]View portfolio[/bold] — alias for 'kcli holdings'."""
+    holdings(account=account, deep=deep)
 
 
 @app.command()

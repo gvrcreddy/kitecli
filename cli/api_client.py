@@ -537,6 +537,73 @@ class KCLIClient:
 
         return {"accounts": results}
 
+    def get_holdings(self, api_keys: list[str] | None = None) -> dict:
+        """Fetch stock/equity holdings for specified accounts in parallel."""
+        keys = api_keys or [a.get("api_key") for a in self._accounts if a.get("api_key")]
+
+        def fetch_one(api_key):
+            mgr = _manager_for(api_key)
+            info = mgr.get_account_info(api_key)
+            broker = getattr(mgr, "broker_name", "zerodha")
+            if not info.get("authenticated"):
+                return {
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "broker": broker,
+                    "holdings": [],
+                    "total_investment": 0.0,
+                    "total_current_value": 0.0,
+                    "total_pnl": 0.0,
+                    "total_day_change": 0.0,
+                    "status": "unauthenticated",
+                }
+            try:
+                holdings = mgr.get_holdings(api_key)
+                tot_inv = sum(h.get("investment_value", 0.0) for h in holdings)
+                tot_cur = sum(h.get("current_value", 0.0) for h in holdings)
+                tot_pnl = tot_cur - tot_inv
+                tot_day = sum(h.get("day_change", 0.0) for h in holdings)
+                return {
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "broker": broker,
+                    "holdings": holdings,
+                    "total_investment": tot_inv,
+                    "total_current_value": tot_cur,
+                    "total_pnl": tot_pnl,
+                    "total_day_change": tot_day,
+                    "status": "success",
+                }
+            except Exception as exc:
+                return {
+                    "name": info.get("name", api_key),
+                    "api_key": api_key,
+                    "broker": broker,
+                    "holdings": [],
+                    "total_investment": 0.0,
+                    "total_current_value": 0.0,
+                    "total_pnl": 0.0,
+                    "total_day_change": 0.0,
+                    "status": f"error: {exc}",
+                }
+
+        with ThreadPoolExecutor(max_workers=max(1, len(keys))) as executor:
+            results = list(executor.map(fetch_one, keys))
+
+        grand_inv = sum(a.get("total_investment", 0.0) for a in results)
+        grand_cur = sum(a.get("total_current_value", 0.0) for a in results)
+        grand_pnl = grand_cur - grand_inv
+        grand_day = sum(a.get("total_day_change", 0.0) for a in results)
+
+        return {
+            "accounts": results,
+            "grand_total_investment": grand_inv,
+            "grand_total_current_value": grand_cur,
+            "grand_total_pnl": grand_pnl,
+            "grand_total_day_change": grand_day,
+            "status": "success",
+        }
+
     def modify_order(
         self,
         api_key: str,

@@ -81,6 +81,10 @@ class BaseBrokerManager(ABC):
     def get_margins(self, account_key: str) -> dict[str, Any]:
         """Return {"net": float|None, "cash": float|None, "collateral": float|None}."""
 
+    @abstractmethod
+    def get_holdings(self, account_key: str) -> list[dict[str, Any]]:
+        """Fetch equity/stock holdings using the normalised schema."""
+
     # ── order management ──────────────────────────────────────────────────────
 
     @abstractmethod

@@ -1,9 +1,19 @@
 from dataclasses import dataclass
+from datetime import datetime, date, time as dtime, timedelta
+import re
 from typing import Optional, Union, Any
 
 @dataclass
 class AccountSelectCommand:
     account_name: str
+
+@dataclass
+class OrderSelectCommand:
+    target: str  # order ID suffix, exact ID, or "none" / "clear"
+
+@dataclass
+class PositionSelectCommand:
+    target: str  # position ID, symbol, or "none" / "clear"
 
 @dataclass
 class PlaceOrderCommand:
@@ -12,12 +22,14 @@ class PlaceOrderCommand:
     quantity: Optional[str]  # Quantity string to preserve lot syntax (e.g. "2L", "50") or None
     price: Optional[float] = None
     product: str = "NRML"
+    trigger_time: Optional[datetime] = None
     confirmed: bool = False
 
 @dataclass
 class ExitCommand:
     target: str  # "all", symbol name, index ID, or "selected"
     price: Optional[float] = None
+    trigger_time: Optional[datetime] = None
     confirmed: bool = False
 
 @dataclass
@@ -49,6 +61,11 @@ class MarketDepthCommand:
     symbol: Optional[str] = None
 
 @dataclass
+class HoldingsCommand:
+    deep: bool = False
+    account: Optional[str] = None
+
+@dataclass
 class ConditionalOrderCommand:
     parent_cmd: Union[PlaceOrderCommand, ExitCommand]
     child_cmd: Union[PlaceOrderCommand, ExitCommand]
@@ -63,6 +80,95 @@ class CancelConditionalOrderCommand:
 @dataclass
 class ConditionalOrdersViewCommand:
     pass
+
+@dataclass
+class CancelScheduledOrderCommand:
+    target: str  # "all", ID string, etc.
+    confirmed: bool = False
+
+@dataclass
+class ScheduledOrdersViewCommand:
+    pass
+
+
+def _parse_date_time(date_str: Optional[str], time_str: str) -> datetime:
+    """Parse time and date strings into a concrete datetime object."""
+    time_str = time_str.strip()
+    is_pm = "pm" in time_str.lower()
+    is_am = "am" in time_str.lower()
+    clean_time = re.sub(r"[a-zA-Z\s]", "", time_str)
+    t_parts = clean_time.split(":")
+
+    hr = int(t_parts[0])
+    minute = int(t_parts[1]) if len(t_parts) > 1 else 0
+    sec = int(t_parts[2]) if len(t_parts) > 2 else 0
+
+    if is_pm and hr < 12:
+        hr += 12
+    elif is_am and hr == 12:
+        hr = 0
+
+    if not (0 <= hr <= 23 and 0 <= minute <= 59 and 0 <= sec <= 59):
+        raise ValueError(f"Invalid time format: '{time_str}'")
+
+    if date_str:
+        date_str = date_str.strip()
+        if "-" in date_str:
+            d_parts = date_str.split("-")
+            if len(d_parts[0]) == 4:  # YYYY-MM-DD
+                target_date = date(int(d_parts[0]), int(d_parts[1]), int(d_parts[2]))
+            else:  # DD-MM-YYYY
+                target_date = date(int(d_parts[2]), int(d_parts[1]), int(d_parts[0]))
+        else:
+            raise ValueError(f"Invalid date format: '{date_str}'. Expected YYYY-MM-DD or DD-MM-YYYY.")
+    else:
+        target_date = datetime.now().date()
+
+    target_dt = datetime.combine(target_date, dtime(hr, minute, sec))
+
+    # If date was omitted, check if time has already passed today by > 60s
+    if not date_str:
+        now = datetime.now()
+        if target_dt < now - timedelta(seconds=60):
+            raise ValueError(
+                f"Specified time '{time_str}' has already passed today ({now.strftime('%H:%M:%S')}). "
+                f"Please specify a future date, e.g. 'at {time_str} {(now + timedelta(days=1)).strftime('%Y-%m-%d')}'"
+            )
+
+    return target_dt
+
+
+def _extract_time_clause(raw_text: str) -> tuple[str, Optional[datetime]]:
+    """Extract 'at <time> [<date>]' or 'on <date> at <time>' from command text.
+
+    Returns:
+        (remaining_command_text, parsed_datetime_or_None)
+    """
+    # Pattern 1: "on YYYY-MM-DD [at] HH:MM[:SS] [AM|PM]" or "on DD-MM-YYYY [at] HH:MM[:SS] [AM|PM]"
+    m_on = re.search(
+        r"\s+on\s+(\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4})\s+(?:at\s+)?(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)",
+        raw_text,
+        re.IGNORECASE
+    )
+    if m_on:
+        date_str, time_str = m_on.group(1), m_on.group(2)
+        dt = _parse_date_time(date_str, time_str)
+        cleaned = raw_text[:m_on.start()] + raw_text[m_on.end():]
+        return cleaned.strip(), dt
+
+    # Pattern 2: "at HH:MM[:SS] [AM|PM] [YYYY-MM-DD|DD-MM-YYYY]"
+    m_at = re.search(
+        r"\s+at\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)(?:\s+(\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4}))?",
+        raw_text,
+        re.IGNORECASE
+    )
+    if m_at:
+        time_str, date_str = m_at.group(1), m_at.group(2)
+        dt = _parse_date_time(date_str, time_str)
+        cleaned = raw_text[:m_at.start()] + raw_text[m_at.end():]
+        return cleaned.strip(), dt
+
+    return raw_text, None
 
 
 
@@ -144,18 +250,51 @@ def parse_single_command(raw_text: str) -> Any:
             child_raw_text=child_raw,
         )
 
+    # Extract optional trigger time clause for order/exit actions
+    trigger_dt = None
+    first_tok = raw_clean.split()[0].lower() if raw_clean.split() else ""
+    if first_tok in ("buy", "sell", "b", "s", "exit"):
+        raw_clean, trigger_dt = _extract_time_clause(raw_clean)
+
     parts = [p.strip() for p in raw_clean.split() if p.strip()]
     if not parts:
         return None
     primary = parts[0].lower()
 
-    # 1. Account select
-    if primary in ("account", "acct", "a"):
+    # 1. Selection commands: select / s o / s a / s <target> / deselect
+    if primary in ("select", "sel", "deselect"):
+        if primary == "deselect":
+            return PositionSelectCommand(target="none")
+        if len(parts) < 2:
+            raise ValueError("Usage: select <pos_id|symbol|none>  OR  select order <id|none>  OR  select account <name|none>")
+        sub = parts[1].lower()
+        if sub in ("account", "acct", "a"):
+            acc = " ".join(parts[2:]) if len(parts) >= 3 else "all"
+            return AccountSelectCommand(account_name=acc)
+        elif sub in ("order", "ord", "o"):
+            ord_target = parts[2] if len(parts) >= 3 else "none"
+            return OrderSelectCommand(target=ord_target)
+        else:
+            return PositionSelectCommand(target=parts[1])
+
+    elif primary == "s" and len(parts) >= 2 and parts[1].lower() in ("order", "ord", "o"):
+        ord_target = parts[2] if len(parts) >= 3 else "none"
+        return OrderSelectCommand(target=ord_target)
+
+    elif primary == "s" and len(parts) >= 2 and parts[1].lower() in ("account", "acct", "a"):
+        acc = " ".join(parts[2:]) if len(parts) >= 3 else "all"
+        return AccountSelectCommand(account_name=acc)
+
+    elif primary == "s" and len(parts) == 2 and parts[1].lower() in ("none", "clear", "null", "empty"):
+        return PositionSelectCommand(target="none")
+
+    # 2. Direct Account select: account <name|all> / acct <name|all> / a <name|all>
+    elif primary in ("account", "acct", "a"):
         if len(parts) < 2:
             raise ValueError("Usage: account <name|all>")
-        return AccountSelectCommand(account_name=parts[1])
+        return AccountSelectCommand(account_name=" ".join(parts[1:]))
 
-    # 2. Place Order (Buy/Sell)
+    # 3. Place Order (Buy/Sell)
     elif primary in ("buy", "sell", "b", "s"):
         if len(parts) < 2:
             raise ValueError(f"Usage: {primary} [symbol|id] [qty] [price] [product]")
@@ -221,21 +360,26 @@ def parse_single_command(raw_text: str) -> Any:
             symbol_or_id=symbol_or_id,
             quantity=qty,
             price=price,
-            product=product
+            product=product,
+            trigger_time=trigger_dt
         )
 
-    # 3. Exit
+    # 4. Exit
     elif primary == "exit":
         if len(parts) < 2:
             target = "selected"
             price = None
         elif len(parts) == 2:
-            try:
-                price = float(parts[1])
-                target = "selected"
-            except ValueError:
+            if parts[1].isdigit() or parts[1].lower() == "all":
                 target = parts[1]
                 price = None
+            else:
+                try:
+                    price = float(parts[1])
+                    target = "selected"
+                except ValueError:
+                    target = parts[1]
+                    price = None
         else:
             target = parts[1]
             try:
@@ -243,36 +387,53 @@ def parse_single_command(raw_text: str) -> Any:
             except ValueError:
                 raise ValueError("Exit price must be a valid number.")
 
-        return ExitCommand(target=target, price=price)
+        return ExitCommand(target=target, price=price, trigger_time=trigger_dt)
 
-    # 4. Status
+    # 5. Status
     elif primary in ("status", "st", "health"):
         return StatusCommand()
 
-    # 5. Positions / Pos
+    # 6. Positions / Pos
     elif primary in ("positions", "pos"):
         return PositionsCommand()
 
-    # 6. Orders / Ord
+    # 7. Orders / Ord
     elif primary in ("orders", "ord"):
         return OrdersCommand()
 
-    # 7. Cancel / Cancel Conditional
+    # 8. Cancel / Cancel Conditional / Cancel Scheduled
     elif primary in ("cancel", "c"):
         if len(parts) < 2:
-            raise ValueError("Usage: cancel <order_id|symbol|all>  OR  cancel co <id|all>")
+            return CancelOrderCommand(target="selected")
         if parts[1].lower() in ("co", "cond", "conditional", "conditionals"):
             target_id = parts[2] if len(parts) >= 3 else "all"
             return CancelConditionalOrderCommand(target=target_id)
+        elif parts[1].lower() in ("sched", "scheduled", "schedule", "so"):
+            target_id = parts[2] if len(parts) >= 3 else "all"
+            return CancelScheduledOrderCommand(target=target_id)
         return CancelOrderCommand(target=parts[1])
 
-    # 8. Conditional Orders View
+    # 9. Conditional Orders View
     elif primary in ("cond", "co", "conditional", "conditionals"):
         return ConditionalOrdersViewCommand()
 
-    # 9. Modify
+    # 9b. Scheduled Orders View
+    elif primary in ("sched", "scheduled", "schedule"):
+        return ScheduledOrdersViewCommand()
+
+    # 10. Modify
     elif primary in ("modify", "m", "order"):
-        if len(parts) == 3:
+        if len(parts) == 2:
+            try:
+                price_val = float(parts[1])
+                return ModifyOrderCommand(
+                    order_id="selected",
+                    quantity=None,
+                    price=price_val
+                )
+            except ValueError:
+                raise ValueError("Modify price must be a valid number.")
+        elif len(parts) == 3:
             try:
                 price_val = float(parts[2])
             except ValueError:
@@ -293,12 +454,31 @@ def parse_single_command(raw_text: str) -> Any:
                 price=price_val
             )
         else:
-            raise ValueError("Usage: order <id_or_sym> <price>  OR  order <id_or_sym> <qty> <price>")
+            raise ValueError("Usage: order <id_or_sym> <price>  OR  order <id_or_sym> <qty> <price>  OR  order <price>")
 
-    # 10. Market Depth
+    # 11. Market Depth
     elif primary in ("md", "depth", "marketdepth"):
         sym = parts[1] if len(parts) >= 2 else None
         return MarketDepthCommand(symbol=sym)
+
+    # 12. Holdings / Portfolio
+    elif primary in ("holdings", "holding", "portfolio", "port", "hld"):
+        deep = False
+        target_acct = None
+        if len(parts) >= 2:
+            arg1 = parts[1].lower()
+            if arg1 in ("deep", "all", "detail", "details"):
+                deep = True
+                if len(parts) >= 3:
+                    target_acct = parts[2]
+            elif arg1 in ("summary", "sum"):
+                deep = False
+            else:
+                target_acct = parts[1]
+                deep = True
+                if len(parts) >= 3 and parts[2].lower() in ("deep", "detail", "details"):
+                    deep = True
+        return HoldingsCommand(deep=deep, account=target_acct)
 
     else:
         raise ValueError(f"Unknown command: '{primary}'")

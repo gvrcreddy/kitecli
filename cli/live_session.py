@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta, time
 import logging
+from typing import Any, Optional, Union
 from urllib.parse import urlparse
 import threading
 
@@ -25,13 +26,13 @@ from prompt_toolkit.filters import has_focus
 from prompt_toolkit.data_structures import Point
 
 from cli.api_client import KCLIClient, KCLIClientError
-from cli.display import render_positions_to_string
+from cli.display import render_positions_to_string, render_holdings_to_string
 from cli.recorder import DataRecorder
 from cli.parser import (
-    parse_command_line, AccountSelectCommand, PlaceOrderCommand, ExitCommand,
+    parse_command_line, parse_single_command, AccountSelectCommand, OrderSelectCommand, PositionSelectCommand, PlaceOrderCommand, ExitCommand,
     StatusCommand, PositionsCommand, OrdersCommand, CancelOrderCommand, ModifyOrderCommand,
-    MarketDepthCommand, ConditionalOrderCommand, CancelConditionalOrderCommand,
-    ConditionalOrdersViewCommand
+    MarketDepthCommand, HoldingsCommand, ConditionalOrderCommand, CancelConditionalOrderCommand,
+    ConditionalOrdersViewCommand, CancelScheduledOrderCommand, ScheduledOrdersViewCommand
 )
 from cli.executor import ExecutionContext, resolve_symbol_or_id
 import json
@@ -410,17 +411,25 @@ class KCLILiveSession:
         self.conditional_orders_map: dict[str, dict] = {}
         self._init_conditional_orders()
 
+        # Scheduled orders in-memory lookup: sched_id -> sched_dict
+        self.scheduled_orders_map: dict[int, dict] = {}
+        self._init_scheduled_orders()
+
         # Info pane state
-        # mode: "orders_pending" | "orders_executed" | "oc" | "advisor" | "pnl" | "md" | "help"
+        # mode: "orders_pending" | "orders_executed" | "oc" | "advisor" | "pnl" | "md" | "holdings" | "help"
         self.info_mode: str = "orders_pending"
-        self.pnl_period: str = "month"  # "week" | "month" | "year"
+        self.pnl_period: str = "week"  # "week" | "last_week" | "month" | "year" | "custom"
         self.md_symbol: str = ""
+        self.holdings_view_mode: str = "summary"  # "summary" | "deep"
+        self.holdings_target_account: str | None = None
+        self.last_holdings_response: dict | None = None
         self._last_oc_text: str = "Press F3 or run 'oc <UNDERLYING>' to fetch option chain."
         self._last_pending_text: str = "Fetching pending orders..."
         self._last_executed_text: str = "Fetching executed orders..."
         self._last_advisor_text: str = "Press F4 to view Tuesday Option Strangle Advisor plan."
         self._last_pnl_text: str = "Fetching P&L analytics..."
-        self._last_md_text: str = "Press F7 or run 'md <SYMBOL>' to fetch market depth."
+        self._last_md_text: str = "Press F6 or run 'md <SYMBOL>' to fetch market depth."
+        self._last_holdings_text: str = "Press F7 or run 'holdings' to view portfolio."
         self._advisor_alerted_today: str | None = None
         self._last_advisor_time_check: float = 0.0
 
@@ -1058,6 +1067,8 @@ class KCLILiveSession:
                     mouse_event = args[0]
                 
                 if mouse_event and mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    if mode == "pnl":
+                        self.pnl_period = "week"
                     self.info_mode = mode
                     self._update_info_buffer()
                     if hasattr(self, "app") and self.app:
@@ -1117,7 +1128,15 @@ class KCLILiveSession:
         ))
         fragments.append(("", " "))
 
-        # Tab 7: Help
+        # Tab 7: Holdings
+        fragments.append((
+            "class:tab.active" if self.info_mode == "holdings" else "class:tab.inactive",
+            " Holdings ",
+            make_click_handler("holdings")
+        ))
+        fragments.append(("", " "))
+
+        # Tab 8: Help
         fragments.append((
             "class:tab.active" if self.info_mode == "help" else "class:tab.inactive",
             " Help ",
@@ -1292,6 +1311,9 @@ class KCLILiveSession:
         # Fire off REST data fetch in the background so it doesn't block WebSockets
         if hasattr(self, "app") and self.app and self.app.loop:
             asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+        
+        # Start scheduled orders poller
+        asyncio.create_task(self._poll_scheduled_orders())
         
         try:
             token_statuses = await self._diagnose_tokens()
@@ -1738,16 +1760,30 @@ class KCLILiveSession:
                 errors_this_cycle = 0
                 cycle_failed_keys = set()
 
-                # Fetch positions, margins, orders, and indices concurrently.
+                # Fetch positions, margins, orders, indices (and holdings) concurrently.
                 positions_task = self._run_api_call(self.client.get_positions, api_keys)
                 margins_task   = self._run_api_call(self.client.get_margins, api_keys)
                 orders_task    = self._run_api_call(self.client.get_orders, api_keys)
                 indices_task   = self._run_api_call(self.client.get_market_indices)
+                
+                fetch_holdings = (self.info_mode == "holdings" or getattr(self, "last_holdings_response", None) is None)
+                holdings_task  = self._run_api_call(self.client.get_holdings, api_keys) if fetch_holdings else None
 
-                response, margins_resp, orders_resp, indices_resp = await asyncio.gather(
-                    positions_task, margins_task, orders_task, indices_task,
-                    return_exceptions=True,
-                )
+                tasks = [positions_task, margins_task, orders_task, indices_task]
+                if holdings_task:
+                    tasks.append(holdings_task)
+
+                gather_results = await asyncio.gather(*tasks, return_exceptions=True)
+                response = gather_results[0]
+                margins_resp = gather_results[1]
+                orders_resp = gather_results[2]
+                indices_resp = gather_results[3]
+                holdings_resp = gather_results[4] if holdings_task and len(gather_results) > 4 else None
+
+                if holdings_resp is not None and not isinstance(holdings_resp, BaseException):
+                    self.last_holdings_response = holdings_resp
+                    if self.info_mode == "holdings":
+                        self._update_info_buffer(reset_scroll=False)
 
                 # 1. Process positions response
                 if isinstance(response, BaseException):
@@ -2456,6 +2492,258 @@ class KCLILiveSession:
         except Exception as exc:
             logger.warning("Failed to initialize conditional orders: %s", exc)
 
+    def _init_scheduled_orders(self) -> None:
+        """Re-hydrate active pending scheduled orders from SQLite and expire old ones."""
+        if not getattr(self, "recorder", None):
+            return
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            # 1. Expire past scheduled orders older than today
+            expired_cnt = self.recorder.expire_old_scheduled_orders(today_str)
+            if expired_cnt > 0:
+                logger.info("Expired %d stale scheduled order(s) from past dates.", expired_cnt)
+
+            # 2. Re-hydrate pending scheduled orders
+            pending = self.recorder.get_pending_scheduled_orders()
+            self.scheduled_orders_map.clear()
+            for sched in pending:
+                sid = sched.get("id")
+                if sid:
+                    self.scheduled_orders_map[sid] = sched
+            if pending:
+                logger.info("Re-hydrated %d active scheduled order(s).", len(pending))
+        except Exception as exc:
+            logger.warning("Failed to initialize scheduled orders: %s", exc)
+
+    def register_scheduled_order(self, cmd_obj: Any, command_raw: str = "", api_keys: list[str] = []) -> int:
+        """Register a scheduled standalone order or conditional chain into SQLite and timer map."""
+        is_cond = isinstance(cmd_obj, ConditionalOrderCommand)
+        if is_cond:
+            parent = cmd_obj.parent_cmd
+            child_raw = cmd_obj.child_raw_text
+            trig_dt = getattr(parent, "trigger_time", None)
+            act = getattr(parent, "action", "EXIT")
+            sym = getattr(parent, "symbol_or_id", getattr(parent, "target", None))
+            qty = getattr(parent, "quantity", None)
+            price = getattr(parent, "price", None)
+            prod = getattr(parent, "product", "NRML")
+        else:
+            trig_dt = getattr(cmd_obj, "trigger_time", None)
+            act = getattr(cmd_obj, "action", "EXIT" if isinstance(cmd_obj, ExitCommand) else "BUY")
+            sym = getattr(cmd_obj, "symbol_or_id", getattr(cmd_obj, "target", None))
+            qty = getattr(cmd_obj, "quantity", None)
+            price = getattr(cmd_obj, "price", None)
+            prod = getattr(cmd_obj, "product", "NRML")
+            child_raw = None
+
+        if not trig_dt:
+            trig_dt = datetime.now()
+
+        trig_str = trig_dt.strftime("%Y-%m-%d %H:%M:%S")
+        target_acct_key = api_keys[0] if api_keys else (self.selected_account_api_key or "ALL")
+        target_acct_name = self._get_account_name(target_acct_key) if target_acct_key != "ALL" else "ALL"
+
+        sched_id = self.recorder.save_scheduled_order(
+            trigger_time=trig_str,
+            command_raw=command_raw,
+            action=act,
+            symbol_or_id=sym,
+            quantity=qty,
+            price=price,
+            product=prod,
+            account_key=target_acct_key,
+            account_name=target_acct_name,
+            is_conditional=is_cond,
+            child_command_raw=child_raw,
+        )
+
+        sched_entry = {
+            "id": sched_id,
+            "trigger_time": trig_str,
+            "command_raw": command_raw,
+            "action": act,
+            "symbol_or_id": sym,
+            "quantity": qty,
+            "price": price,
+            "product": prod,
+            "account_key": target_acct_key,
+            "account_name": target_acct_name,
+            "is_conditional": 1 if is_cond else 0,
+            "child_command_raw": child_raw,
+            "status": "PENDING",
+        }
+        self.scheduled_orders_map[sched_id] = sched_entry
+
+        cond_suffix = f" -> [THEN {child_raw}]" if is_cond else ""
+        price_disp = f"@{price:.2f}" if price else "@MKT"
+        self.log_message(
+            f"[#00e5ff]⏰ Scheduled Order #{sched_id} Registered [@{target_acct_name}]:[/#] "
+            f"{act} {qty or ''} {sym or ''} {price_disp} at {trig_str}{cond_suffix}"
+        )
+        if hasattr(self, "app") and self.app and self.app.loop:
+            asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+        return sched_id
+
+    async def _poll_scheduled_orders(self) -> None:
+        """Background poller checking pending scheduled orders every 500ms."""
+        while self.running:
+            try:
+                if getattr(self, "scheduled_orders_map", None):
+                    now = datetime.now()
+                    for sched_id, sched in list(self.scheduled_orders_map.items()):
+                        if sched.get("status") != "PENDING":
+                            continue
+
+                        trig_str = sched.get("trigger_time")
+                        if not trig_str:
+                            continue
+
+                        try:
+                            if "T" in trig_str:
+                                trig_dt = datetime.fromisoformat(trig_str)
+                            else:
+                                trig_dt = datetime.strptime(trig_str, "%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            try:
+                                trig_dt = datetime.fromisoformat(trig_str)
+                            except Exception:
+                                continue
+
+                        if now >= trig_dt:
+                            drift_sec = (now - trig_dt).total_seconds()
+                            if drift_sec > 60.0:
+                                sched["status"] = "EXPIRED"
+                                if getattr(self, "recorder", None):
+                                    self.recorder.update_scheduled_order_status(
+                                        sched_id, "EXPIRED", failure_reason=f"Trigger window missed (drift: {int(drift_sec)}s)"
+                                    )
+                                self.scheduled_orders_map.pop(sched_id, None)
+                                self.log_message(
+                                    f"[#ff0000]⏰ Scheduled Order #{sched_id} Expired:[/#] "
+                                    f"Missed trigger window by {int(drift_sec)}s (system sleep or clock jump)."
+                                )
+                                continue
+
+                            sched["status"] = "TRIGGERED"
+                            self.scheduled_orders_map.pop(sched_id, None)
+                            asyncio.create_task(self._execute_scheduled_trigger(sched_id, sched))
+            except Exception as exc:
+                logger.error("Error in _poll_scheduled_orders loop: %s", exc)
+
+            await asyncio.sleep(0.5)
+
+    async def _execute_scheduled_trigger(self, sched_id: int, sched: dict) -> None:
+        """Execute a scheduled order or conditional chain upon trigger time arrival."""
+        is_cond = bool(sched.get("is_conditional"))
+        action = str(sched.get("action", "")).upper()
+        symbol_or_id = sched.get("symbol_or_id")
+        qty = sched.get("quantity")
+        price = sched.get("price")
+        product = sched.get("product") or "NRML"
+        acct_key = sched.get("account_key")
+
+        price_str = f"@{price:.2f}" if price else "@MKT"
+        self.log_message(
+            f"[#00ff00]⏰ Scheduled Trigger Fired (#{sched_id}):[/#] "
+            f"{action} {qty or ''} {symbol_or_id or ''} {price_str}"
+        )
+
+        try:
+            api_keys = [acct_key] if (acct_key and acct_key != "ALL") else []
+            if is_cond:
+                child_raw = sched.get("child_command_raw") or ""
+                parent_cmd = PlaceOrderCommand(
+                    action=action,
+                    symbol_or_id=symbol_or_id,
+                    quantity=qty,
+                    price=price,
+                    product=product,
+                )
+                try:
+                    child_cmd = parse_single_command(child_raw)
+                except Exception:
+                    parts_child = child_raw.split()
+                    if parts_child:
+                        act_raw = parts_child[0].upper()
+                        act = "BUY" if act_raw in ("BUY", "B") else ("SELL" if act_raw in ("SELL", "S") else "EXIT")
+                        price_val = float(parts_child[1]) if len(parts_child) >= 2 else None
+                        child_cmd = PlaceOrderCommand(action=act, symbol_or_id=None, quantity=None, price=price_val)
+                    else:
+                        child_cmd = ExitCommand(target="selected")
+
+                cond_cmd = ConditionalOrderCommand(
+                    parent_cmd=parent_cmd,
+                    child_cmd=child_cmd,
+                    child_raw_text=child_raw,
+                )
+                await self.execute_conditional_order(cond_cmd, api_keys=api_keys)
+                if getattr(self, "recorder", None):
+                    self.recorder.update_scheduled_order_status(sched_id, "TRIGGERED", executed_at=datetime.now().isoformat())
+
+            elif action == "EXIT":
+                target = symbol_or_id or "selected"
+                await self.execute_exit(symbol=target, api_keys=api_keys, price=price)
+                if getattr(self, "recorder", None):
+                    self.recorder.update_scheduled_order_status(sched_id, "TRIGGERED", executed_at=datetime.now().isoformat())
+
+            else:
+                # Resolve symbol if ID
+                sym = symbol_or_id
+                if sym and sym.isdigit():
+                    sym, api_keys = resolve_symbol_or_id(
+                        ExecutionContext(self.client, self.active_positions, self.position_id_map, self.selected_symbol, self.selected_account_api_key or "ALL"),
+                        sym
+                    )
+                elif sym:
+                    sym = sym.upper()
+                else:
+                    sym = self.selected_symbol
+
+                if not sym:
+                    raise ValueError("No symbol specified and no active selection.")
+
+                if not qty:
+                    matching_positions = [
+                        p for p in self.active_positions
+                        if p.get("tradingsymbol") == sym and (not api_keys or p.get("api_key") in api_keys) and abs(p.get("quantity", 0)) > 0
+                    ]
+                    if not matching_positions:
+                        raise ValueError(f"Omitted quantity for {sym}, but no matching open position found.")
+                    for p in matching_positions:
+                        p_key = p["api_key"]
+                        p_qty = str(abs(p.get("quantity", 0)))
+                        await self.execute_order(
+                            symbol=sym,
+                            transaction_type=action,
+                            qty_str=p_qty,
+                            price_str=str(price) if price else None,
+                            product=product,
+                            api_keys=[p_key],
+                        )
+                else:
+                    qty_val, _, qty_err = self._resolve_qty(qty, sym)
+                    if qty_err:
+                        raise ValueError(qty_err)
+                    await self.execute_order(
+                        symbol=sym,
+                        transaction_type=action,
+                        qty_str=qty_val,
+                        price_str=str(price) if price else None,
+                        product=product,
+                        api_keys=api_keys,
+                    )
+                if getattr(self, "recorder", None):
+                    self.recorder.update_scheduled_order_status(sched_id, "TRIGGERED", executed_at=datetime.now().isoformat())
+
+        except Exception as exc:
+            logger.error("Failed to execute scheduled order #%d: %s", sched_id, exc, exc_info=True)
+            self.log_message(f"[#ff0000]✗ Scheduled Order #{sched_id} Execution Failed:[/#] {exc}")
+            if getattr(self, "recorder", None):
+                self.recorder.update_scheduled_order_status(sched_id, "FAILED", failure_reason=str(exc))
+        finally:
+            if hasattr(self, "app") and self.app and self.app.loop:
+                asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+
     def _check_conditional_triggers(self, order_id: str, status: str, filled_qty: int = 0, ord_data: dict | None = None) -> None:
         """Check if an order update completes or cancels any pending conditional child orders."""
         oid = str(order_id).strip()
@@ -2770,7 +3058,9 @@ class KCLILiveSession:
             - display_str: human-friendly string shown in confirmation, e.g. '2L (150 qty)'
             - error: non-None string if the input is invalid.
         """
-        cleaned = qty_arg.strip()
+        if qty_arg is None or not str(qty_arg).strip():
+            return None, "original qty", None
+        cleaned = str(qty_arg).strip()
         if cleaned.upper().endswith("L"):
             # Lot-based quantity
             lots_str = cleaned[:-1]
@@ -2920,16 +3210,18 @@ class KCLILiveSession:
         except KCLIClientError as exc:
             self.log_message(f"[#ff0000]Exit Execution Failed:[/#] {exc}")
 
-    async def execute_modify(self, order_id: str, qty_str: str, price_str: str, api_key: str) -> None:
+    async def execute_modify(self, order_id: str, qty_str: str | None, price_str: str, api_key: str) -> None:
         """Modify open order in executor."""
-        # 1. Validate quantity
-        try:
-            qty = int(qty_str)
-            if qty <= 0:
-                raise ValueError("Quantity must be positive.")
-        except ValueError:
-            self.log_message(f"[#ff0000]Error:[/#] Invalid quantity '{qty_str}'. Must be a positive integer.")
-            return
+        # 1. Validate quantity (optional if modifying price only)
+        qty = None
+        if qty_str is not None and str(qty_str).strip() and str(qty_str).strip().lower() != "none":
+            try:
+                qty = int(qty_str)
+                if qty <= 0:
+                    raise ValueError("Quantity must be positive.")
+            except ValueError:
+                self.log_message(f"[#ff0000]Error:[/#] Invalid quantity '{qty_str}'. Must be a positive integer.")
+                return
 
         # 2. Parse price
         price = None
@@ -2944,7 +3236,8 @@ class KCLILiveSession:
                 self.log_message(f"[#ff0000]Error:[/#] Invalid price '{price_str}'. Must be a positive float.")
                 return
 
-        self.log_message(f"Modifying order {order_id} to quantity {qty} @ {price or 'MARKET'}...")
+        qty_desc = f"quantity {qty} " if qty is not None else ""
+        self.log_message(f"Modifying order {order_id} to {qty_desc}@ {price or 'MARKET'}...")
 
         try:
             response = await self._run_api_call(
@@ -3153,17 +3446,36 @@ class KCLILiveSession:
                             api_keys=p.get("api_keys", []),
                         )
                     )
-                else:
-                    asyncio.create_task(
-                        self.execute_order(
-                            p["symbol"],
-                            p["type"],
-                            p["qty"],
-                            p["price"],
-                            p["product"],
-                            api_keys=p.get("api_keys", []),
-                        )
+                elif p["type"] == "scheduled":
+                    self.register_scheduled_order(
+                        cmd_obj=p["cmd"],
+                        command_raw=p.get("command_raw", ""),
+                        api_keys=p.get("api_keys", []),
                     )
+                else:
+                    if p.get("orders"):
+                        for o in p["orders"]:
+                            asyncio.create_task(
+                                self.execute_order(
+                                    symbol=p["symbol"],
+                                    transaction_type=p["type"].upper(),
+                                    qty_str=str(o["qty"]),
+                                    price_str=p.get("price"),
+                                    product=p.get("product", "NRML"),
+                                    api_keys=[o["api_key"]],
+                                )
+                            )
+                    else:
+                        asyncio.create_task(
+                            self.execute_order(
+                                p["symbol"],
+                                p["type"],
+                                p["qty"],
+                                p["price"],
+                                p["product"],
+                                api_keys=p.get("api_keys", []),
+                            )
+                        )
             else:
                 self.log_message("[#ff5555]Order Cancelled.[/#]")
                 self._log_command(
@@ -3211,31 +3523,36 @@ class KCLILiveSession:
                 self.pnl_period = "custom"
                 self.pnl_custom_start = dates[0]
                 self.pnl_custom_end = dates[1] if len(dates) >= 2 else dates[0]
-            elif "week" in cmd_norm or " w" in cmd_norm or cmd_norm == "pnl w":
+            elif "last_week" in cmd_norm or "lastweek" in cmd_norm or " lw" in cmd_norm or cmd_norm == "pnl lw" or cmd_norm == "pnl 2":
+                self.pnl_period = "last_week"
+            elif "week" in cmd_norm or " w" in cmd_norm or cmd_norm == "pnl w" or cmd_norm == "pnl 1":
                 self.pnl_period = "week"
-            elif "year" in cmd_norm or " y" in cmd_norm or cmd_norm == "pnl y":
-                self.pnl_period = "year"
-            elif "month" in cmd_norm or " m" in cmd_norm or cmd_norm == "pnl m":
+            elif "month" in cmd_norm or " m" in cmd_norm or cmd_norm == "pnl m" or cmd_norm == "pnl 3":
                 self.pnl_period = "month"
-            elif "custom" in cmd_norm or " c" in cmd_norm or cmd_norm == "pnl c":
+            elif "year" in cmd_norm or " y" in cmd_norm or cmd_norm == "pnl y" or cmd_norm == "pnl 4":
+                self.pnl_period = "year"
+            elif "custom" in cmd_norm or " c" in cmd_norm or cmd_norm == "pnl c" or cmd_norm == "pnl 5":
                 self.pnl_period = "custom"
+            else:
+                self.pnl_period = "week"
             self._update_info_buffer()
             if hasattr(self, "app") and self.app:
                 self.app.invalidate()
-            self.log_message(f"Switched info pane to [bold]P&L Analytics ({getattr(self, 'pnl_period', 'month').title()})[/bold].")
+            self.log_message(f"Switched info pane to [bold]P&L Analytics ({getattr(self, 'pnl_period', 'week').replace('_', ' ').title()})[/bold].")
             return
-        elif self.info_mode == "pnl" and cmd_norm in ("w", "m", "y", "c", "week", "month", "year", "custom", "1", "2", "3", "4"):
+        elif self.info_mode == "pnl" and cmd_norm in ("w", "lw", "m", "y", "c", "week", "lastweek", "last_week", "last-week", "month", "year", "custom", "1", "2", "3", "4", "5"):
             period_map = {
                 "w": "week", "week": "week", "1": "week",
-                "m": "month", "month": "month", "2": "month",
-                "y": "year", "year": "year", "3": "year",
-                "c": "custom", "custom": "custom", "4": "custom",
+                "lw": "last_week", "lastweek": "last_week", "last_week": "last_week", "last-week": "last_week", "2": "last_week",
+                "m": "month", "month": "month", "3": "month",
+                "y": "year", "year": "year", "4": "year",
+                "c": "custom", "custom": "custom", "5": "custom",
             }
             self.pnl_period = period_map[cmd_norm]
             self._update_info_buffer()
             if hasattr(self, "app") and self.app:
                 self.app.invalidate()
-            self.log_message(f"P&L period switched to [bold]{self.pnl_period.title()}[/bold].")
+            self.log_message(f"P&L period switched to [bold]{self.pnl_period.replace('_', ' ').title()}[/bold].")
             return
         elif self.info_mode == "pnl":
             dates = self._extract_custom_dates_from_cmd(cmd)
@@ -3265,7 +3582,43 @@ class KCLILiveSession:
                 self.app.invalidate()
             self.log_message(f"Market Depth symbol set to [bold]{self.md_symbol}[/bold].")
             return
-        elif cmd_norm in ("help", "h", "7", "/7", "/help"):
+        elif cmd_norm in ("holdings", "holding", "portfolio", "port", "hld", "7", "/7", "/holdings", "/portfolio", "/port") or cmd_norm.startswith(("holdings ", "holding ", "portfolio ", "port ", "hld ")):
+            self.info_mode = "holdings"
+            parts = cmd.strip().split()
+            if len(parts) >= 2:
+                arg1 = parts[1].lower()
+                if arg1 in ("deep", "all", "detail", "details"):
+                    self.holdings_view_mode = "deep"
+                    self.holdings_target_account = parts[2] if len(parts) >= 3 else None
+                elif arg1 in ("summary", "sum", "1"):
+                    self.holdings_view_mode = "summary"
+                    self.holdings_target_account = None
+                elif arg1 in ("2",):
+                    self.holdings_view_mode = "deep"
+                    self.holdings_target_account = None
+                else:
+                    self.holdings_view_mode = "deep"
+                    self.holdings_target_account = parts[1]
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            view_desc = f"Deep View ({self.holdings_target_account})" if self.holdings_target_account else ("Deep View" if self.holdings_view_mode == "deep" else "Summary")
+            self.log_message(f"Switched info pane to [bold]Holdings & Portfolio ({view_desc})[/bold].")
+            return
+        elif self.info_mode == "holdings" and cmd_norm in ("1", "sum", "summary", "2", "deep", "all"):
+            if cmd_norm in ("1", "sum", "summary"):
+                self.holdings_view_mode = "summary"
+                self.holdings_target_account = None
+                self.log_message("Holdings view switched to [bold]Summary[/bold].")
+            else:
+                self.holdings_view_mode = "deep"
+                self.holdings_target_account = None
+                self.log_message("Holdings view switched to [bold]Deep View[/bold].")
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            return
+        elif cmd_norm in ("help", "h", "8", "/8", "/help"):
             self.info_mode = "help"
             self._update_info_buffer()
             if hasattr(self, "app") and self.app:
@@ -3277,9 +3630,89 @@ class KCLILiveSession:
         try:
             parsed_cmds = parse_command_line(cmd)
             # If parsed commands match trading/API targets, handle them
-            if parsed_cmds and any(isinstance(pc, (AccountSelectCommand, PlaceOrderCommand, ExitCommand, CancelOrderCommand, ModifyOrderCommand, StatusCommand, PositionsCommand, OrdersCommand, MarketDepthCommand, ConditionalOrderCommand, CancelConditionalOrderCommand, ConditionalOrdersViewCommand)) for pc in parsed_cmds):
+            if parsed_cmds and any(isinstance(pc, (AccountSelectCommand, OrderSelectCommand, PositionSelectCommand, PlaceOrderCommand, ExitCommand, CancelOrderCommand, ModifyOrderCommand, StatusCommand, PositionsCommand, OrdersCommand, MarketDepthCommand, HoldingsCommand, ConditionalOrderCommand, CancelConditionalOrderCommand, ConditionalOrdersViewCommand)) for pc in parsed_cmds):
                 for parsed in parsed_cmds:
-                    if isinstance(parsed, MarketDepthCommand):
+                    if isinstance(parsed, HoldingsCommand):
+                        self.info_mode = "holdings"
+                        self.holdings_view_mode = "deep" if parsed.deep else "summary"
+                        self.holdings_target_account = parsed.account
+                        self._update_info_buffer()
+                        if hasattr(self, "app") and self.app:
+                            self.app.invalidate()
+                        view_desc = f"Deep View ({self.holdings_target_account})" if self.holdings_target_account else ("Deep View" if self.holdings_view_mode == "deep" else "Summary")
+                        self.log_message(f"Switched info pane to [bold]Holdings & Portfolio ({view_desc})[/bold].")
+                        continue
+                    elif isinstance(parsed, OrderSelectCommand):
+                        raw_ord = parsed.target
+                        if raw_ord.lower() in ("none", "clear", "null", "empty"):
+                            self._log_command(cmd, {"action": "clear_order_selection"}, "success")
+                            self.selected_order = None
+                            self.update_prompt_label()
+                            self.log_message("Order selection cleared.")
+                            continue
+
+                        acct_and_order, err = self._find_pending_order(raw_ord)
+                        if err:
+                            self._log_command(cmd, {"action": "select_order", "query": raw_ord}, "error", err)
+                            self.log_message(f"[#ff0000]Error:[/#] {err}")
+                            continue
+
+                        acct, order = acct_and_order
+                        self.selected_order = {
+                            "order_id": order.get("order_id"),
+                            "tradingsymbol": order.get("tradingsymbol"),
+                            "transaction_type": order.get("transaction_type"),
+                            "quantity": order.get("quantity"),
+                            "price": order.get("price"),
+                            "order_type": order.get("order_type"),
+                            "product": order.get("product"),
+                            "api_key": acct.get("api_key"),
+                            "account_name": acct.get("name")
+                        }
+                        self.selected_symbol = None
+                        self.update_prompt_label()
+                        self._log_command(cmd, {"action": "select_order", "order": self.selected_order}, "success", api_key=self.selected_order["api_key"])
+                        self.log_message(f"Selected pending order [bold]{self.selected_order['order_id']}[/bold] ({self.selected_order['tradingsymbol']} | {self.selected_order['transaction_type']} | {self.selected_order['quantity']} @ {self.selected_order['price']:.2f}) on @{self.selected_order['account_name']}.")
+                        continue
+
+                    elif isinstance(parsed, PositionSelectCommand):
+                        raw_id = parsed.target
+                        if raw_id.lower() in ("none", "clear", "null", "empty"):
+                            self._log_command(cmd, {"action": "clear_position_selection"}, "success")
+                            self.selected_symbol = None
+                            self.selected_account_name = None
+                            self.selected_account_api_key = None
+                            self.selected_order = None
+                            self.update_prompt_label()
+                            self.log_message("Selection cleared.")
+                            continue
+
+                        symbol, api_key, err = self.resolve_symbol(raw_id)
+                        if err:
+                            self._log_command(cmd, {"action": "select_position", "query": raw_id}, "error", err)
+                            self.log_message(f"[#ff0000]Error:[/#] {err}")
+                            continue
+
+                        self.selected_symbol = symbol
+                        self.selected_order = None
+                        if api_key:
+                            self.selected_account_api_key = api_key
+                            for acct in self.accounts:
+                                if acct.get("api_key") == api_key:
+                                    self.selected_account_name = acct.get("name")
+                                    break
+
+                        self.update_prompt_label()
+                        self._log_command(
+                            cmd_text=cmd,
+                            action={"action": "select_position", "symbol": symbol, "api_key": api_key},
+                            status="success",
+                            api_key=api_key,
+                        )
+                        self.log_message(f"Selected {symbol} (@{self.selected_account_name or 'All Accounts'}). You can now type: [bold]buy|sell <qty> [price] [product][/bold] directly!")
+                        continue
+
+                    elif isinstance(parsed, MarketDepthCommand):
                         if parsed.symbol:
                             self.md_symbol = parsed.symbol.upper()
                         self.info_mode = "md"
@@ -3326,41 +3759,85 @@ class KCLILiveSession:
                                 api_keys = [self.selected_account_api_key]
                                 
                         if not parsed.quantity:
-                            matched_pos = None
-                            for p in self.active_positions:
-                                if p.get("tradingsymbol") == symbol and (not api_keys or p.get("api_key") in api_keys):
-                                    matched_pos = p
-                                    break
-                            if not matched_pos:
-                                self.log_message("[#ff0000]Error:[/#] Omitted quantity, but no matching position found.")
+                            matching_positions = [
+                                p for p in self.active_positions
+                                if p.get("tradingsymbol") == symbol and (not api_keys or p.get("api_key") in api_keys) and abs(p.get("quantity", 0)) > 0
+                            ]
+                            if not matching_positions:
+                                self.log_message(f"[#ff0000]Error:[/#] Omitted quantity for {symbol}, but no open position found.")
                                 continue
-                            qty_val = abs(matched_pos.get("quantity", 0))
-                            qty_display = str(qty_val)
+
+                            if not api_keys and len(matching_positions) > 1:
+                                total_qty = sum(abs(p.get("quantity", 0)) for p in matching_positions)
+                                acct_details = ", ".join(f"@{self._get_account_name(p['api_key'])}: {abs(p.get('quantity', 0))}" for p in matching_positions)
+                                qty_val = None
+                                qty_display = f"position quantities ({acct_details} | Total: {total_qty})"
+                                per_acct_orders = [{"api_key": p["api_key"], "qty": abs(p.get("quantity", 0))} for p in matching_positions]
+                            else:
+                                first_p = matching_positions[0]
+                                qty_val = str(abs(first_p.get("quantity", 0)))
+                                qty_display = qty_val
+                                per_acct_orders = None
                         else:
                             qty_val, qty_display, qty_err = self._resolve_qty(parsed.quantity, symbol)
                             if qty_err:
                                 self.log_message(f"[#ff0000]Error:[/#] {qty_err}")
                                 continue
+                            per_acct_orders = None
 
                         price_desc = f"@{parsed.price:.2f}" if parsed.price else "MARKET"
 
-                        if getattr(self, "_skip_confirmation", False):
-                            asyncio.create_task(
-                                self.execute_order(
-                                    symbol,
-                                    parsed.action.upper(),
-                                    qty_val,
-                                    str(parsed.price) if parsed.price else None,
-                                    parsed.product,
-                                    api_keys=api_keys
-                                )
+                        if parsed.trigger_time:
+                            if getattr(self, "_skip_confirmation", False):
+                                self.register_scheduled_order(cmd_obj=parsed, command_raw=cmd, api_keys=api_keys)
+                                continue
+                            self.pending_order = {
+                                "type": "scheduled",
+                                "cmd": parsed,
+                                "command_raw": cmd,
+                                "api_keys": api_keys,
+                            }
+                            self._log_command(
+                                cmd_text=cmd,
+                                action=self.pending_order,
+                                status="pending_confirmation",
+                                api_key=api_keys[0] if api_keys else None
                             )
+                            self.prompt_control.text = f" Confirm SCHEDULED {parsed.action} {qty_display} {symbol} ({parsed.product}) {price_desc} at {parsed.trigger_time.strftime('%Y-%m-%d %H:%M:%S')}? (y/n)> "
+                            self.log_message(f"[#ff8700]Pending Confirmation (Scheduled Order):[/#] {parsed.action} {qty_display} {symbol} {price_desc} ({parsed.product}) at {parsed.trigger_time.strftime('%Y-%m-%d %H:%M:%S')}.\nPress [bold]y[/bold] to confirm.")
+                            continue
+
+                        if getattr(self, "_skip_confirmation", False):
+                            if per_acct_orders:
+                                for o in per_acct_orders:
+                                    asyncio.create_task(
+                                        self.execute_order(
+                                            symbol,
+                                            parsed.action.upper(),
+                                            str(o["qty"]),
+                                            str(parsed.price) if parsed.price else None,
+                                            parsed.product,
+                                            api_keys=[o["api_key"]]
+                                        )
+                                    )
+                            else:
+                                asyncio.create_task(
+                                    self.execute_order(
+                                        symbol,
+                                        parsed.action.upper(),
+                                        qty_val,
+                                        str(parsed.price) if parsed.price else None,
+                                        parsed.product,
+                                        api_keys=api_keys
+                                    )
+                                )
                             continue
 
                         self.pending_order = {
                             "type": parsed.action.lower(),
                             "symbol": symbol,
                             "qty": qty_val,
+                            "orders": per_acct_orders,
                             "price": str(parsed.price) if parsed.price else None,
                             "product": parsed.product,
                             "api_keys": api_keys
@@ -3414,6 +3891,26 @@ class KCLILiveSession:
                         price_desc = f"@{parsed.price:.2f}" if parsed.price else "MARKET"
                         target_display = symbol if symbol else "ALL"
                         
+                        if parsed.trigger_time:
+                            if getattr(self, "_skip_confirmation", False):
+                                self.register_scheduled_order(cmd_obj=parsed, command_raw=cmd, api_keys=api_keys)
+                                continue
+                            self.pending_order = {
+                                "type": "scheduled",
+                                "cmd": parsed,
+                                "command_raw": cmd,
+                                "api_keys": api_keys,
+                            }
+                            self._log_command(
+                                cmd_text=cmd,
+                                action=self.pending_order,
+                                status="pending_confirmation",
+                                api_key=api_keys[0] if api_keys else None
+                            )
+                            self.prompt_control.text = f" Confirm SCHEDULED EXIT {target_display} {price_desc} at {parsed.trigger_time.strftime('%Y-%m-%d %H:%M:%S')}? (y/n)> "
+                            self.log_message(f"[#ff8700]Pending Confirmation (Scheduled Exit):[/#] EXIT {target_display} positions {price_desc} at {parsed.trigger_time.strftime('%Y-%m-%d %H:%M:%S')}.\nPress [bold]y[/bold] to confirm.")
+                            continue
+
                         if getattr(self, "_skip_confirmation", False):
                             asyncio.create_task(self.execute_exit(symbol if symbol else "all", api_keys, parsed.price))
                             continue
@@ -3438,6 +3935,12 @@ class KCLILiveSession:
 
                     elif isinstance(parsed, CancelOrderCommand):
                         target = parsed.target
+                        if target == "selected":
+                            if self.selected_order:
+                                target = self.selected_order.get("order_id")
+                            else:
+                                self.log_message("[#ff0000]Error:[/#] No pending order currently selected. Usage: cancel <id_suffix|symbol|all>")
+                                continue
                         
                         # Find all matching pending orders
                         matches = self._find_all_matching_pending_orders(target)
@@ -3451,21 +3954,22 @@ class KCLILiveSession:
                         ]
 
                         if len(orders_to_cancel) == 1:
-                            o = orders_to_cancel[0]
+                            ord_id = orders_to_cancel[0]["order_id"]
+                            api_k = orders_to_cancel[0]["api_key"]
                             if getattr(self, "_skip_confirmation", False):
-                                asyncio.create_task(self.execute_cancel(o["order_id"], o["api_key"]))
+                                asyncio.create_task(self.execute_cancel(ord_id, api_k))
                                 continue
                             self.pending_order = {
                                 "type": "cancel",
-                                "order_id": o["order_id"],
-                                "api_key": o["api_key"]
+                                "order_id": ord_id,
+                                "api_key": api_k
                             }
-                            self.prompt_control.text = f" Confirm CANCEL of order {o['order_id'][-6:]}? (y/n)> "
-                            self.log_message(f"[#ff8700]Pending Confirmation:[/#] CANCEL order {o['order_id']}. Press [bold]y[/bold] to confirm.")
+                            self.prompt_control.text = f" Confirm CANCEL order {ord_id[-6:]}? (y/n)> "
+                            self.log_message(f"[#ff8700]Pending Confirmation:[/#] CANCEL order {ord_id}. Press [bold]y[/bold] to confirm.")
                         else:
                             if getattr(self, "_skip_confirmation", False):
-                                for o in orders_to_cancel:
-                                    asyncio.create_task(self.execute_cancel(o["order_id"], o["api_key"]))
+                                for ord_info in orders_to_cancel:
+                                    asyncio.create_task(self.execute_cancel(ord_info["order_id"], ord_info["api_key"]))
                                 continue
                             self.pending_order = {
                                 "type": "cancel_multi",
@@ -3476,44 +3980,62 @@ class KCLILiveSession:
                         continue
 
                     elif isinstance(parsed, ModifyOrderCommand):
-                        matches = self._find_all_matching_pending_orders(parsed.order_id)
+                        target_id = parsed.order_id
+                        if target_id == "selected":
+                            if self.selected_order:
+                                target_id = self.selected_order.get("order_id")
+                            else:
+                                self.log_message("[#ff0000]Error:[/#] No pending order currently selected. Usage: order <id_or_sym> <price>")
+                                continue
+
+                        matches = self._find_all_matching_pending_orders(target_id)
                         if not matches:
-                            self.log_message(f"[#ff0000]Error:[/#] No pending order matches ID/suffix/symbol '{parsed.order_id}'.")
+                            self.log_message(f"[#ff0000]Error:[/#] No pending order matches ID/suffix/symbol '{target_id}'.")
                             continue
                         
                         first_acct, first_order = matches[0]
                         first_sym = first_order.get("tradingsymbol")
-                        qty_val, qty_display, qty_err = self._resolve_qty(parsed.quantity, first_sym)
-                        if qty_err:
-                            self.log_message(f"[#ff0000]Error:[/#] {qty_err}")
-                            continue
+                        if parsed.quantity:
+                            qty_val, qty_display, qty_err = self._resolve_qty(parsed.quantity, first_sym)
+                            if qty_err:
+                                self.log_message(f"[#ff0000]Error:[/#] {qty_err}")
+                                continue
+                        else:
+                            qty_val = None
+                            qty_display = ""
 
                         price_desc = f"@{parsed.price:.2f}" if parsed.price > 0 else "MARKET"
                         if len(matches) == 1:
                             acct, order = matches[0]
+                            order_qty = qty_val if qty_val is not None else str(order.get("quantity") or order.get("pending_quantity") or "")
+                            qty_disp_str = f"{qty_display} " if qty_display else ""
                             if getattr(self, "_skip_confirmation", False):
-                                asyncio.create_task(self.execute_modify(order.get("order_id"), qty_val, str(parsed.price), acct.get("api_key")))
+                                asyncio.create_task(self.execute_modify(order.get("order_id"), order_qty, str(parsed.price), acct.get("api_key")))
                                 continue
                             self.pending_order = {
                                 "type": "modify",
                                 "order_id": order.get("order_id"),
-                                "qty": qty_val,
+                                "qty": order_qty,
                                 "price": str(parsed.price),
                                 "api_key": acct.get("api_key"),
                                 "symbol": order.get("tradingsymbol")
                             }
-                            self.prompt_control.text = f" Confirm MODIFY order {order.get('order_id')[-6:]} to {qty_display} {price_desc}? (y/n)> "
-                            self.log_message(f"[#ff8700]Pending Confirmation:[/#] MODIFY order {order.get('order_id')} to {qty_display} {price_desc}. Press [bold]y[/bold] to confirm.")
+                            self.prompt_control.text = f" Confirm MODIFY order {order.get('order_id')[-6:]} to {qty_disp_str}{price_desc}? (y/n)> "
+                            self.log_message(f"[#ff8700]Pending Confirmation:[/#] MODIFY order {order.get('order_id')} to {qty_disp_str}{price_desc}. Press [bold]y[/bold] to confirm.")
                         else:
+                            qty_disp_str = f"{qty_display} " if qty_display else ""
                             if getattr(self, "_skip_confirmation", False):
                                 for a, o in matches:
-                                    asyncio.create_task(self.execute_modify(o.get("order_id"), qty_val, str(parsed.price), a.get("api_key")))
+                                    o_qty = qty_val if qty_val is not None else str(o.get("quantity") or o.get("pending_quantity") or "")
+                                    asyncio.create_task(self.execute_modify(o.get("order_id"), o_qty, str(parsed.price), a.get("api_key")))
                                 continue
                             self.pending_order = {
                                 "type": "modify_multi",
+                                "price_only": (qty_val is None),
                                 "orders": [
                                     {
                                         "order_id": o.get("order_id"),
+                                        "qty": qty_val if qty_val is not None else str(o.get("quantity") or o.get("pending_quantity") or ""),
                                         "api_key": a.get("api_key"),
                                         "account_name": a.get("name"),
                                         "symbol": o.get("tradingsymbol")
@@ -3523,8 +4045,8 @@ class KCLILiveSession:
                                 "qty": qty_val,
                                 "price": str(parsed.price)
                             }
-                            self.prompt_control.text = f" Confirm MODIFY {len(matches)} orders to {qty_display} {price_desc}? (y/n)> "
-                            self.log_message(f"[#ff8700]Pending Confirmation:[/#] MODIFY {len(matches)} orders to {qty_display} {price_desc}. Press [bold]y[/bold] to confirm.")
+                            self.prompt_control.text = f" Confirm MODIFY {len(matches)} orders to {qty_disp_str}{price_desc}? (y/n)> "
+                            self.log_message(f"[#ff8700]Pending Confirmation:[/#] MODIFY {len(matches)} orders to {qty_disp_str}{price_desc}. Press [bold]y[/bold] to confirm.")
                         continue
                         
                     elif isinstance(parsed, StatusCommand):
@@ -3580,7 +4102,12 @@ class KCLILiveSession:
                             else:
                                 for p in positions:
                                     sym = p.get("tradingsymbol")
-                                    self.log_message(f"  • {sym} | Qty: {p.get('quantity')} | Avg: {p.get('average_price'):.2f} | LTP: {p.get('last_price'):.2f}")
+                                    pos_id = p.get("position_id", "-")
+                                    qty = p.get("quantity", 0)
+                                    avg = p.get("average_price", 0.0)
+                                    pnl = p.get("pnl", 0.0)
+                                    pnl_col = "[#00ff00]" if pnl >= 0 else "[#ff0000]"
+                                    self.log_message(f"  ID: {pos_id} | {sym} | Qty: {qty} | Avg: ₹{avg:.2f} | P&L: {pnl_col}₹{pnl:.2f}[/#]")
                         continue
                         
                     elif isinstance(parsed, OrdersCommand):
@@ -3645,6 +4172,35 @@ class KCLILiveSession:
                             parent_desc = f"EXIT {parent_cmd.target}"
 
                         child_desc = parsed.child_raw_text
+
+                        # Check if scheduled conditional chain
+                        if getattr(parent_cmd, "trigger_time", None):
+                            trig_str = parent_cmd.trigger_time.strftime('%Y-%m-%d %H:%M:%S')
+                            if getattr(self, "_skip_confirmation", False):
+                                self.register_scheduled_order(cmd_obj=parsed, command_raw=cmd, api_keys=api_keys)
+                                continue
+
+                            self.pending_order = {
+                                "type": "scheduled",
+                                "cmd": parsed,
+                                "command_raw": cmd,
+                                "api_keys": api_keys,
+                            }
+                            self._log_command(
+                                cmd_text=cmd,
+                                action=self.pending_order,
+                                status="pending_confirmation",
+                                api_key=api_keys[0] if api_keys else None,
+                            )
+                            self.prompt_control.text = f" Confirm SCHEDULED CONDITIONAL: 1) {parent_desc} at {trig_str} THEN 2) {child_desc}? (y/n)> "
+                            self.log_message(
+                                f"[#ff8700]Pending Confirmation (Scheduled Conditional Chain):[/#]\n"
+                                f"  1) {parent_desc} at {trig_str}\n"
+                                f"  THEN once filled:\n"
+                                f"  2) {child_desc}\n"
+                                f"Press [bold]y[/bold] to confirm."
+                            )
+                            continue
 
                         if getattr(self, "_skip_confirmation", False):
                             asyncio.create_task(
@@ -3714,6 +4270,50 @@ class KCLILiveSession:
                                 c_raw = co_item.get("child_command_raw", "")
                                 st = co_item.get("status", "")
                                 self.log_message(f"  • [bold]#{cid}[/bold] | Parent: {p_act} {p_sym} (IDs: {p_ids}) -> Child: '{c_raw}' | Status: [bold]{st}[/bold]")
+                        continue
+
+                    elif isinstance(parsed, CancelScheduledOrderCommand):
+                        target = parsed.target
+                        if target.lower() == "all":
+                            cnt = self.recorder.cancel_all_scheduled_orders()
+                            self.scheduled_orders_map.clear()
+                            self.log_message(f"[#00ff00]✓ Cancelled all ({cnt}) active scheduled order(s).[/#]")
+                        else:
+                            try:
+                                sid = int(target)
+                                ok = self.recorder.cancel_scheduled_order(sid)
+                                if ok:
+                                    self.scheduled_orders_map.pop(sid, None)
+                                    self.log_message(f"[#00ff00]✓ Cancelled scheduled order #{sid}.[/#]")
+                                else:
+                                    self.log_message(f"[#ff8700]No pending scheduled order found with ID #{sid}.[/#]")
+                            except ValueError:
+                                self.log_message(f"[#ff0000]Error:[/#] Invalid scheduled order ID '{target}'. Usage: cancel sched <id|all>")
+                        if hasattr(self, "app") and self.app and self.app.loop:
+                            asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+                        continue
+
+                    elif isinstance(parsed, ScheduledOrdersViewCommand):
+                        today_str = datetime.now().strftime("%Y-%m-%d")
+                        all_sched = self.recorder.get_all_scheduled_orders_today(today_str)
+                        if not all_sched:
+                            self.log_message("[#58a6ff]Scheduled Orders:[/#] No scheduled orders recorded for today.")
+                        else:
+                            self.log_message(f"[#58a6ff]Scheduled Orders Today ({len(all_sched)}):[/#]")
+                            for so in all_sched:
+                                sid = so.get("id")
+                                t_str = so.get("trigger_time", "")
+                                acct = so.get("account_name", "ALL")
+                                act = so.get("action", "")
+                                sym = so.get("symbol_or_id", "")
+                                qty = so.get("quantity") or ""
+                                pr = so.get("price")
+                                pr_str = f"@{pr:.2f}" if pr else "@MKT"
+                                is_c = bool(so.get("is_conditional"))
+                                c_child = so.get("child_command_raw") or ""
+                                st = so.get("status", "")
+                                cond_info = f" -> THEN '{c_child}'" if is_c else ""
+                                self.log_message(f"  • [bold]#{sid}[/bold] | [{acct}] {act} {qty} {sym} {pr_str} at {t_str}{cond_info} | Status: [bold]{st}[/bold]")
                         continue
                 return
         except Exception:
@@ -5031,6 +5631,87 @@ class KCLILiveSession:
         if not any_orders and mode == "orders_pending":
             lines.append("No open or recent orders across all accounts.")
 
+        # Scheduled orders section (in Pending Orders view)
+        if mode == "orders_pending" and hasattr(self, "recorder") and self.recorder:
+            try:
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                sched_list = self.recorder.get_all_scheduled_orders_today(today_str)
+                if sched_list:
+                    lines.append("")
+                    lines.append("⏰ Scheduled Orders (Today):")
+                    w_sid = 4
+                    w_trig = 19
+                    w_cd = 14
+                    w_acct = 8
+                    w_order = 28
+                    w_st = 11
+
+                    s_top = f"┌─{'─'*w_sid}─┬─{'─'*w_trig}─┬─{'─'*w_cd}─┬─{'─'*w_acct}─┬─{'─'*w_order}─┬─{'─'*w_st}─┐"
+                    s_hdr = f"│ {'ID':<{w_sid}} │ {'Target Time':<{w_trig}} │ {'Countdown':<{w_cd}} │ {'Account':<{w_acct}} │ {'Order Details':<{w_order}} │ {'Status':<{w_st}} │"
+                    s_mid = f"├─{'─'*w_sid}─┼─{'─'*w_trig}─┼─{'─'*w_cd}─┼─{'─'*w_acct}─┼─{'─'*w_order}─┼─{'─'*w_st}─┤"
+                    s_bot = f"└─{'─'*w_sid}─┴─{'─'*w_trig}─┴─{'─'*w_cd}─┴─{'─'*w_acct}─┴─{'─'*w_order}─┴─{'─'*w_st}─┘"
+
+                    lines.append(s_top)
+                    lines.append(s_hdr)
+                    lines.append(s_mid)
+
+                    now = datetime.now()
+                    for so in sched_list:
+                        sid_str = str(so.get("id", ""))
+                        trig_str = str(so.get("trigger_time", ""))[:w_trig]
+                        acct_str = str(so.get("account_name", "ALL"))[:w_acct]
+                        act = so.get("action", "")
+                        sym = so.get("symbol_or_id", "")
+                        qty = so.get("quantity") or ""
+                        pr = so.get("price")
+                        pr_str = f"@{pr:.2f}" if pr else "@MKT"
+                        is_c = bool(so.get("is_conditional"))
+                        c_child = so.get("child_command_raw") or ""
+
+                        ord_detail = f"{act} {qty} {sym} {pr_str}".strip()
+                        if is_c:
+                            ord_detail = f"{ord_detail} -> {c_child}"
+                        ord_detail = ord_detail[:w_order]
+
+                        st_str = str(so.get("status", ""))
+
+                        # Compute countdown if pending
+                        if st_str == "PENDING":
+                            try:
+                                if "T" in trig_str:
+                                    t_dt = datetime.fromisoformat(trig_str)
+                                else:
+                                    t_dt = datetime.strptime(trig_str, "%Y-%m-%d %H:%M:%S")
+                                diff = (t_dt - now).total_seconds()
+                                if diff > 0:
+                                    hours, rem = divmod(int(diff), 3600)
+                                    mins, secs = divmod(rem, 60)
+                                    cd_str = f"T - {hours:02d}:{mins:02d}:{secs:02d}"
+                                else:
+                                    cd_str = "Triggering..."
+                            except Exception:
+                                cd_str = "-"
+                            s_col = "\033[38;5;51m"   # Cyan
+                        elif st_str in ("TRIGGERED", "COMPLETE"):
+                            cd_str = "Triggered"
+                            s_col = "\033[38;5;48m"   # Green
+                        else:
+                            cd_str = "-"
+                            s_col = "\033[38;5;196m"  # Red
+
+                        s_end = "\033[0m"
+                        lines.append(
+                            f"│ {s_col}{sid_str:<{w_sid}}{s_end} │ "
+                            f"{s_col}{trig_str:<{w_trig}}{s_end} │ "
+                            f"{s_col}{cd_str:<{w_cd}}{s_end} │ "
+                            f"{s_col}{acct_str:<{w_acct}}{s_end} │ "
+                            f"{s_col}{ord_detail:<{w_order}}{s_end} │ "
+                            f"{s_col}{st_str:<{w_st}}{s_end} │"
+                        )
+                    lines.append(s_bot)
+            except Exception as exc:
+                logger.warning("Error rendering scheduled orders in orders pane: %s", exc)
+
         # Conditional orders section (in Pending Orders view)
         if mode == "orders_pending" and hasattr(self, "recorder") and self.recorder:
             try:
@@ -5099,11 +5780,13 @@ class KCLILiveSession:
 │ adv / advisor / 4     │ Ctrl + G  / F4        │ AI Expiry Advisor Pane      │
 │ pnl / pl      / 5     │ F5 / Esc+5            │ P&L Analytics (Week/Mo/Yr)  │
 │ md / depth    / 6     │ F6 / Esc+6            │ Market Depth (5-level Book) │
-│ h  / help     / 7     │ F7 / Esc+7            │ Help & Cheat Sheet Pane     │
+│ port/ holdings / 7    │ Ctrl + 7  / F7        │ Holdings & Portfolio Pane   │
+│ h  / help     / 8     │ Ctrl + 8  / F8        │ Help & Cheat Sheet Pane     │
 └───────────────────────┴───────────────────────┴─────────────────────────────┘
   * Quick Navigation: Click directly on any tab title in the header bar.
+  * Holdings Commands: Type 'holdings' (Summary), 'holdings deep' (Constituents), or 'holdings <acct>' (Drill-down).
   * Market Depth Command: Type 'md <symbol>' (e.g. 'md NIFTY2682025000CE' or 'md INFY').
-  * P&L Period Options: Type 'w' (Week), 'm' (Month), 'y' (Year) when P&L tab is active.
+  * P&L Period Options: Type 'w' (Week), 'lw' (Last Week), 'm' (Month), 'y' (Year), 'c' (Custom) when P&L tab is active.
 
  2. ORDER PLACEMENT & TRADING
 ┌──────────────────────────────────┬──────────────────────────────────────────┐
@@ -5137,16 +5820,20 @@ class KCLILiveSession:
 │                                  │ e.g. cancel 12345  /  cancel all (or c)  │
 └──────────────────────────────────┴──────────────────────────────────────────┘
 
- 4. CONDITIONAL / CHAINED ORDERS (THEN / ->)
+ 4. SCHEDULED ORDERS & CONDITIONAL CHAINS (at <time> [date] / THEN / ->)
 ┌──────────────────────────────────┬──────────────────────────────────────────┐
 │ Command Syntax                   │ Description / Example                    │
 ├──────────────────────────────────┼──────────────────────────────────────────┤
-│ <cmd1> THEN <cmd2>               │ Place Order 1; upon COMPLETE, place Order 2│
-│                                  │ e.g. buy 1L 150 THEN sell 1L 180         │
-│                                  │ e.g. buy NIFTY... 1L 120 -> exit 150     │
+│ <cmd> at <time> [date]           │ Place order at exact scheduled time/date │
+│                                  │ e.g. b NIFTY... 50 120 at 09:20          │
+│                                  │ e.g. exit all at 15:25                   │
+│                                  │ e.g. b INFY 10 1450 on 2026-09-02 at 09:20│
+│ <cmd1> at <time> THEN <cmd2>     │ Timed primary; upon fill, place child leg│
+│                                  │ e.g. b NIFTY... 50 120 at 09:20 then s 150│
+│ sched / scheduled                │ View active and today's scheduled orders │
+│ cancel sched <id|all>            │ Cancel pending scheduled order(s)        │
 │ cond / co                        │ View active and today's conditional orders│
 │ cancel co <id|all>               │ Cancel pending conditional order(s)      │
-│                                  │ e.g. cancel co 1  /  cancel co all       │
 └──────────────────────────────────┴──────────────────────────────────────────┘
 
  5. ACCOUNT & SELECTION CONTROL
@@ -5159,7 +5846,7 @@ class KCLILiveSession:
 │ Esc                              │ Clear active selection / reset filter    │
 └──────────────────────────────────┴──────────────────────────────────────────┘
 
- 5. GLOBAL NAVIGATION & CONTROL
+ 6. GLOBAL NAVIGATION & CONTROL
 ┌───────────────────────┬─────────────────────────────────────────────────────┐
 │ Key / Action          │ Description / Function                              │
 ├───────────────────────┼─────────────────────────────────────────────────────┤
@@ -5176,18 +5863,29 @@ class KCLILiveSession:
         
         Periods:
         - "week": From most recent Wednesday 00:00:00 to now.
+        - "last_week": From previous week's Wednesday 00:00:00 to most recent Tuesday 23:59:59.
         - "month": From day after last month's last Tuesday (Wednesday) 00:00:00 to now.
         - "year": From current financial year April 1st 00:00:00 to now.
+        - "custom": Custom start and end date range.
         """
         now = datetime.now()
         
+        # NIFTY Options F&O Week: Wednesday 00:00:00 to Tuesday (most recent Wednesday)
+        d = now.weekday()
+        days_ago = d - 2 if d >= 2 else d + 5
+        this_wed = (now - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
+
         if period == "week":
-            # NIFTY Options F&O Week: Wednesday 00:00:00 to Tuesday (most recent Wednesday)
-            d = now.weekday()
-            days_ago = d - 2 if d >= 2 else d + 5
-            start_dt = (now - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
+            start_dt = this_wed
             label = f"Week (Wed {start_dt.strftime('%b %d')} -> Now)"
+            return start_dt, now, label
             
+        elif period == "last_week":
+            last_wed = this_wed - timedelta(days=7)
+            last_tue = (this_wed - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
+            label = f"Last Week (Wed {last_wed.strftime('%b %d')} -> Tue {last_tue.strftime('%b %d')})"
+            return last_wed, last_tue, label
+
         elif period == "month":
             first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             last_day_prev_month = first_of_this_month - timedelta(days=1)
@@ -5195,6 +5893,8 @@ class KCLILiveSession:
             last_tue_prev_month = last_day_prev_month - timedelta(days=offset)
             start_dt = (last_tue_prev_month + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             label = f"Month (Wed {start_dt.strftime('%b %d')} -> Now)"
+            return start_dt, now, label
+
         elif period == "custom":
             c_start = getattr(self, "pnl_custom_start", None)
             c_end = getattr(self, "pnl_custom_end", None)
@@ -5220,14 +5920,14 @@ class KCLILiveSession:
             fy_year = now.year if now.month >= 4 else now.year - 1
             start_dt = datetime(fy_year, 4, 1, 0, 0, 0)
             label = f"FY Year (Apr 01, {fy_year} -> Now)"
-
-        return start_dt, now, label
+            return start_dt, now, label
 
     def _render_pnl_pane(self) -> str:
         """Render the P&L Analytics tab with Grand Total and Account-wise breakdown."""
-        period = getattr(self, "pnl_period", "month")
+        period = getattr(self, "pnl_period", "week")
         start_dt, end_dt, period_label = self._get_pnl_date_range(period)
         now_dt = datetime.now()
+        is_past_period = end_dt < now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
         start_iso = start_dt.isoformat()
         end_iso = end_dt.isoformat()
 
@@ -5238,11 +5938,12 @@ class KCLILiveSession:
             return f"\033[36m [{p_name}] \033[0m"
 
         btn_week = _fmt_btn("week", "1: Week")
-        btn_month = _fmt_btn("month", "2: Month")
-        btn_year = _fmt_btn("year", "3: Year")
-        btn_custom = _fmt_btn("custom", "4: Custom Range")
+        btn_last_week = _fmt_btn("last_week", "2: Last Week")
+        btn_month = _fmt_btn("month", "3: Month")
+        btn_year = _fmt_btn("year", "4: Year")
+        btn_custom = _fmt_btn("custom", "5: Custom Range")
 
-        header_selector = f"Period:  {btn_week}  │  {btn_month}  │  {btn_year}  │  {btn_custom}"
+        header_selector = f"Period:  {btn_week}  │  {btn_last_week}  │  {btn_month}  │  {btn_year}  │  {btn_custom}"
         if period == "custom":
             header_selector += "  │  \033[90m(Type 'pnl YYYY-MM-DD YYYY-MM-DD' to set range)\033[0m"
 
@@ -5292,7 +5993,7 @@ class KCLILiveSession:
         executed_orders = list(executed_orders_map.values())
 
         # Active positions
-        open_positions = getattr(self, "active_positions", [])
+        open_positions = getattr(self, "active_positions", []) if not is_past_period else []
 
         # Group executed orders & active positions by account
         acct_orders_map = defaultdict(list)
@@ -5716,6 +6417,43 @@ class KCLILiveSession:
 
         return "\n".join(lines)
 
+    def _render_holdings_pane(self) -> str:
+        """Render Holdings / Portfolio pane text (Summary or Deep View)."""
+        if getattr(self, "last_holdings_response", None) is None:
+            try:
+                self.last_holdings_response = self.client.get_holdings()
+            except Exception as e:
+                return f"\x1b[1;31mError fetching holdings:\x1b[0m {e}"
+
+        holdings_resp = self.last_holdings_response or {}
+        deep = (getattr(self, "holdings_view_mode", "summary") == "deep")
+        target_acct = getattr(self, "holdings_target_account", None)
+
+        width = 100
+        if hasattr(self, "_info_control") and hasattr(self, "app") and self.app and self.app.output:
+            width = max(80, int(self.app.output.get_size().columns * (100 - self.left_width_pct) / 100) - 4)
+
+        # Header sub-navigation bar
+        def _fmt_btn(is_active, label):
+            if is_active:
+                return f"\033[30;46;1m [{label}] \033[0m"
+            return f"\033[36m [{label}] \033[0m"
+
+        btn_sum = _fmt_btn(not deep and not target_acct, "1: Summary")
+        btn_deep = _fmt_btn(deep and not target_acct, "2: Deep View")
+        
+        target_info = f"  │  \033[36mAccount: {target_acct}\033[0m \033[90m(type 'holdings all' to reset)\033[0m" if target_acct else ""
+
+        nav_line = f"View:  {btn_sum}  │  {btn_deep}{target_info}\n"
+
+        body = render_holdings_to_string(
+            holdings_resp,
+            width=width,
+            deep=deep,
+            target_account=target_acct,
+        )
+        return nav_line + "\n" + body
+
     def _update_info_buffer(self, reset_scroll: bool = True) -> None:
         """Push current info_mode text into the info control.
 
@@ -5748,6 +6486,12 @@ class KCLILiveSession:
             except Exception as exc:
                 self._last_md_text = f"=== Market Depth ===\n\nFailed to calculate depth: {exc}"
             text = self._last_md_text
+        elif self.info_mode == "holdings":
+            try:
+                self._last_holdings_text = self._render_holdings_pane()
+            except Exception as exc:
+                self._last_holdings_text = f"=== Holdings / Portfolio ===\n\nFailed to fetch holdings: {exc}"
+            text = self._last_holdings_text
         elif self.info_mode == "help":
             text = self._build_help_text()
         else:
@@ -5906,33 +6650,59 @@ class KCLILiveSession:
                     v_scroll = getattr(self._info_control, "vertical_scroll_position", 0)
                     if mouse_event.position.y == 0 or mouse_event.position.y - v_scroll == 0:
                         x = mouse_event.position.x
-                        if 8 <= x <= 20:
+                        if 8 <= x <= 22:
                             self.pnl_period = "week"
                             self._update_info_buffer()
                             if hasattr(self, "app") and self.app:
                                 self.app.invalidate()
                             self.log_message("P&L period switched to [bold]Week[/bold].")
                             return res
-                        elif 21 <= x <= 35:
+                        elif 23 <= x <= 43:
+                            self.pnl_period = "last_week"
+                            self._update_info_buffer()
+                            if hasattr(self, "app") and self.app:
+                                self.app.invalidate()
+                            self.log_message("P&L period switched to [bold]Last Week[/bold].")
+                            return res
+                        elif 44 <= x <= 60:
                             self.pnl_period = "month"
                             self._update_info_buffer()
                             if hasattr(self, "app") and self.app:
                                 self.app.invalidate()
                             self.log_message("P&L period switched to [bold]Month[/bold].")
                             return res
-                        elif 36 <= x <= 50:
+                        elif 61 <= x <= 76:
                             self.pnl_period = "year"
                             self._update_info_buffer()
                             if hasattr(self, "app") and self.app:
                                 self.app.invalidate()
                             self.log_message("P&L period switched to [bold]Year[/bold].")
                             return res
-                        elif 51 <= x <= 75:
+                        elif 77 <= x <= 110:
                             self.pnl_period = "custom"
                             self._update_info_buffer()
                             if hasattr(self, "app") and self.app:
                                 self.app.invalidate()
                             self.log_message("P&L period switched to [bold]Custom Range[/bold].")
+                            return res
+                elif self.info_mode == "holdings":
+                    v_scroll = getattr(self._info_control, "vertical_scroll_position", 0)
+                    if mouse_event.position.y == 0 or mouse_event.position.y - v_scroll == 0:
+                        x = mouse_event.position.x
+                        if 6 <= x <= 22:
+                            self.holdings_view_mode = "summary"
+                            self.holdings_target_account = None
+                            self._update_info_buffer()
+                            if hasattr(self, "app") and self.app:
+                                self.app.invalidate()
+                            self.log_message("Holdings view switched to [bold]Summary[/bold].")
+                            return res
+                        elif 23 <= x <= 45:
+                            self.holdings_view_mode = "deep"
+                            self._update_info_buffer()
+                            if hasattr(self, "app") and self.app:
+                                self.app.invalidate()
+                            self.log_message("Holdings view switched to [bold]Deep View[/bold].")
                             return res
 
                 if hasattr(self._info_control, "buffer"):
@@ -6210,6 +6980,14 @@ class KCLILiveSession:
         @kb.add("escape", "7")
         @kb.add("f7")
         def _c7(event):
+            self.info_mode = "holdings"
+            self._update_info_buffer()
+            event.app.invalidate()
+
+        @kb.add("c-8")
+        @kb.add("escape", "8")
+        @kb.add("f8")
+        def _c8(event):
             self.info_mode = "help"
             self._update_info_buffer()
             event.app.invalidate()

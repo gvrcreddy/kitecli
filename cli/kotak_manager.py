@@ -705,6 +705,119 @@ class KotakAccountManager(BaseBrokerManager):
 
         return {"net": None, "cash": None, "collateral": None}
 
+    def get_holdings(self, account_key: str) -> list[dict[str, Any]]:
+        """Fetch Kotak Neo stock/equity holdings and normalise to KiteCLI schema."""
+        client = self._clients.get(account_key)
+        if not client or not self.is_authenticated(account_key):
+            return []
+
+        try:
+            resp = client.holdings()
+            _check_neo_error(resp)
+        except Exception as exc:
+            logger.warning("Kotak get_holdings failed for key=%s…: %s", account_key[:8], exc)
+            return []
+
+        raw_holdings = []
+        if isinstance(resp, dict):
+            raw_holdings = resp.get("data", resp.get("holdings", []))
+        elif isinstance(resp, list):
+            raw_holdings = resp
+
+        result = []
+        for h in raw_holdings:
+            qty_str = str(h.get("quantity") or h.get("holdingQuantity") or h.get("totalQty") or h.get("qty") or "0")
+            try:
+                qty = float(qty_str)
+            except (ValueError, TypeError):
+                qty = 0.0
+
+            t1_qty_str = str(h.get("t1Quantity") or h.get("t1_quantity") or "0")
+            try:
+                t1_qty = float(t1_qty_str)
+            except (ValueError, TypeError):
+                t1_qty = 0.0
+
+            total_qty = qty + t1_qty
+            if total_qty == 0:
+                continue
+
+            # Investment / buy cost
+            holding_cost_str = str(h.get("holdingCost") or h.get("buyAmount") or h.get("investmentValue") or "")
+            avg_price_str = str(h.get("averagePrice") or h.get("buyAvgPrice") or h.get("avgPrice") or "0")
+            try:
+                avg_price = float(avg_price_str)
+            except (ValueError, TypeError):
+                avg_price = 0.0
+
+            if holding_cost_str:
+                try:
+                    investment_val = float(holding_cost_str)
+                    if avg_price == 0.0 and total_qty > 0:
+                        avg_price = investment_val / total_qty
+                except (ValueError, TypeError):
+                    investment_val = total_qty * avg_price
+            else:
+                investment_val = total_qty * avg_price
+
+            # Market / current value and LTP
+            mkt_val_str = str(h.get("mktValue") or h.get("marketValue") or h.get("currentValue") or "")
+            ltp_str = str(h.get("lastPrice") or h.get("ltp") or h.get("lastTradedPrice") or h.get("curPrice") or "")
+            try:
+                ltp = float(ltp_str) if ltp_str else 0.0
+            except (ValueError, TypeError):
+                ltp = 0.0
+
+            if mkt_val_str:
+                try:
+                    current_val = float(mkt_val_str)
+                    if ltp == 0.0 and total_qty > 0:
+                        ltp = current_val / total_qty
+                except (ValueError, TypeError):
+                    current_val = total_qty * (ltp if ltp > 0 else avg_price)
+            else:
+                current_val = total_qty * (ltp if ltp > 0 else avg_price)
+
+            if ltp == 0.0:
+                ltp = (current_val / total_qty) if total_qty > 0 and current_val > 0 else avg_price
+
+            close_price_str = str(h.get("closingPrice") or h.get("closePrice") or h.get("prevClose") or ltp)
+            try:
+                close_price = float(close_price_str)
+            except (ValueError, TypeError):
+                close_price = ltp
+
+            pnl = current_val - investment_val
+            pnl_pct = (pnl / investment_val * 100.0) if investment_val > 0 else 0.0
+
+            day_change = (ltp - close_price) * total_qty
+            day_change_pct = ((ltp - close_price) / close_price * 100.0) if close_price > 0 else 0.0
+
+            symbol = str(h.get("displaySymbol") or h.get("symbol") or h.get("tradingSymbol") or h.get("tradingsymbol") or "")
+            exchange = str(h.get("exchangeSegment") or h.get("exchange") or h.get("exch") or "NSE").replace("_cm", "").upper()
+            isin = str(h.get("isin") or h.get("exchangeIdentifier") or "")
+
+            result.append({
+                "tradingsymbol": symbol,
+                "exchange": exchange,
+                "isin": isin,
+                "quantity": int(total_qty) if total_qty.is_integer() else total_qty,
+                "t1_quantity": int(t1_qty) if t1_qty.is_integer() else t1_qty,
+                "average_price": avg_price,
+                "last_price": ltp,
+                "close_price": close_price,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "day_change": day_change,
+                "day_change_pct": day_change_pct,
+                "investment_value": investment_val,
+                "current_value": current_val,
+                "instrument_token": h.get("instrumentToken"),
+            })
+
+        logger.info("Fetched %d Kotak holdings for key=%s…", len(result), account_key[:8])
+        return result
+
     # ── order management ───────────────────────────────────────────────────────
 
     def place_order(
@@ -833,6 +946,16 @@ class KotakAccountManager(BaseBrokerManager):
         client = self._clients.get(account_key)
         if not client:
             raise ValueError(f"Kotak account not found: key={account_key[:8]}…")
+
+        if not quantity or int(quantity) == 0:
+            try:
+                res = self.get_orders(account_key)
+                for o in res.get("orders", []):
+                    if str(o.get("order_id")) == str(order_id):
+                        quantity = int(o.get("quantity") or o.get("pending_quantity") or 0)
+                        break
+            except Exception:
+                pass
 
         order_type_map = {"MARKET": "MKT", "LIMIT": "L", "SL": "SL", "SL-M": "SL-M"}
         params = {

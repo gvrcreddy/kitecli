@@ -4,7 +4,8 @@ from cli.parser import (
     AccountSelectCommand, PlaceOrderCommand, ExitCommand,
     StatusCommand, PositionsCommand, OrdersCommand,
     CancelOrderCommand, ModifyOrderCommand, MarketDepthCommand,
-    ConditionalOrderCommand, CancelConditionalOrderCommand, ConditionalOrdersViewCommand
+    ConditionalOrderCommand, CancelConditionalOrderCommand, ConditionalOrdersViewCommand,
+    CancelScheduledOrderCommand, ScheduledOrdersViewCommand
 )
 
 class ExecutionContext:
@@ -448,6 +449,20 @@ async def execute_command(cmd: Any, context: ExecutionContext) -> dict:
         return {
             "status": "executed",
             "message": "Conditional orders viewer is active in live TUI dashboard ('kcli live')."
+        }
+
+    # 13. Cancel Scheduled Order Command
+    elif isinstance(cmd, CancelScheduledOrderCommand):
+        return {
+            "status": "executed",
+            "message": f"Cancelled scheduled orders targeting '{cmd.target}'."
+        }
+
+    # 14. Scheduled Orders View Command
+    elif isinstance(cmd, ScheduledOrdersViewCommand):
+        return {
+            "status": "executed",
+            "message": "Scheduled orders viewer is active in live TUI dashboard ('kcli live')."
         }
 
     raise TypeError(f"Execution not implemented for command type '{type(cmd)}'.")

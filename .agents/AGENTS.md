@@ -56,5 +56,12 @@ These rules apply to all AI agents working on the `kitecli` repository. Follow t
 *   **Handling Non-PyPI Dependencies**:
     *   Third-party packages not hosted on PyPI (such as Kotak Neo's `neo-api-client`) must **never** be listed in `pyproject.toml`'s dependencies or optional-dependencies list to prevent PyPI dependency resolution crashes.
     *   Instead, import them lazily at runtime and catch the `ImportError` to raise a clear instruction pointing to the direct Git repository installation command (e.g. `pip install "git+https://...#egg=neo_api_client"`). Always document the Git installation step in `README.md`.
+*   **Command Grammar & Golden Matrix Protection**:
+    *   Any enhancement, feature, or refactoring that touches `cli/parser.py`, `cli/live_session.py`, or `cli/executor.py` MUST preserve 100% backward compatibility for ALL existing 1-arg, 2-arg, 3-arg, and 4-arg commands across single and multi-account setups.
+    *   The `tests/test_command_matrix.py` test suite is the authoritative Golden Matrix for all command permutations (Buy, Sell, Exit, Modify, Cancel, Select, Multi-Account, Scheduled, Conditional). All agents MUST run and verify:
+        ```bash
+        python3 run_tests.py
+        ```
+    *   Never modify token splitting or argument resolution without ensuring all matrix combinations pass.
 
 

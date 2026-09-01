@@ -261,6 +261,10 @@ def parse_single_command(raw_text: str) -> Any:
         return None
     primary = parts[0].lower()
 
+    # 0. Direct Integer Position Selection: "1", "2", "3"
+    if primary.isdigit() and len(parts) == 1:
+        return PositionSelectCommand(target=primary)
+
     # 1. Selection commands: select / s o / s a / s <target> / deselect
     if primary in ("select", "sel", "deselect"):
         if primary == "deselect":
@@ -306,8 +310,18 @@ def parse_single_command(raw_text: str) -> Any:
         price = None
         product = "NRML"
 
+        # Case 0: buy <pos_id> <qty> <price> (e.g. "b 1 50 120.0" or "b 1 1L 120.0")
+        if len(parts) >= 4 and arg1.isdigit() and _is_qty_token(parts[2]):
+            symbol_or_id = arg1
+            qty = parts[2]
+            try:
+                price = float(parts[3])
+            except ValueError:
+                product = parts[3]
+            if len(parts) >= 5:
+                product = parts[4]
         # Case A: buy <qty> ... (symbol omitted, meaning use current selection)
-        if _is_qty_token(arg1):
+        elif _is_qty_token(arg1):
             qty = arg1
             if len(parts) >= 3:
                 try:

@@ -146,8 +146,8 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
     def test_pnl_tab_switching(self, mock_update_buffer):
         self.session.pnl_period = "month"  # manually set to something else
         fragments = self.session._get_tab_bar_text()
-        # Tab 5 is P&L
-        click_handler_pnl = fragments[9][2]
+        # Tab P&L is index 11
+        click_handler_pnl = fragments[11][2]
         
         from prompt_toolkit.mouse_events import MouseEventType
         mock_event = MagicMock()
@@ -157,12 +157,76 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session.info_mode, "pnl")
         self.assertEqual(self.session.pnl_period, "week")
 
+    def test_partially_filled_cancelled_order_pnl(self):
+        import tempfile
+        import sqlite3
+        from pathlib import Path
+
+        # 1. Test _handle_executed_order_context properly formats partial fill
+        self.session.record_context_enabled = True
+        mock_rec = MagicMock()
+        self.session.recorder = mock_rec
+
+        self.session._handle_executed_order_context("api_zk", {
+            "order_id": "ord_buy_partial",
+            "tradingsymbol": "NIFTY2691522400PE",
+            "transaction_type": "BUY",
+            "quantity": 1755,
+            "filled_quantity": 1040,
+            "price": 5.90,
+            "status": "CANCELLED"
+        })
+
+        self.assertTrue(mock_rec.enqueue_executed_order_context.called)
+        kwargs = mock_rec.enqueue_executed_order_context.call_args[1]
+        self.assertEqual(kwargs["order_data"]["quantity"], 1040)
+        self.assertEqual(kwargs["order_data"]["status"], "COMPLETE")
+
+        # 2. Test _render_pnl_pane calculations with DB entries
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_p = Path(tmp_dir) / "test_pnl.db"
+            conn = sqlite3.connect(str(db_p))
+            conn.execute("""
+                CREATE TABLE executed_order_context (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    user_id TEXT,
+                    account_name TEXT,
+                    order_id TEXT,
+                    tradingsymbol TEXT,
+                    exchange TEXT,
+                    transaction_type TEXT,
+                    quantity INTEGER,
+                    price REAL,
+                    status TEXT,
+                    is_settled_externally INTEGER DEFAULT 0,
+                    total_charges REAL DEFAULT 0.0
+                );
+            """)
+            # Insert sell 1755 @ 4.60, buy 1040 @ 5.90, buy 715 @ 6.80
+            conn.execute("INSERT INTO executed_order_context (timestamp, user_id, account_name, order_id, tradingsymbol, transaction_type, quantity, price, status, total_charges) VALUES ('2026-09-01T11:25:01', 'ZK8719', 'ZK8719', 'o1', 'NIFTY2691522400PE', 'SELL', 1755, 4.60, 'COMPLETE', 39.11)")
+            conn.execute("INSERT INTO executed_order_context (timestamp, user_id, account_name, order_id, tradingsymbol, transaction_type, quantity, price, status, total_charges) VALUES ('2026-09-01T14:23:34', 'ZK8719', 'ZK8719', 'o2', 'NIFTY2691522400PE', 'BUY', 1040, 5.90, 'COMPLETE', 26.36)")
+            conn.execute("INSERT INTO executed_order_context (timestamp, user_id, account_name, order_id, tradingsymbol, transaction_type, quantity, price, status, total_charges) VALUES ('2026-09-01T14:25:49', 'ZK8719', 'ZK8719', 'o3', 'NIFTY2691522400PE', 'BUY', 715, 6.80, 'COMPLETE', 25.79)")
+            conn.commit()
+            conn.close()
+
+            mock_rec_db = MagicMock()
+            mock_rec_db.db_path = db_p
+            self.session.recorder = mock_rec_db
+            self.session.pnl_period = "month"
+            self.session.pnl_selected_account = "ALL"
+
+            rendered = self.session._render_pnl_pane()
+            self.assertIn("NIFTY2691522400PE", rendered)
+            self.assertIn("1755", rendered)
+            self.assertIn("2,925.00", rendered)
+
     @patch("cli.live_session.KCLILiveSession._update_info_buffer")
     def test_md_tab_switching_and_rendering(self, mock_update_buffer):
         fragments = self.session._get_tab_bar_text()
-        # Tab 6 is MD (index 11)
-        self.assertEqual(fragments[11][1], " MD ")
-        click_handler_md = fragments[11][2]
+        # Tab MD is index 13
+        self.assertEqual(fragments[13][1], " MD ")
+        click_handler_md = fragments[13][2]
 
         from prompt_toolkit.mouse_events import MouseEventType
         mock_event = MagicMock()
@@ -235,6 +299,57 @@ class TestUIComponents(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Live LTP", rendered)
         self.assertIn("100.00", rendered)
         self.assertIn("105.25", rendered)
+
+    async def test_pending_order_token_resolution_and_live_ltp_streaming(self):
+        self.session.client.get_nfo_symbol_token_map.return_value = {
+            "NIFTY2691525200CE": 88888
+        }
+        self.session.client.get_positions.return_value = {"accounts": []}
+        self.session.client.get_margins.return_value = {"accounts": []}
+        self.session.client.get_orders.return_value = {
+            "accounts": [
+                {
+                    "name": "ZK8719",
+                    "api_key": "api_zk",
+                    "status": "success",
+                    "orders": [
+                        {
+                            "order_id": "825472",
+                            "tradingsymbol": "NIFTY2691525200CE",
+                            "transaction_type": "SELL",
+                            "quantity": 1755,
+                            "filled_quantity": 0,
+                            "order_type": "LIMIT",
+                            "price": 3.85,
+                            "product": "NRML",
+                            "status": "OPEN",
+                        }
+                    ],
+                }
+            ]
+        }
+        self.session.info_mode = "orders_pending"
+
+        # Run refresh
+        await self.session._trigger_immediate_refresh()
+
+        # Verify token was resolved and subscribed
+        self.assertIn(88888, self.session.subscribed_tokens)
+        self.assertEqual(self.session.ws_symbol_to_token.get("NIFTY2691525200CE"), 88888)
+        self.assertEqual(self.session.ws_token_to_symbol.get(88888), "NIFTY2691525200CE")
+
+        # Simulate tick on token 88888
+        self.session.app = MagicMock()
+        self.session.app.loop = MagicMock()
+        ticks = [{"instrument_token": 88888, "last_price": 3.85}]
+        self.session._on_ticks(None, ticks)
+
+        self.assertEqual(self.session.ws_symbol_ltp_cache.get("NIFTY2691525200CE"), 3.85)
+        self.assertEqual(self.session.get_symbol_ltp("NIFTY2691525200CE"), 3.85)
+
+        rendered = self.session._render_orders_pane(self.session.last_orders_response, "orders_pending")
+        self.assertIn("NIFTY2691525200CE", rendered)
+        self.assertIn("₹3.85", rendered)
 
     def test_position_expiry_extraction_and_header(self):
         from cli.greeks import get_position_expiry_info, format_expiry_header

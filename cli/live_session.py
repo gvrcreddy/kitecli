@@ -18,6 +18,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame, TextArea
 
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.history import InMemoryHistory, FileHistory
 from collections import UserDict, defaultdict
 from prompt_toolkit.widgets import SearchToolbar
@@ -335,6 +336,8 @@ class KCLILiveSession:
         self.ws_symbol_ltp_cache: dict[str, float] = {}
         # Reverse map: instrument_token → tradingsymbol, built during _trigger_immediate_refresh
         self.ws_token_to_symbol: dict[int, str] = {}
+        # Forward map: tradingsymbol → instrument_token
+        self.ws_symbol_to_token: dict[str, int] = {}
         self._refresh_in_progress = False
         self._refresh_pending = False
         self.rest_error_count = 0
@@ -424,6 +427,12 @@ class KCLILiveSession:
         self.holdings_target_account: str | None = None
         self.last_holdings_response: dict | None = None
         self._last_oc_text: str = "Press F3 or run 'oc <UNDERLYING>' to fetch option chain."
+        self.oc_dual_data: dict | None = None
+        self.oc_dual_dropdown_1: bool = False
+        self.oc_dual_dropdown_2: bool = False
+        self.oc_dual_exp1_idx: int = 0
+        self.oc_dual_exp2_idx: int = 1
+        self._last_oc_dual_text: str = "Press F3 or run 'oc comp <UNDERLYING>' to compare option chains."
         self._last_pending_text: str = "Fetching pending orders..."
         self._last_executed_text: str = "Fetching executed orders..."
         self._last_advisor_text: str = "Press F4 to view Tuesday Option Strangle Advisor plan."
@@ -479,6 +488,47 @@ class KCLILiveSession:
             "frame.label": "fg:#8b949e bold",
             "focused_frame.border": "fg:#58a6ff bold",
             "focused_frame.label": "fg:#58a6ff bold",
+
+            # Option Chain Matrix styles
+            "oc.border": "fg:#30363d",
+            "oc.header.title": "fg:#58a6ff bold",
+            "oc.header.spot": "fg:#f1e05a bold",
+            "oc.header.expiry": "fg:#d29922 bold",
+            "oc.header.pcr": "fg:#56d364 bold",
+            "oc.header.straddle": "fg:#bc8cff bold",
+            "oc.header.pain": "fg:#ff7b72 bold",
+            "oc.table.header": "fg:#8b949e bold",
+            "oc.table.cols": "fg:#79c0ff bold",
+            "oc.ce": "fg:#56d364",
+            "oc.pe": "fg:#ff7b72",
+            "oc.ce.itm": "bg:#161b22 fg:#56d364",
+            "oc.pe.itm": "bg:#161b22 fg:#ff7b72",
+            "oc.bar.call": "fg:#ff7b72",
+            "oc.bar.put": "fg:#56d364",
+            "oc.strike": "fg:#e6edf3 bold",
+            "oc.atm": "bg:#388bfd fg:#ffffff bold",
+            "oc.wall.call": "bg:#490202 fg:#ff7b72 bold",
+            "oc.wall.put": "bg:#033a16 fg:#56d364 bold",
+            "oc.maxpain": "bg:#2e1065 fg:#d8b4fe bold",
+            "oc.selected": "bg:#1f6feb fg:#ffffff bold",
+            "oc.expiry.header": "fg:#8b949e bold",
+            "oc.expiry.active": "bg:#238636 fg:#ffffff bold",
+            "oc.expiry.inactive": "bg:#21262d fg:#58a6ff",
+            "oc.dropdown.btn": "bg:#21262d fg:#58a6ff bold",
+            "oc.dropdown.active": "bg:#1f6feb fg:#ffffff bold",
+            "oc.dropdown.item": "fg:#e6edf3",
+            "oc.dropdown.close": "fg:#8b949e italic",
+            "oc.tip": "fg:#8b949e italic",
+
+            # Dual Option Chain Comparison (Set 1 vs Set 2) styles
+            "oc.set1.ce": "fg:#56d364",           # Set 1 Calls (Emerald Green)
+            "oc.set1.pe": "fg:#ff7b72",           # Set 1 Puts (Coral Red)
+            "oc.set1.hdr": "fg:#56d364 bold",      # Set 1 Header
+            "oc.set1.btn": "bg:#0d3318 fg:#56d364 bold", # Set 1 Expiry Button
+            "oc.set2.ce": "fg:#79c0ff",           # Set 2 Calls (Sky Blue / Cyan)
+            "oc.set2.pe": "fg:#f1e05a",           # Set 2 Puts (Gold / Amber)
+            "oc.set2.hdr": "fg:#79c0ff bold",      # Set 2 Header
+            "oc.set2.btn": "bg:#0c2d48 fg:#79c0ff bold", # Set 2 Expiry Button
         })
 
     def _strip_rich_markup(self, text: str) -> str:
@@ -599,6 +649,8 @@ class KCLILiveSession:
 
     def update_prompt_label(self) -> None:
         """Update prompt label based on selected symbol and account contexts."""
+        if not hasattr(self, "prompt_control"):
+            return
         if self.selected_order:
             self.prompt_control.text = f" kcli [@{self.selected_order.get('account_name')}:{self.selected_order.get('order_id')[-6:]}]> "
         elif self.selected_account_name and self.selected_symbol:
@@ -877,6 +929,8 @@ class KCLILiveSession:
 
     def _update_positions_display(self) -> None:
         """Render positions to a formatted string aligned to the left container width."""
+        if not hasattr(self, "positions_control"):
+            return
         if not getattr(self, "last_positions_response", None):
             self.positions_control.text = "Fetching positions, please wait..."
             return
@@ -1069,6 +1123,9 @@ class KCLILiveSession:
                 if mouse_event and mouse_event.event_type == MouseEventType.MOUSE_UP:
                     if mode == "pnl":
                         self.pnl_period = "week"
+                    elif mode == "oc":
+                        if getattr(self, "oc_data", None):
+                            self._update_oc_subscriptions(self.oc_data.get("strikes", []))
                     self.info_mode = mode
                     self._update_info_buffer()
                     if hasattr(self, "app") and self.app:
@@ -1101,6 +1158,38 @@ class KCLILiveSession:
             "class:tab.active" if self.info_mode == "oc" else "class:tab.inactive",
             " OC ",
             make_click_handler("oc")
+        ))
+        fragments.append(("", " "))
+
+        # Tab 3b: OC-Comp (Side-by-Side Dual Option Chain)
+        def make_oc_dual_click():
+            def handler(*args):
+                mouse_event = None
+                if len(args) == 2:
+                    mouse_event = args[1]
+                elif len(args) == 1:
+                    mouse_event = args[0]
+                if mouse_event and mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    if not getattr(self, "oc_dual_data", None):
+                        api_key = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
+                        und = getattr(self, "oc_data", {}).get("underlying", "NIFTY") if getattr(self, "oc_data", None) else "NIFTY"
+                        if api_key:
+                            asyncio.create_task(self._fetch_and_display_dual_option_chain(api_key, und, 0, 1))
+                    else:
+                        strikes1 = self.oc_dual_data.get("oc1", {}).get("strikes", [])
+                        strikes2 = self.oc_dual_data.get("oc2", {}).get("strikes", [])
+                        if strikes1 or strikes2:
+                            self._update_oc_subscriptions(strikes1 + strikes2)
+                    self.info_mode = "oc_dual"
+                    self._update_info_buffer()
+                    if hasattr(self, "app") and self.app:
+                        self.app.invalidate()
+            return handler
+
+        fragments.append((
+            "class:tab.active" if self.info_mode == "oc_dual" else "class:tab.inactive",
+            " OC-Comp ",
+            make_oc_dual_click()
         ))
         fragments.append(("", " "))
         
@@ -1512,6 +1601,7 @@ class KCLILiveSession:
 
     def _on_ticks(self, ws, ticks):
         updated = False
+        orders_updated = False
         indices_updated = False
         oc_updated = False
         for tick in ticks:
@@ -1536,24 +1626,35 @@ class KCLILiveSession:
                 if close_val is not None:
                     self.index_values[f"{key}_change"] = ltp - close_val
 
+                # Propagate live index spot price to active option chains
+                if hasattr(self, "oc_data") and self.oc_data and str(self.oc_data.get("underlying", "")).upper() == key.upper():
+                    self.oc_data["spot_price"] = ltp
+                    oc_updated = True
+                if hasattr(self, "oc_dual_data") and self.oc_dual_data and str(self.oc_dual_data.get("underlying", "")).upper() == key.upper():
+                    for oc_k in ("oc1", "oc2"):
+                        if self.oc_dual_data.get(oc_k):
+                            self.oc_dual_data[oc_k]["spot_price"] = ltp
+                    oc_updated = True
+
                 indices_updated = True
                 continue
 
-            # Option-chain tick → update the matching strike's CE/PE LTP.
-            if token in self.oc_token_map and self.oc_data:
-                strike_val, side = self.oc_token_map[token]
-                for s in self.oc_data.get("strikes", []):
-                    if s.get("strike") == strike_val:
-                        s[f"{side}_ltp"] = ltp
-                        oc_updated = True
-                        break
+            # Option-chain tick → update matching strike(s) CE/PE LTP in O(1).
+            if token in self.oc_token_map:
+                for strike_dict, side in self.oc_token_map[token]:
+                    strike_dict[f"{side}_ltp"] = ltp
+                oc_updated = True
 
             # Cache the latest LTP.
             self.ws_ltp_cache[int(token)] = ltp
-            # Also cache by symbol for Kotak positions that have no instrument_token
+            # Also cache by symbol for Kotak positions and orders
             sym = self.ws_token_to_symbol.get(int(token))
             if sym:
-                self.ws_symbol_ltp_cache[sym] = ltp
+                self.ws_symbol_ltp_cache[sym.strip().upper()] = ltp
+
+            # Check if this tick affects displayed orders
+            if self.info_mode in ("orders_pending", "orders_executed"):
+                orders_updated = True
 
             # Position tick → update the matching positions across all accounts.
             # Zerodha positions: matched by instrument_token.
@@ -1594,14 +1695,17 @@ class KCLILiveSession:
         if oc_updated and hasattr(self, "app") and self.app and self.app.loop:
             self.app.loop.call_soon_threadsafe(self._update_oc_and_invalidate)
 
-        if updated:
-            self._positions_version = getattr(self, "_positions_version", 0) + 1
+        if updated or orders_updated:
+            if updated:
+                self._positions_version = getattr(self, "_positions_version", 0) + 1
             if hasattr(self, "app") and self.app and self.app.loop:
                 self.app.loop.call_soon_threadsafe(self._update_display_and_invalidate)
 
     def _update_display_and_invalidate(self) -> None:
-        """Helper to re-render positions and invalidate TUI."""
+        """Helper to re-render positions and orders and invalidate TUI."""
         self._update_positions_display()
+        if self.info_mode in ("orders_pending", "orders_executed"):
+            self._update_info_buffer(reset_scroll=False)
         if hasattr(self, "app") and self.app:
             self.app.invalidate()
 
@@ -1930,9 +2034,11 @@ class KCLILiveSession:
                                 self.position_id_map[pos_idx] = pos
                                 pos_idx += 1
                                 if pos.get("instrument_token"):
-                                    new_tokens.add(int(pos["instrument_token"]))
-
-                    self._update_subscriptions(new_tokens)
+                                    t_int = int(pos["instrument_token"])
+                                    new_tokens.add(t_int)
+                                    if sym:
+                                        self.ws_token_to_symbol[t_int] = sym
+                                        self.ws_symbol_to_token[sym.strip().upper()] = t_int
 
                 # 3. Process orders response
                 if isinstance(orders_resp, BaseException):
@@ -1950,6 +2056,8 @@ class KCLILiveSession:
                             for acct in old_orders_response.get("accounts", [])
                         }
                     
+                    nfo_token_map = self.client.get_nfo_symbol_token_map() if hasattr(self.client, "get_nfo_symbol_token_map") else {}
+
                     for acct in orders_resp.get("accounts", []):
                         api_key = acct.get("api_key")
                         status = acct.get("status", "")
@@ -1965,18 +2073,36 @@ class KCLILiveSession:
                                 acct["orders"] = old_acct.get("orders", [])
                                 acct["status"] = old_acct.get("status", "success")
 
+                        # Extract instrument tokens for all orders (especially open/pending limit orders)
+                        for ord_item in acct.get("orders", []):
+                            sym = ord_item.get("tradingsymbol", "")
+                            sym_clean = sym.strip().upper()
+                            tok = ord_item.get("instrument_token")
+                            if not tok and sym_clean and sym_clean in nfo_token_map:
+                                tok = nfo_token_map[sym_clean]
+                                ord_item["instrument_token"] = tok
+                            if tok:
+                                t_int = int(tok)
+                                new_tokens.add(t_int)
+                                if sym:
+                                    self.ws_token_to_symbol[t_int] = sym
+                                    self.ws_symbol_to_token[sym_clean] = t_int
+
+                    # Subscribe all position and order instrument tokens together on WebSocket
+                    self._update_subscriptions(new_tokens)
+
                     self.last_orders_response = orders_resp
                     self._last_pending_text  = self._render_orders_pane(orders_resp, "orders_pending")
                     self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
                     if self.info_mode in ("orders_pending", "orders_executed"):
                         self._update_info_buffer(reset_scroll=False)
 
-                    # Trigger context recording for completed orders returned via REST (e.g. Kotak / Zerodha)
+                    # Trigger context recording for completed orders or partial fills returned via REST (e.g. Kotak / Zerodha)
                     if hasattr(self, "recorder") and self.recorder:
                         for acct in orders_resp.get("accounts", []):
                             key = acct.get("api_key", "")
                             for ord_item in acct.get("orders", []):
-                                if str(ord_item.get("status", "")).upper() == "COMPLETE":
+                                if str(ord_item.get("status", "")).upper() == "COMPLETE" or int(ord_item.get("filled_quantity", 0)) > 0:
                                     self._handle_executed_order_context(key, ord_item)
 
                     # Trigger conditional orders returned via REST
@@ -2393,6 +2519,8 @@ class KCLILiveSession:
         # Use filled_quantity as effective order quantity for DB and charges calculation
         data_copy = dict(data)
         data_copy["quantity"] = filled_qty
+        if filled_qty > 0:
+            data_copy["status"] = "COMPLETE"
 
         user_id = self.api_key_to_user_id.get(api_key, "UNKNOWN")
         account_name = self._get_account_name(api_key)
@@ -2459,7 +2587,7 @@ class KCLILiveSession:
         if hasattr(self, "recorder") and self.recorder:
             self.recorder.enqueue_executed_order_context(
                 user_id=user_id,
-                order_data=data,
+                order_data=data_copy,
                 margins=margins,
                 greeks=greeks,
                 indicators=indicators,
@@ -3503,11 +3631,30 @@ class KCLILiveSession:
             self.log_message("Switched info pane to [bold]Executed Orders[/bold].")
             return
         elif cmd_norm in ("oc", "optionchain", "chain", "3", "/3", "/oc"):
+            if getattr(self, "oc_data", None):
+                self._update_oc_subscriptions(self.oc_data.get("strikes", []))
             self.info_mode = "oc"
             self._update_info_buffer()
             if hasattr(self, "app") and self.app:
                 self.app.invalidate()
             self.log_message("Switched info pane to [bold]Option Chain[/bold].")
+            return
+        elif cmd_norm in ("oc comp", "occomp", "ocdual", "oc dual", "oc side", "oc2", "/oc2", "/occomp", "comp", "dual"):
+            if not getattr(self, "oc_dual_data", None):
+                api_key = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
+                und = getattr(self, "oc_data", {}).get("underlying", "NIFTY") if getattr(self, "oc_data", None) else "NIFTY"
+                if api_key:
+                    asyncio.create_task(self._fetch_and_display_dual_option_chain(api_key, und, 0, 1))
+            else:
+                strikes1 = self.oc_dual_data.get("oc1", {}).get("strikes", [])
+                strikes2 = self.oc_dual_data.get("oc2", {}).get("strikes", [])
+                if strikes1 or strikes2:
+                    self._update_oc_subscriptions(strikes1 + strikes2)
+            self.info_mode = "oc_dual"
+            self._update_info_buffer()
+            if hasattr(self, "app") and self.app:
+                self.app.invalidate()
+            self.log_message("Switched info pane to [bold]Option Chain Comparison (Side-by-Side)[/bold].")
             return
         elif cmd_norm in ("advisor", "adv", "ai", "4", "/4", "/advisor"):
             self.info_mode = "advisor"
@@ -5131,14 +5278,64 @@ class KCLILiveSession:
 
         # Option Chain Command
         # Usage:
-        #   oc <UNDERLYING>                  → current week
-        #   oc <UNDERLYING> week <N>         → N-th week (0=current, 1=next, ...)
+        #   oc <UNDERLYING>                  → current week (centered on ATM)
+        #   oc <UNDERLYING> monthly          → current month's monthly expiry
+        #   oc <UNDERLYING> next month       → next month's monthly expiry
+        #   oc <UNDERLYING> far month        → far month's monthly expiry
+        #   oc <UNDERLYING> week <N>         → N-th week (0=current, 1=next, 2=far, ...)
         #   oc <UNDERLYING> <YYYY-MM-DD>     → specific expiry date
+        #   oc exp / oc dropdown             → toggle interactive expiry dropdown
         if primary_cmd in ("oc", "optionchain", "chain"):
+            if len(parts) >= 2 and parts[1].lower() in ("comp", "compare", "dual", "side", "2"):
+                import re as _re
+                underlying = "NIFTY"
+                exp1_idx = 0
+                exp2_idx = 1
+                exp1_date = None
+                exp2_date = None
+
+                args = parts[2:]
+                if args:
+                    if not args[0].isdigit() and not _re.match(r"^\d{4}-\d{2}-\d{2}$", args[0]):
+                        underlying = args[0].upper()
+                        args = args[1:]
+
+                if len(args) >= 1:
+                    if args[0].isdigit():
+                        exp1_idx = int(args[0])
+                    elif _re.match(r"^\d{4}-\d{2}-\d{2}$", args[0]):
+                        exp1_date = args[0]
+                if len(args) >= 2:
+                    if args[1].isdigit():
+                        exp2_idx = int(args[1])
+                    elif _re.match(r"^\d{4}-\d{2}-\d{2}$", args[1]):
+                        exp2_date = args[1]
+
+                if not self.accounts:
+                    self.log_message("[#ff0000]Error:[/#] No accounts configured.")
+                    return
+                api_key = self.primary_api_key or self.accounts[0]["api_key"]
+                self.log_message(f"Fetching dual option chain for [bold]{underlying}[/bold]...")
+                asyncio.create_task(self._fetch_and_display_dual_option_chain(
+                    api_key, underlying, exp1_idx, exp2_idx, exp1_date, exp2_date
+                ))
+                return
+
+            if len(parts) >= 2 and parts[1].lower() in ("exp", "dropdown", "menu"):
+                self.oc_dropdown_open = not getattr(self, "oc_dropdown_open", False)
+                self._update_info_buffer(reset_scroll=False)
+                if hasattr(self, "app") and self.app:
+                    self.app.invalidate()
+                return
+
             if len(parts) < 2:
-                self.log_message("[#ff0000]Usage:[/#] oc <UNDERLYING> [week <N> | <YYYY-MM-DD>]")
-                self.log_message("  e.g. [bold]oc NIFTY[/bold]              — current week expiry")
+                self.log_message("[#ff0000]Usage:[/#] oc <UNDERLYING> [monthly | next month | far month | week <N> | <YYYY-MM-DD>]")
+                self.log_message("  e.g. [bold]oc NIFTY[/bold]              — current week")
+                self.log_message("  e.g. [bold]oc NIFTY monthly[/bold]      — current month's monthly expiry")
+                self.log_message("  e.g. [bold]oc NIFTY next month[/bold]   — next month's monthly expiry")
+                self.log_message("  e.g. [bold]oc NIFTY far month[/bold]    — far month's monthly expiry")
                 self.log_message("  e.g. [bold]oc NIFTY week 1[/bold]       — next week expiry")
+                self.log_message("  e.g. [bold]oc NIFTY far week[/bold]     — far week expiry")
                 self.log_message("  e.g. [bold]oc BANKNIFTY 2024-06-27[/bold] — specific date")
                 return
 
@@ -5146,22 +5343,46 @@ class KCLILiveSession:
             expiry_week = 0
             expiry_date = None
 
-            if len(parts) >= 3:
+            show_all = "all" in [p.lower() for p in parts]
+            self.oc_show_all = show_all
+
+            non_all_parts = [p for p in parts if p.lower() != "all"]
+            if len(non_all_parts) >= 3:
+                second_arg = non_all_parts[2].lower()
+                # 'monthly' / 'month' / 'm'
+                if second_arg in ("monthly", "month", "m"):
+                    expiry_date = "monthly"
+                    self.oc_context_mode = "monthly"
+                elif second_arg == "next" and len(non_all_parts) >= 4 and non_all_parts[3].lower() in ("month", "monthly"):
+                    expiry_date = "next monthly"
+                    self.oc_context_mode = "monthly"
+                elif second_arg == "far" and len(non_all_parts) >= 4 and non_all_parts[3].lower() in ("month", "monthly"):
+                    expiry_date = "far monthly"
+                    self.oc_context_mode = "monthly"
+                elif second_arg == "next" and len(non_all_parts) >= 4 and non_all_parts[3].lower() == "week":
+                    expiry_week = 1
+                    self.oc_context_mode = "weekly"
+                elif second_arg == "far" and len(non_all_parts) >= 4 and non_all_parts[3].lower() == "week":
+                    expiry_week = 2
+                    self.oc_context_mode = "weekly"
                 # 'week N' suffix
-                if parts[2].lower() == "week" and len(parts) >= 4:
+                elif second_arg == "week" and len(non_all_parts) >= 4:
                     try:
-                        expiry_week = int(parts[3])
+                        expiry_week = int(non_all_parts[3])
+                        self.oc_context_mode = "weekly"
                     except ValueError:
-                        self.log_message(f"[#ff0000]Error:[/#] Invalid week number '{parts[3]}'.")
+                        self.log_message(f"[#ff0000]Error:[/#] Invalid week number '{non_all_parts[3]}'.")
                         return
                 else:
                     # Try to parse as a date
                     import re as _re
-                    if _re.match(r"\d{4}-\d{2}-\d{2}", parts[2]):
-                        expiry_date = parts[2]
+                    if _re.match(r"\d{4}-\d{2}-\d{2}", non_all_parts[2]):
+                        expiry_date = non_all_parts[2]
                     else:
-                        self.log_message(f"[#ff0000]Error:[/#] Unknown option '{parts[2]}'. Use 'week <N>' or 'YYYY-MM-DD'.")
+                        self.log_message(f"[#ff0000]Error:[/#] Unknown option '{non_all_parts[2]}'. Use 'monthly', 'next month', 'week <N>', or 'YYYY-MM-DD'.")
                         return
+            else:
+                self.oc_context_mode = "weekly"
 
             # Use the primary streaming account so the option chain can stream;
             # fall back to the first configured account for the REST fetch.
@@ -5170,7 +5391,7 @@ class KCLILiveSession:
                 return
             api_key = self.primary_api_key or self.accounts[0]["api_key"]
 
-            self.log_message(f"Fetching option chain for [bold]{underlying}[/bold] (expiry_week={expiry_week if not expiry_date else expiry_date})...")
+            self.log_message(f"Fetching option chain for [bold]{underlying}[/bold] (expiry={expiry_date or f'week {expiry_week}'})...")
             asyncio.create_task(self._fetch_and_display_option_chain(api_key, underlying, expiry_week, expiry_date))
             return
 
@@ -5215,6 +5436,8 @@ class KCLILiveSession:
         self.oc_data = {
             "underlying": underlying,
             "expiry": expiry,
+            "spot_price": response.get("spot_price", 0.0),
+            "summary": response.get("summary", {}),
             "strikes": strikes,
             "available_expiries": expiries,
         }
@@ -5224,7 +5447,19 @@ class KCLILiveSession:
 
         self._last_oc_text = self._render_oc_text()
         self.info_mode = "oc"
-        self._update_info_buffer()
+        self._update_info_buffer(reset_scroll=False)
+
+        # Center initial scroll position around ATM strike
+        atm_strike = response.get("summary", {}).get("atm_strike")
+        if atm_strike and hasattr(self, "_info_control"):
+            for idx, s in enumerate(strikes):
+                if float(s.get("strike", 0)) == atm_strike:
+                    target_scroll = max(0, (10 + idx) - 12)
+                    self._info_control.vertical_scroll_position = target_scroll
+                    if hasattr(self, "info_window"):
+                        self.info_window.vertical_scroll = target_scroll
+                    break
+
         stream_note = " (streaming)" if self.primary_api_key else ""
         self.log_message(
             f"Option chain loaded for {underlying} expiry {expiry}{stream_note}. "
@@ -5232,44 +5467,490 @@ class KCLILiveSession:
         )
 
     def _render_oc_text(self) -> str:
-        """Render the current ``self.oc_data`` into the option-chain pane text."""
+        """Render the current ``self.oc_data`` into the rich option-chain matrix."""
         data = self.oc_data
         if not data:
             return self._last_oc_text
 
         underlying = data.get("underlying", "")
         expiry = data.get("expiry", "")
+        spot_price = float(data.get("spot_price") or 0.0)
+        summary = data.get("summary", {})
         strikes = data.get("strikes", [])
         expiries = data.get("available_expiries", [])
 
+        # If spot_price is 0, check if we have index LTP streaming
+        if spot_price <= 0 and hasattr(self, "index_ltp_map"):
+            for sym, ltp in self.index_ltp_map.items():
+                if underlying in sym:
+                    spot_price = float(ltp or 0.0)
+                    break
+
+        atm_strike = summary.get("atm_strike")
+        atm_straddle = summary.get("atm_straddle")
+        pcr = summary.get("pcr", 0.0)
+        max_pain = summary.get("max_pain", 0.0)
+
+        # Days to expiry formatting
+        from datetime import datetime as _dt, date as _d
+        dte_str = ""
+        if expiry:
+            try:
+                exp_d = _dt.strptime(expiry[:10], "%Y-%m-%d").date()
+                dte = (exp_d - _d.today()).days
+                dte_str = f"({max(0, dte)} DTE)"
+            except Exception:
+                pass
+
+        def _fmt_tab_dt(exp_str: str) -> str:
+            try:
+                d = _dt.strptime(exp_str[:10], "%Y-%m-%d").date()
+                return d.strftime("%d-%b")
+            except Exception:
+                return exp_str
+
+        def _fmt_spark(val, max_val, is_call=True) -> str:
+            if not val or not max_val or val <= 0:
+                return "  "
+            ratio = min(1.0, max(0.0, float(val) / float(max_val)))
+            num_blocks = int(round(ratio * 2))
+            if num_blocks == 0 and ratio > 0.05:
+                num_blocks = 1
+            blocks = "▇" * num_blocks
+            return f"{blocks:<2}" if is_call else f"{blocks:>2}"
+
+        def _fmt_oi(val) -> str:
+            if val is None or val == 0:
+                return "     -"
+            val_int = int(val)
+            if val_int >= 10_000_000:
+                return f"{val_int / 10_000_000:>5.1f}Cr"
+            if val_int >= 100_000:
+                return f"{val_int / 100_000:>5.1f}L"
+            if val_int >= 1_000:
+                return f"{val_int / 1_000:>5.1f}k"
+            return f"{val_int:>6}"
+
+        def _fmt_iv(val) -> str:
+            if val is None or val <= 0:
+                return "     -"
+            return f"{val:>5.1f}%"
+
+        def _fmt_delta(val) -> str:
+            if val is None:
+                return "     -"
+            return f"{val:>6.2f}"
+
+        def _fmt_ltp(val) -> str:
+            if val is None:
+                return "       -"
+            return f"{val:>8.2f}"
+
+        # Classify weekly vs monthly expiries
+        weekly_expiries = [e for e in expiries if not e.get("is_monthly")]
+        monthly_expiries = [e for e in expiries if e.get("is_monthly")]
+        is_monthly_context = any(e.get("expiry") == expiry and e.get("is_monthly") for e in expiries) or getattr(self, "oc_context_mode", "weekly") == "monthly"
+
+        # 1. Top Expiry Tabs (Exactly 3 tabs + 1 dropdown tab)
+        top_tabs = []
+        if is_monthly_context and monthly_expiries:
+            for i, m in enumerate(monthly_expiries[:3]):
+                lbl = "Current" if i == 0 else "Next" if i == 1 else "Far"
+                dt_disp = _fmt_tab_dt(m.get("expiry", ""))
+                is_active = (m.get("expiry") == expiry)
+                prefix = "● " if is_active else ""
+                top_tabs.append(f"[ {prefix}{lbl}: {dt_disp} ]")
+        else:
+            for i, w in enumerate(weekly_expiries[:3]):
+                lbl = "Current" if i == 0 else "Next" if i == 1 else "Far"
+                dt_disp = _fmt_tab_dt(w.get("expiry", ""))
+                is_active = (w.get("expiry") == expiry)
+                prefix = "● " if is_active else ""
+                top_tabs.append(f"[ {prefix}{lbl}: {dt_disp} ]")
+
+        top_tabs.append(f"[ ▾ Expiries ({len(expiries)}) ]")
+        tab_line = " " + "  ".join(top_tabs)
+
         lines = [
-            f"=== Option Chain: {underlying}  |  Expiry: {expiry} ===",
-            "",
-            f"{'CE LTP':>8}  {'CE Symbol':<24}  {'Strike':>8}  {'PE Symbol':<24}  {'PE LTP':>8}",
-            "-" * 80,
+            tab_line,
         ]
+
+        # 2. Dropdown (if open)
+        if getattr(self, "oc_dropdown_open", False):
+            lines.append("┌── Select Expiry (Click to switch) ────────────────────────────────────────┐")
+            for i, e in enumerate(expiries):
+                prefix = "►" if e.get("expiry") == expiry else " "
+                lbl = e.get("week_label", "")
+                dt = e.get("expiry", "")
+                lines.append(f"│  {prefix} {dt:<12} • {lbl:<52}│")
+            lines.append("│  [ ▲ Close Dropdown ]                                                     │")
+            lines.append("└───────────────────────────────────────────────────────────────────────────┘")
+
+        lines.append("────────────────────────────────────────────────────────────────────────────")
+
+        # 3. Symmetrical Tidied Info Container with Visual Gauges (exactly 76 chars wide)
+        atm_str_label = f"₹{atm_straddle:.2f} ({int(atm_strike or 0)} ATM)" if atm_straddle else "-"
+        exp_full = f"Expiry: {expiry} {dte_str}"
+
+        lower_range = int(round(atm_strike - atm_straddle)) if (atm_strike and atm_straddle) else None
+        upper_range = int(round(atm_strike + atm_straddle)) if (atm_strike and atm_straddle) else None
+
+        filled = min(8, max(0, int(round((float(pcr or 0.0) / 2.0) * 8))))
+        pcr_bar = "█" * filled + "░" * (8 - filled)
+
+        s1 = f" {underlying} Spot: {spot_price:,.2f}"[:26]
+        s2 = f"{exp_full}"[:30]
+        s3 = f"Max Pain: {int(max_pain or 0)} "[:16]
+
+        p1 = f" PCR: {pcr:.2f} [{pcr_bar}]"[:25]
+        p2 = (f"ATM Str: ₹{atm_straddle:.1f} (Range: {lower_range}-{upper_range})" if (lower_range and upper_range) else f"ATM Straddle: {atm_str_label}")[:47]
+
+        lines.append("┌──────────────────────────────────────────────────────────────────────────┐")
+        lines.append(f"│ {s1:<26}{s2:^30}{s3:>16} │")
+        lines.append(f"│ {p1:<25}{p2:<47} │")
+        lines.append("└──────────────────────────────────────────────────────────────────────────┘")
+
+        # 4. Table Header & Matrix Divider (76 chars)
+        lines += [
+            "   OI        IV   Delta    LTP  │  STRIKE  │  LTP    Delta    IV        OI  ",
+            "────────────────────────────────┼──────────┼────────────────────────────────",
+        ]
+
+        max_oi = max(
+            max((s.get("ce_oi") or 0) for s in strikes) if strikes else 1,
+            max((s.get("pe_oi") or 0) for s in strikes) if strikes else 1,
+            1,
+        )
+        max_ce_strike = max(strikes, key=lambda s: s.get("ce_oi") or 0)["strike"] if strikes else None
+        max_pe_strike = max(strikes, key=lambda s: s.get("pe_oi") or 0)["strike"] if strikes else None
+
         for s in strikes:
-            strike = s.get("strike", 0)
+            strike = float(s.get("strike", 0.0))
+            is_atm = (strike == atm_strike)
+
+            ce_oi_str = _fmt_oi(s.get("ce_oi"))
+            ce_bar = _fmt_spark(s.get("ce_oi"), max_oi, is_call=True)
+            ce_iv_str = _fmt_iv(s.get("ce_iv"))
+            ce_delta_str = _fmt_delta(s.get("ce_delta"))
+            ce_ltp_str = _fmt_ltp(s.get("ce_ltp"))
+
+            pe_ltp_str = _fmt_ltp(s.get("pe_ltp"))
+            pe_delta_str = _fmt_delta(s.get("pe_delta"))
+            pe_iv_str = _fmt_iv(s.get("pe_iv"))
+            pe_bar = _fmt_spark(s.get("pe_oi"), max_oi, is_call=False)
+            pe_oi_str = _fmt_oi(s.get("pe_oi"))
+
+            if is_atm:
+                strike_disp = f"[{int(strike):^6}]"
+            elif strike == max_ce_strike:
+                strike_disp = f" {int(strike)} R"
+            elif strike == max_pe_strike:
+                strike_disp = f" {int(strike)} S"
+            elif max_pain and int(strike) == int(max_pain):
+                strike_disp = f" {int(strike)} *"
+            else:
+                strike_disp = f" {int(strike):^6} "
+
+            call_side = f"{ce_oi_str} {ce_bar} {ce_iv_str} {ce_delta_str} {ce_ltp_str} "
+            put_side = f" {pe_ltp_str} {pe_delta_str} {pe_iv_str} {pe_bar} {pe_oi_str}"
+            lines.append(f"{call_side}│{strike_disp}│{put_side}")
+
+        lines += [
+            "────────────────────────────────┴──────────┴────────────────────────────────",
+            " Tip: Click any strike to stage order | Type 'oc <SYM> monthly' or 'oc <SYM> week <N>'",
+        ]
+        return "\n".join(lines)
+
+    def _build_oc_formatted_fragments(self) -> list:
+        """Build interactive formatted text fragments with mouse click handlers for the Option Chain."""
+        from prompt_toolkit.mouse_events import MouseEventType
+        from datetime import datetime as _dt, date as _d
+
+        data = self.oc_data
+        if not data:
+            return [("", self._last_oc_text or "No option chain data loaded.")]
+
+        underlying = data.get("underlying", "")
+        expiry = data.get("expiry", "")
+        spot_price = float(data.get("spot_price") or 0.0)
+        summary = data.get("summary", {})
+        strikes = data.get("strikes", [])
+        expiries = data.get("available_expiries", [])
+
+        if spot_price <= 0 and hasattr(self, "index_ltp_map"):
+            for sym, ltp in self.index_ltp_map.items():
+                if underlying in sym:
+                    spot_price = float(ltp or 0.0)
+                    break
+
+        atm_strike = summary.get("atm_strike")
+        atm_straddle = summary.get("atm_straddle")
+        pcr = summary.get("pcr", 0.0)
+        max_pain = summary.get("max_pain", 0.0)
+
+        # Days to expiry formatting
+        dte_str = ""
+        if expiry:
+            try:
+                exp_d = _dt.strptime(expiry[:10], "%Y-%m-%d").date()
+                dte = (exp_d - _d.today()).days
+                dte_str = f"({max(0, dte)} DTE)"
+            except Exception:
+                pass
+
+        def _fmt_tab_dt(exp_str: str) -> str:
+            try:
+                d = _dt.strptime(exp_str[:10], "%Y-%m-%d").date()
+                return d.strftime("%d-%b")
+            except Exception:
+                return exp_str
+
+        def _fmt_spark(val, max_val, is_call=True) -> str:
+            if not val or not max_val or val <= 0:
+                return "  "
+            ratio = min(1.0, max(0.0, float(val) / float(max_val)))
+            num_blocks = int(round(ratio * 2))
+            if num_blocks == 0 and ratio > 0.05:
+                num_blocks = 1
+            blocks = "▇" * num_blocks
+            return f"{blocks:<2}" if is_call else f"{blocks:>2}"
+
+        def _fmt_oi(val) -> str:
+            if val is None or val == 0:
+                return "     -"
+            val_int = int(val)
+            if val_int >= 10_000_000:
+                return f"{val_int / 10_000_000:>5.1f}Cr"
+            if val_int >= 100_000:
+                return f"{val_int / 100_000:>5.1f}L"
+            if val_int >= 1_000:
+                return f"{val_int / 1_000:>5.1f}k"
+            return f"{val_int:>6}"
+
+        def _fmt_iv(val) -> str:
+            if val is None or val <= 0:
+                return "     -"
+            return f"{val:>5.1f}%"
+
+        def _fmt_delta(val) -> str:
+            if val is None:
+                return "     -"
+            return f"{val:>6.2f}"
+
+        def _fmt_ltp(val) -> str:
+            if val is None:
+                return "       -"
+            return f"{val:>8.2f}"
+
+        def _make_exp_click(w_idx, exp_val):
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self.oc_dropdown_open = False
+                    und = self.oc_data.get("underlying", "NIFTY")
+                    ak = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
+                    if ak:
+                        self.log_message(f"Loading Option Chain for [bold]{und}[/bold] expiry [bold]{exp_val}[/bold]...")
+                        import asyncio
+                        asyncio.create_task(self._fetch_and_display_option_chain(ak, und, expiry_week=w_idx, expiry_date=exp_val))
+            return _handler
+
+        def _make_dropdown_toggle():
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self.oc_dropdown_open = not getattr(self, "oc_dropdown_open", False)
+                    self._update_info_buffer(reset_scroll=False)
+                    if hasattr(self, "app") and self.app:
+                        self.app.invalidate()
+            return _handler
+
+        # 1. Top Expiry Navigation Tabs (3 tabs + 1 dropdown tab)
+        weekly_expiries = [(i, e) for i, e in enumerate(expiries) if not e.get("is_monthly")]
+        monthly_expiries = [(i, e) for i, e in enumerate(expiries) if e.get("is_monthly")]
+        is_monthly_context = any(e.get("expiry") == expiry and e.get("is_monthly") for e in expiries) or getattr(self, "oc_context_mode", "weekly") == "monthly"
+
+        frags = [("", " ")]
+        if is_monthly_context and monthly_expiries:
+            for count, (idx, m) in enumerate(monthly_expiries[:3]):
+                lbl = "Current" if count == 0 else "Next" if count == 1 else "Far"
+                m_dt = m.get("expiry", "")
+                dt_disp = _fmt_tab_dt(m_dt)
+                is_cur = (m_dt == expiry)
+                style = "class:oc.expiry.active" if is_cur else "class:oc.expiry.inactive"
+                prefix = "● " if is_cur else ""
+                frags.append((style, f"[ {prefix}{lbl}: {dt_disp} ]", _make_exp_click(idx, m_dt)))
+                frags.append(("", "  "))
+        else:
+            for count, (idx, w) in enumerate(weekly_expiries[:3]):
+                lbl = "Current" if count == 0 else "Next" if count == 1 else "Far"
+                w_dt = w.get("expiry", "")
+                dt_disp = _fmt_tab_dt(w_dt)
+                is_cur = (w_dt == expiry)
+                style = "class:oc.expiry.active" if is_cur else "class:oc.expiry.inactive"
+                prefix = "● " if is_cur else ""
+                frags.append((style, f"[ {prefix}{lbl}: {dt_disp} ]", _make_exp_click(idx, w_dt)))
+                frags.append(("", "  "))
+
+        dd_style = "class:oc.expiry.active" if getattr(self, "oc_dropdown_open", False) else "class:oc.dropdown.btn"
+        frags.append((dd_style, f"[ ▾ Expiries ({len(expiries)}) ]", _make_dropdown_toggle()))
+        frags.append(("", "\n"))
+
+        # 2. Interactive Dropdown Menu (if open)
+        if getattr(self, "oc_dropdown_open", False):
+            frags.append(("class:oc.border", "┌── Select Expiry (Click to switch) ────────────────────────────────────────┐\n"))
+            for i, e in enumerate(expiries):
+                dt = e.get("expiry", "")
+                lbl = e.get("week_label", "")
+                is_cur = (dt == expiry)
+                prefix = "► " if is_cur else "  "
+                item_style = "class:oc.dropdown.active" if is_cur else "class:oc.dropdown.item"
+                frags.append(("class:oc.border", "│ "))
+                frags.append((item_style, f"{prefix}{dt:<12} • {lbl:<52}", _make_exp_click(i, dt)))
+                frags.append(("class:oc.border", " │\n"))
+            frags.append(("class:oc.border", "│ "))
+            frags.append(("class:oc.dropdown.close", "[ ▲ Close Dropdown ]                                                     ", _make_dropdown_toggle()))
+            frags.append(("class:oc.border", " │\n"))
+            frags.append(("class:oc.border", "└───────────────────────────────────────────────────────────────────────────┘\n"))
+
+        # 3. Distinction Line
+        frags.append(("class:oc.border", "────────────────────────────────────────────────────────────────────────────\n"))
+
+        # 4. Tidied Symmetrical Metrics Container with Visual Gauges (exact 76 chars wide)
+        atm_str_label = f"₹{atm_straddle:.2f} ({int(atm_strike or 0)} ATM)" if atm_straddle else "-"
+        exp_full = f"Expiry: {expiry} {dte_str}"
+
+        lower_range = int(round(atm_strike - atm_straddle)) if (atm_strike and atm_straddle) else None
+        upper_range = int(round(atm_strike + atm_straddle)) if (atm_strike and atm_straddle) else None
+
+        filled = min(8, max(0, int(round((float(pcr or 0.0) / 2.0) * 8))))
+        pcr_bar = "█" * filled + "░" * (8 - filled)
+
+        s1 = f" {underlying} Spot: {spot_price:,.2f}"[:26]
+        s2 = f"{exp_full}"[:30]
+        s3 = f"Max Pain: {int(max_pain or 0)} "[:16]
+
+        p1 = f" PCR: {pcr:.2f} [{pcr_bar}]"[:25]
+        p2 = (f"ATM Str: ₹{atm_straddle:.1f} (Range: {lower_range}-{upper_range})" if (lower_range and upper_range) else f"ATM Straddle: {atm_str_label}")[:47]
+
+        frags += [
+            ("class:oc.border", "┌──────────────────────────────────────────────────────────────────────────┐\n"),
+            ("class:oc.border", "│ "),
+            ("class:oc.header.spot", f"{s1:<26}"),
+            ("class:oc.header.expiry", f"{s2:^30}"),
+            ("class:oc.header.pain", f"{s3:>16}"),
+            ("class:oc.border", " │\n"),
+            ("class:oc.border", "│ "),
+            ("class:oc.header.pcr", f"{p1:<25}"),
+            ("class:oc.header.straddle", f"{p2:<47}"),
+            ("class:oc.border", " │\n"),
+            ("class:oc.border", "└──────────────────────────────────────────────────────────────────────────┘\n"),
+        ]
+
+        # 5. Table Headers
+        frags += [
+            ("class:oc.table.cols",   "   OI        IV   Delta    LTP  │  STRIKE  │  LTP    Delta    IV        OI  \n"),
+            ("class:oc.border",       "────────────────────────────────┼──────────┼────────────────────────────────\n"),
+        ]
+
+        def _make_ce_click(sym, ltp):
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    if sym and sym != "-":
+                        self.log_message(f"Selected [bold green]Call (CE): {sym}[/bold green] (LTP: {ltp or 'N/A'})")
+                        if hasattr(self, "input_field") and self.input_field:
+                            buf = self.input_field.buffer
+                            price_str = f" {float(ltp):.2f}" if ltp and float(ltp) > 0 else ""
+                            buf.text = f"sell {sym} 27L{price_str}"
+                            buf.cursor_position = len(buf.text)
+                            if hasattr(self, "app") and self.app:
+                                self.app.layout.focus(self.input_field)
+                        self._update_display_and_invalidate()
+            return _handler
+
+        def _make_pe_click(sym, ltp):
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    if sym and sym != "-":
+                        self.log_message(f"Selected [bold red]Put (PE): {sym}[/bold red] (LTP: {ltp or 'N/A'})")
+                        if hasattr(self, "input_field") and self.input_field:
+                            buf = self.input_field.buffer
+                            price_str = f" {float(ltp):.2f}" if ltp and float(ltp) > 0 else ""
+                            buf.text = f"sell {sym} 27L{price_str}"
+                            buf.cursor_position = len(buf.text)
+                            if hasattr(self, "app") and self.app:
+                                self.app.layout.focus(self.input_field)
+                        self._update_display_and_invalidate()
+            return _handler
+
+        # 6. Render ALL strikes with OI Depth Spark-Bars, Wall Annotations, and ITM/OTM Shading
+        max_oi = max(
+            max((s.get("ce_oi") or 0) for s in strikes) if strikes else 1,
+            max((s.get("pe_oi") or 0) for s in strikes) if strikes else 1,
+            1,
+        )
+        max_ce_strike = max(strikes, key=lambda s: s.get("ce_oi") or 0)["strike"] if strikes else None
+        max_pe_strike = max(strikes, key=lambda s: s.get("pe_oi") or 0)["strike"] if strikes else None
+
+        for s in strikes:
+            strike = float(s.get("strike", 0.0))
+            is_atm = (strike == atm_strike)
+
             ce_sym = s.get("ce_symbol") or "-"
             pe_sym = s.get("pe_symbol") or "-"
             ce_ltp = s.get("ce_ltp")
             pe_ltp = s.get("pe_ltp")
-            ce_ltp_str = f"{ce_ltp:>8.2f}" if ce_ltp is not None else f"{'N/A':>8}"
-            pe_ltp_str = f"{pe_ltp:>8.2f}" if pe_ltp is not None else f"{'N/A':>8}"
-            lines.append(
-                f"{ce_ltp_str}  {ce_sym:<24}  {strike:>8.0f}  {pe_sym:<24}  {pe_ltp_str}"
-            )
 
-        lines += [
-            "-" * 80,
-            "",
-            "Available expiries (use 'oc <UNDERLYING> week <N>' or 'oc <UNDERLYING> YYYY-MM-DD'):",
-        ]
-        for e in expiries:
-            lines.append(f"  [{e['week_label']}]  {e['expiry']}")
-        lines.append("")
-        lines.append("Tip: To buy CE, type: buy <CE_SYMBOL> <qty>")
-        return "\n".join(lines)
+            ce_oi_str = _fmt_oi(s.get("ce_oi"))
+            ce_bar = _fmt_spark(s.get("ce_oi"), max_oi, is_call=True)
+            ce_iv_str = _fmt_iv(s.get("ce_iv"))
+            ce_delta_str = _fmt_delta(s.get("ce_delta"))
+            ce_ltp_str = _fmt_ltp(ce_ltp)
+
+            pe_ltp_str = _fmt_ltp(pe_ltp)
+            pe_delta_str = _fmt_delta(s.get("pe_delta"))
+            pe_iv_str = _fmt_iv(s.get("pe_iv"))
+            pe_bar = _fmt_spark(s.get("pe_oi"), max_oi, is_call=False)
+            pe_oi_str = _fmt_oi(s.get("pe_oi"))
+
+            ce_click = _make_ce_click(ce_sym, ce_ltp)
+            pe_click = _make_pe_click(pe_sym, pe_ltp)
+
+            # ITM vs OTM Shading
+            is_ce_itm = (spot_price > 0 and strike < spot_price)
+            is_pe_itm = (spot_price > 0 and strike > spot_price)
+
+            ce_style = "class:oc.ce.itm" if is_ce_itm else "class:oc.ce"
+            pe_style = "class:oc.pe.itm" if is_pe_itm else "class:oc.pe"
+
+            # Call Side (33 chars)
+            frags.append((ce_style, f"{ce_oi_str} ", ce_click))
+            frags.append(("class:oc.bar.call", f"{ce_bar} ", ce_click))
+            frags.append((ce_style, f"{ce_iv_str} {ce_delta_str} {ce_ltp_str} ", ce_click))
+
+            frags.append(("class:oc.border", "│"))
+
+            # Strike Column (8 chars)
+            if is_atm:
+                frags.append(("class:oc.atm", f"[{int(strike):^6}]"))
+            elif strike == max_ce_strike:
+                frags.append(("class:oc.wall.call", f" {int(strike)} R"))
+            elif strike == max_pe_strike:
+                frags.append(("class:oc.wall.put", f" {int(strike)} S"))
+            elif max_pain and int(strike) == int(max_pain):
+                frags.append(("class:oc.maxpain", f" {int(strike)} *"))
+            else:
+                frags.append(("class:oc.strike", f" {int(strike):^6} "))
+
+            frags.append(("class:oc.border", "│"))
+
+            # Put Side (33 chars)
+            frags.append((pe_style, f" {pe_ltp_str} {pe_delta_str} {pe_iv_str} ", pe_click))
+            frags.append(("class:oc.bar.put", f"{pe_bar} ", pe_click))
+            frags.append((pe_style, f"{pe_oi_str}", pe_click))
+            frags.append(("", "\n"))
+
+        frags.append(("class:oc.border", "────────────────────────────────┴──────────┴────────────────────────────────\n"))
+        frags.append(("class:oc.tip", " Tip: Click any strike to stage order | Type 'oc <SYM> monthly' or 'oc <SYM> week <N>'\n"))
+        return frags
 
     def _update_oc_subscriptions(self, strikes: list[dict]) -> None:
         """Subscribe the option-chain instrument tokens on the primary ticker
@@ -5279,18 +5960,20 @@ class KCLILiveSession:
         the correct strike/side for live LTP updates.
         """
         new_tokens: set[int] = set()
-        token_map: dict[int, tuple] = {}
+        token_map: dict[int, list[tuple[dict, str]]] = defaultdict(list)
         for s in strikes:
             ce_tok = s.get("ce_token")
             pe_tok = s.get("pe_token")
             if ce_tok:
-                new_tokens.add(int(ce_tok))
-                token_map[int(ce_tok)] = (s.get("strike"), "ce")
+                c_tok_int = int(ce_tok)
+                new_tokens.add(c_tok_int)
+                token_map[c_tok_int].append((s, "ce"))
             if pe_tok:
-                new_tokens.add(int(pe_tok))
-                token_map[int(pe_tok)] = (s.get("strike"), "pe")
+                p_tok_int = int(pe_tok)
+                new_tokens.add(p_tok_int)
+                token_map[p_tok_int].append((s, "pe"))
 
-        self.oc_token_map = token_map
+        self.oc_token_map = dict(token_map)
 
         ticker = self._get_active_ticker()
         old_tokens = self.oc_subscribed_tokens
@@ -5317,11 +6000,559 @@ class KCLILiveSession:
 
     def _update_oc_and_invalidate(self) -> None:
         """Re-render the option-chain pane from streamed values and refresh TUI."""
+        if hasattr(self, "oc_data") and self.oc_data:
+            from cli.greeks import enrich_option_chain_greeks
+            spot = float(self.oc_data.get("spot_price") or 0.0)
+            exp = self.oc_data.get("expiry")
+            strikes = self.oc_data.get("strikes", [])
+            if spot > 0 and exp and strikes:
+                self.oc_data["summary"] = enrich_option_chain_greeks(strikes, spot, exp)
+        if hasattr(self, "oc_dual_data") and self.oc_dual_data:
+            from cli.greeks import enrich_option_chain_greeks
+            for oc_k in ("oc1", "oc2"):
+                chain = self.oc_dual_data.get(oc_k)
+                if chain:
+                    spot = float(chain.get("spot_price") or 0.0)
+                    exp = chain.get("expiry")
+                    strikes = chain.get("strikes", [])
+                    if spot > 0 and exp and strikes:
+                        chain["summary"] = enrich_option_chain_greeks(strikes, spot, exp)
+
         self._last_oc_text = self._render_oc_text()
-        if self.info_mode == "oc":
+        self._last_oc_dual_text = self._render_oc_dual_text()
+        if self.info_mode in ("oc", "oc_dual"):
             self._update_info_buffer(reset_scroll=False)
         if hasattr(self, "app") and self.app:
             self.app.invalidate()
+
+    async def _fetch_and_display_dual_option_chain(
+        self,
+        api_key: str,
+        underlying: str = "NIFTY",
+        exp1_idx: int = 0,
+        exp2_idx: int = 1,
+        exp1_date: str | None = None,
+        exp2_date: str | None = None,
+    ) -> None:
+        """Fetch and display two option chains side-by-side in the info pane."""
+        try:
+            task1 = self._run_api_call(
+                self.client.get_option_chain,
+                api_key=api_key,
+                underlying=underlying,
+                expiry_week=exp1_idx,
+                expiry_date=exp1_date,
+            )
+            task2 = self._run_api_call(
+                self.client.get_option_chain,
+                api_key=api_key,
+                underlying=underlying,
+                expiry_week=exp2_idx,
+                expiry_date=exp2_date,
+            )
+            res1, res2 = await asyncio.gather(task1, task2)
+        except Exception as exc:
+            self.log_message(f"Dual option chain error: {exc}")
+            return
+
+        if res1.get("status") != "success":
+            self.log_message(f"Option chain 1 error: {res1.get('message', 'Unknown error')}")
+            return
+        if res2.get("status") != "success":
+            self.log_message(f"Option chain 2 error: {res2.get('message', 'Unknown error')}")
+            return
+
+        strikes1 = res1.get("strikes", [])
+        strikes2 = res2.get("strikes", [])
+        expiries = res1.get("available_expiries", []) or res2.get("available_expiries", [])
+
+        self.oc_dual_data = {
+            "underlying": underlying,
+            "oc1": res1,
+            "oc2": res2,
+            "available_expiries": expiries,
+            "exp1_idx": exp1_idx,
+            "exp2_idx": exp2_idx,
+        }
+
+        # Subscribe tokens for both chains so LTPs stream live
+        all_strikes = strikes1 + strikes2
+        self._update_oc_subscriptions(all_strikes)
+
+        self._last_oc_dual_text = self._render_oc_dual_text()
+        self.info_mode = "oc_dual"
+        self._update_info_buffer(reset_scroll=False)
+
+        # Center scroll position around ATM strike
+        atm1 = res1.get("summary", {}).get("atm_strike")
+        if atm1 and hasattr(self, "_info_control"):
+            s1_map = {float(s.get("strike", 0)): idx for idx, s in enumerate(strikes1)}
+            if atm1 in s1_map:
+                target_scroll = max(0, (10 + s1_map[atm1]) - 12)
+                self._info_control.vertical_scroll_position = target_scroll
+                if hasattr(self, "info_window"):
+                    self.info_window.vertical_scroll = target_scroll
+
+        stream_note = " (streaming)" if self.primary_api_key else ""
+        self.log_message(
+            f"Dual option chain loaded for {underlying}: "
+            f"{res1.get('expiry')} vs {res2.get('expiry')}{stream_note}."
+        )
+
+    def _render_oc_dual_text(self) -> str:
+        """Render the current ``self.oc_dual_data`` into plain text."""
+        data = self.oc_dual_data
+        if not data:
+            return self._last_oc_dual_text
+
+        underlying = data.get("underlying", "NIFTY")
+        oc1 = data.get("oc1", {})
+        oc2 = data.get("oc2", {})
+        exp1 = oc1.get("expiry", "")
+        exp2 = oc2.get("expiry", "")
+        spot1 = float(oc1.get("spot_price") or 0.0)
+        spot2 = float(oc2.get("spot_price") or spot1)
+
+        sum1 = oc1.get("summary", {})
+        sum2 = oc2.get("summary", {})
+        strikes1 = oc1.get("strikes", [])
+        strikes2 = oc2.get("strikes", [])
+        expiries = data.get("available_expiries", [])
+
+        def _fmt_dt(exp_str):
+            try:
+                from datetime import datetime as _dt
+                d = _dt.strptime(exp_str[:10], "%Y-%m-%d").date()
+                return d.strftime("%d-%b")
+            except Exception:
+                return exp_str
+
+        exp1_dt = _fmt_dt(exp1)
+        exp2_dt = _fmt_dt(exp2)
+
+        lines = []
+        top_bar = (" [ ▾ Expiry 1: " + exp1_dt + " ]").ljust(60) + (" [ ▾ Expiry 2: " + exp2_dt + " ]").rjust(60)
+        lines.append(top_bar)
+        lines.append("─" * 120)
+
+        c1_str = f"₹{sum1.get('atm_straddle', 0.0):.1f}" if sum1.get("atm_straddle") else "-"
+        c2_str = f"₹{sum2.get('atm_straddle', 0.0):.1f}" if sum2.get("atm_straddle") else "-"
+        m1_pain = int(sum1.get("max_pain", 0))
+        m2_pain = int(sum2.get("max_pain", 0))
+
+        left_title = f" Expiry 1: {exp1_dt} "
+        right_title = f" Expiry 2: {exp2_dt} "
+        top_left = "┌──" + left_title + ("─" * max(0, 56 - len(left_title)))
+        top_right = "──" + right_title + ("─" * max(0, 57 - len(right_title))) + "┐"
+        lines.append(top_left + "┬" + top_right)
+
+        c1_l1 = f"Spot: {spot1:,.2f}  Str: {c1_str:<7}"[:56].ljust(56)
+        c2_l1 = f"Spot: {spot2:,.2f}  Str: {c2_str:<7}"[:57].ljust(57)
+        lines.append(f"│ {c1_l1} │ {c2_l1} │")
+
+        c1_l2 = f"PCR: {sum1.get('pcr', 0.0):.2f}  Max Pain: {m1_pain:<5}"[:56].ljust(56)
+        c2_l2 = f"PCR: {sum2.get('pcr', 0.0):.2f}  Max Pain: {m2_pain:<5}"[:57].ljust(57)
+        lines.append(f"│ {c1_l2} │ {c2_l2} │")
+        lines.append("└" + ("─" * 58) + "┴" + ("─" * 59) + "┘")
+
+        # Table Header (Enclosed Container)
+        lines.append("┌───────────────┬─────────────┬───────────┬───────────┬──────────┬───────────────┬─────────────┬───────────┬───────────┐")
+        lines.append("│   LTP1   LTP2 │  IV1    IV2 │  Δ1   Δ2  │  θ1   θ2  │  STRIKE  │   LTP1   LTP2 │  IV1    IV2 │  Δ1   Δ2  │  θ1   θ2  │")
+        lines.append("├───────────────┼─────────────┼───────────┼───────────┼──────────┼───────────────┼─────────────┼───────────┼───────────┤")
+
+        s1_map = {float(s.get("strike", 0)): s for s in strikes1}
+        s2_map = {float(s.get("strike", 0)): s for s in strikes2}
+        all_strikes = sorted(set(list(s1_map.keys()) + list(s2_map.keys())))
+
+        atm1 = sum1.get("atm_strike")
+        atm2 = sum2.get("atm_strike")
+
+        def _fmt_iv(val):
+            if val is None or val <= 0:
+                return "     -"
+            return f"{float(val):>5.1f}%"[:6]
+
+        def _fmt_ltp(val):
+            if val is None:
+                return "      -"
+            return f"{float(val):>7.2f}"[:7]
+
+        def _fmt_delta(val):
+            if val is None:
+                return "    -"
+            return f"{float(val):>5.2f}"[:5]
+
+        def _fmt_theta(val):
+            if val is None:
+                return "    -"
+            return f"{float(val):>5.1f}"[:5]
+
+        for k in all_strikes:
+            s1 = s1_map.get(k, {})
+            s2 = s2_map.get(k, {})
+
+            ce1_ltp_str = _fmt_ltp(s1.get("ce_ltp"))
+            ce2_ltp_str = _fmt_ltp(s2.get("ce_ltp"))
+            ce1_iv_str  = _fmt_iv(s1.get("ce_iv"))
+            ce2_iv_str  = _fmt_iv(s2.get("ce_iv"))
+            ce1_dlt_str = _fmt_delta(s1.get("ce_delta"))
+            ce2_dlt_str = _fmt_delta(s2.get("ce_delta"))
+            ce1_tht_str = _fmt_theta(s1.get("ce_theta"))
+            ce2_tht_str = _fmt_theta(s2.get("ce_theta"))
+
+            pe1_ltp_str = _fmt_ltp(s1.get("pe_ltp"))
+            pe2_ltp_str = _fmt_ltp(s2.get("pe_ltp"))
+            pe1_iv_str  = _fmt_iv(s1.get("pe_iv"))
+            pe2_iv_str  = _fmt_iv(s2.get("pe_iv"))
+            pe1_dlt_str = _fmt_delta(s1.get("pe_delta"))
+            pe2_dlt_str = _fmt_delta(s2.get("pe_delta"))
+            pe1_tht_str = _fmt_theta(s1.get("pe_theta"))
+            pe2_tht_str = _fmt_theta(s2.get("pe_theta"))
+
+            is_atm = (k == atm1 or k == atm2)
+            s_str = str(int(k))
+            disp_stk = f"[{s_str:^8}]" if is_atm else f" {s_str:^8} "
+
+            c_ltp = f"{ce1_ltp_str} {ce2_ltp_str}"
+            c_iv  = f"{ce1_iv_str} {ce2_iv_str}"
+            c_dlt = f"{ce1_dlt_str} {ce2_dlt_str}"
+            c_tht = f"{ce1_tht_str} {ce2_tht_str}"
+
+            p_ltp = f"{pe1_ltp_str} {pe2_ltp_str}"
+            p_iv  = f"{pe1_iv_str} {pe2_iv_str}"
+            p_dlt = f"{pe1_dlt_str} {pe2_dlt_str}"
+            p_tht = f"{pe1_tht_str} {pe2_tht_str}"
+
+            lines.append(f"│{c_ltp}│{c_iv}│{c_dlt}│{c_tht}│{disp_stk}│{p_ltp}│{p_iv}│{p_dlt}│{p_tht}│")
+
+        lines.append("└───────────────┴─────────────┴───────────┴───────────┴──────────┴───────────────┴─────────────┴───────────┴───────────┘")
+        lines.append(" Tip: Click any strike to stage order | Click dropdowns to switch expiries")
+        return "\n".join(lines)
+
+    def _build_oc_dual_formatted_fragments(self) -> list[tuple]:
+        """Build FormattedTextControl fragment list for Side-by-Side Dual Option Chain with click routing."""
+        data = self.oc_dual_data
+        if not data:
+            return to_formatted_text(ANSI(self._last_oc_dual_text))
+
+        underlying = data.get("underlying", "NIFTY")
+        oc1 = data.get("oc1", {})
+        oc2 = data.get("oc2", {})
+        exp1 = oc1.get("expiry", "")
+        exp2 = oc2.get("expiry", "")
+        spot1 = float(oc1.get("spot_price") or 0.0)
+        spot2 = float(oc2.get("spot_price") or spot1)
+
+        sum1 = oc1.get("summary", {})
+        sum2 = oc2.get("summary", {})
+        strikes1 = oc1.get("strikes", [])
+        strikes2 = oc2.get("strikes", [])
+        expiries = data.get("available_expiries", [])
+
+        def _fmt_tab_dt(exp_str: str) -> str:
+            try:
+                from datetime import datetime as _dt
+                d = _dt.strptime(exp_str[:10], "%Y-%m-%d").date()
+                return d.strftime("%d-%b")
+            except Exception:
+                return exp_str
+
+        exp1_dt = _fmt_tab_dt(exp1)
+        exp2_dt = _fmt_tab_dt(exp2)
+
+        def _make_exp1_click(idx: int, exp_val: str):
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self.oc_dual_dropdown_1 = False
+                    und = self.oc_dual_data.get("underlying", "NIFTY")
+                    ak = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
+                    if ak:
+                        e2_idx = self.oc_dual_data.get("exp2_idx", 1)
+                        asyncio.create_task(self._fetch_and_display_dual_option_chain(
+                            ak, und, exp1_idx=idx, exp2_idx=e2_idx, exp1_date=exp_val
+                        ))
+            return _handler
+
+        def _make_exp2_click(idx: int, exp_val: str):
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self.oc_dual_dropdown_2 = False
+                    und = self.oc_dual_data.get("underlying", "NIFTY")
+                    ak = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
+                    if ak:
+                        e1_idx = self.oc_dual_data.get("exp1_idx", 0)
+                        asyncio.create_task(self._fetch_and_display_dual_option_chain(
+                            ak, und, exp1_idx=e1_idx, exp2_idx=idx, exp2_date=exp_val
+                        ))
+            return _handler
+
+        def _make_dropdown_1_toggle():
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self.oc_dual_dropdown_1 = not getattr(self, "oc_dual_dropdown_1", False)
+                    self.oc_dual_dropdown_2 = False
+                    self._update_info_buffer(reset_scroll=False)
+                    if hasattr(self, "app") and self.app:
+                        self.app.invalidate()
+            return _handler
+
+        def _make_dropdown_2_toggle():
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    self.oc_dual_dropdown_2 = not getattr(self, "oc_dual_dropdown_2", False)
+                    self.oc_dual_dropdown_1 = False
+                    self._update_info_buffer(reset_scroll=False)
+                    if hasattr(self, "app") and self.app:
+                        self.app.invalidate()
+            return _handler
+
+        def _make_strike_click(sym: str, ltp_val: float | None, is_call: bool = True, exp_num: int = 1):
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    if sym and sym != "-":
+                        tag = "Call (CE)" if is_call else "Put (PE)"
+                        color = "green" if is_call else "red"
+                        self.log_message(f"Selected [bold {color}]Expiry {exp_num} {tag}: {sym}[/bold {color}] (LTP: {ltp_val or 'N/A'})")
+                        buf = None
+                        if hasattr(self, "input_field") and self.input_field:
+                            buf = self.input_field.buffer
+                        elif hasattr(self, "cmd_buffer") and self.cmd_buffer:
+                            buf = self.cmd_buffer
+
+                        if buf is not None:
+                            price_str = f" {float(ltp_val):.2f}" if (ltp_val is not None and float(ltp_val) > 0) else ""
+                            buf.text = f"sell {sym} 27L{price_str}"
+                            buf.cursor_position = len(buf.text)
+                            if hasattr(self, "app") and self.app and hasattr(self, "input_field") and self.input_field:
+                                self.app.layout.focus(self.input_field)
+                        self._update_display_and_invalidate()
+            return _handler
+
+        frags = [("", " ")]
+
+        # 1. Top Expiry Selectors (2 Dropdown buttons)
+        dd1_style = "class:oc.expiry.active" if getattr(self, "oc_dual_dropdown_1", False) else "class:oc.set1.btn"
+        dd2_style = "class:oc.expiry.active" if getattr(self, "oc_dual_dropdown_2", False) else "class:oc.set2.btn"
+
+        frags.append((dd1_style, f"[ ▾ Expiry 1: {exp1_dt} ]", _make_dropdown_1_toggle()))
+        frags.append(("", " " * 60))
+        frags.append((dd2_style, f"[ ▾ Expiry 2: {exp2_dt} ]", _make_dropdown_2_toggle()))
+        frags.append(("", "\n"))
+
+        # 2. Interactive Dropdown Menus
+        if getattr(self, "oc_dual_dropdown_1", False):
+            frags.append(("class:oc.border", "┌── Select Expiry 1 (Click to switch) ─────────────────────────────────────────────────────────────────────────┐\n"))
+            for i, e in enumerate(expiries):
+                dt = e.get("expiry", "")
+                lbl = e.get("week_label", "")
+                is_cur = (dt == exp1)
+                prefix = "► " if is_cur else "  "
+                item_style = "class:oc.dropdown.active" if is_cur else "class:oc.dropdown.item"
+                frags.append(("class:oc.border", "│ "))
+                frags.append((item_style, f"{prefix}{dt:<12} • {lbl:<96}", _make_exp1_click(i, dt)))
+                frags.append(("class:oc.border", " │\n"))
+            frags.append(("class:oc.border", "│ "))
+            frags.append(("class:oc.dropdown.close", "[ ▲ Close Dropdown ]                                                                                        ", _make_dropdown_1_toggle()))
+            frags.append(("class:oc.border", " │\n"))
+            frags.append(("class:oc.border", "└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n"))
+
+        if getattr(self, "oc_dual_dropdown_2", False):
+            frags.append(("class:oc.border", "┌── Select Expiry 2 (Click to switch) ─────────────────────────────────────────────────────────────────────────┐\n"))
+            for i, e in enumerate(expiries):
+                dt = e.get("expiry", "")
+                lbl = e.get("week_label", "")
+                is_cur = (dt == exp2)
+                prefix = "► " if is_cur else "  "
+                item_style = "class:oc.dropdown.active" if is_cur else "class:oc.dropdown.item"
+                frags.append(("class:oc.border", "│ "))
+                frags.append((item_style, f"{prefix}{dt:<12} • {lbl:<96}", _make_exp2_click(i, dt)))
+                frags.append(("class:oc.border", " │\n"))
+            frags.append(("class:oc.border", "│ "))
+            frags.append(("class:oc.dropdown.close", "[ ▲ Close Dropdown ]                                                                                        ", _make_dropdown_2_toggle()))
+            frags.append(("class:oc.border", " │\n"))
+            frags.append(("class:oc.border", "└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n"))
+
+        # 3. Distinction Line
+        frags.append(("class:oc.border", "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n"))
+
+        # 4. Symmetrical Dual Metrics Card (exact 120 chars wide)
+        c1_str = f"₹{sum1.get('atm_straddle', 0.0):.1f}" if sum1.get("atm_straddle") else "-"
+        c2_str = f"₹{sum2.get('atm_straddle', 0.0):.1f}" if sum2.get("atm_straddle") else "-"
+        m1_pain = int(sum1.get("max_pain", 0))
+        m2_pain = int(sum2.get("max_pain", 0))
+
+        left_title = f" Expiry 1: {exp1_dt} "
+        right_title = f" Expiry 2: {exp2_dt} "
+        top_left = "┌──" + left_title + ("─" * max(0, 56 - len(left_title)))
+        top_right = "──" + right_title + ("─" * max(0, 57 - len(right_title))) + "┐"
+        frags.append(("class:oc.border", top_left + "┬" + top_right + "\n"))
+
+        c1_l1 = f"Spot: {spot1:,.2f}  Str: {c1_str:<7}"[:56].ljust(56)
+        c2_l1 = f"Spot: {spot2:,.2f}  Str: {c2_str:<7}"[:57].ljust(57)
+        frags.append(("class:oc.border", "│ "))
+        frags.append(("class:oc.set1.hdr", c1_l1))
+        frags.append(("class:oc.border", " │ "))
+        frags.append(("class:oc.set2.hdr", c2_l1))
+        frags.append(("class:oc.border", " │\n"))
+
+        c1_l2 = f"PCR: {sum1.get('pcr', 0.0):.2f}  Max Pain: {m1_pain:<5}"[:56].ljust(56)
+        c2_l2 = f"PCR: {sum2.get('pcr', 0.0):.2f}  Max Pain: {m2_pain:<5}"[:57].ljust(57)
+        frags.append(("class:oc.border", "│ "))
+        frags.append(("class:oc.set1.hdr", c1_l2))
+        frags.append(("class:oc.border", " │ "))
+        frags.append(("class:oc.set2.hdr", c2_l2))
+        frags.append(("class:oc.border", " │\n"))
+        frags.append(("class:oc.border", "└" + ("─" * 58) + "┴" + ("─" * 59) + "┘\n"))
+
+        # 5. Table Header (Enclosed Container)
+        frags.append(("class:oc.border", "┌───────────────┬─────────────┬───────────┬───────────┬──────────┬───────────────┬─────────────┬───────────┬───────────┐\n"))
+        frags.append(("class:oc.border", "│"))
+        frags.append(("class:oc.set1.hdr", "   LTP1"))
+        frags.append(("class:oc.set2.hdr", "   LTP2 "))
+        frags.append(("class:oc.border", "│"))
+        frags.append(("class:oc.set1.hdr", "  IV1 "))
+        frags.append(("class:oc.set2.hdr", "   IV2 "))
+        frags.append(("class:oc.border", "│"))
+        frags.append(("class:oc.set1.hdr", "  Δ1  "))
+        frags.append(("class:oc.set2.hdr", " Δ2  "))
+        frags.append(("class:oc.border", "│"))
+        frags.append(("class:oc.set1.hdr", "  θ1  "))
+        frags.append(("class:oc.set2.hdr", " θ2  "))
+        frags.append(("class:oc.border", "│"))
+        frags.append(("class:oc.strike",   "  STRIKE  "))
+        frags.append(("class:oc.border", "│"))
+        frags.append(("class:oc.set1.hdr", "   LTP1"))
+        frags.append(("class:oc.set2.hdr", "   LTP2 "))
+        frags.append(("class:oc.border", "│"))
+        frags.append(("class:oc.set1.hdr", "  IV1 "))
+        frags.append(("class:oc.set2.hdr", "   IV2 "))
+        frags.append(("class:oc.border", "│"))
+        frags.append(("class:oc.set1.hdr", "  Δ1  "))
+        frags.append(("class:oc.set2.hdr", " Δ2  "))
+        frags.append(("class:oc.border", "│"))
+        frags.append(("class:oc.set1.hdr", "  θ1  "))
+        frags.append(("class:oc.set2.hdr", " θ2  "))
+        frags.append(("class:oc.border", "│\n"))
+        frags.append(("class:oc.border", "├───────────────┼─────────────┼───────────┼───────────┼──────────┼───────────────┼─────────────┼───────────┼───────────┤\n"))
+
+        # 6. Strike Rows
+        s1_map = {float(s.get("strike", 0)): s for s in strikes1}
+        s2_map = {float(s.get("strike", 0)): s for s in strikes2}
+        all_strikes = sorted(set(list(s1_map.keys()) + list(s2_map.keys())))
+
+        atm1 = sum1.get("atm_strike")
+        atm2 = sum2.get("atm_strike")
+
+        def _fmt_iv(val):
+            if val is None or val <= 0:
+                return "     -"
+            return f"{float(val):>5.1f}%"[:6]
+
+        def _fmt_ltp(val):
+            if val is None:
+                return "      -"
+            return f"{float(val):>7.2f}"[:7]
+
+        def _fmt_delta(val):
+            if val is None:
+                return "    -"
+            return f"{float(val):>5.2f}"[:5]
+
+        def _fmt_theta(val):
+            if val is None:
+                return "    -"
+            return f"{float(val):>5.1f}"[:5]
+
+        for k in all_strikes:
+            s1 = s1_map.get(k, {})
+            s2 = s2_map.get(k, {})
+
+            ce1_sym = s1.get("ce_symbol") or "-"
+            ce2_sym = s2.get("ce_symbol") or "-"
+            pe1_sym = s1.get("pe_symbol") or "-"
+            pe2_sym = s2.get("pe_symbol") or "-"
+
+            ce1_ltp = s1.get("ce_ltp")
+            ce2_ltp = s2.get("ce_ltp")
+            pe1_ltp = s1.get("pe_ltp")
+            pe2_ltp = s2.get("pe_ltp")
+
+            ce1_ltp_str = _fmt_ltp(ce1_ltp)
+            ce2_ltp_str = _fmt_ltp(ce2_ltp)
+            ce1_iv_str  = _fmt_iv(s1.get("ce_iv"))
+            ce2_iv_str  = _fmt_iv(s2.get("ce_iv"))
+            ce1_dlt_str = _fmt_delta(s1.get("ce_delta"))
+            ce2_dlt_str = _fmt_delta(s2.get("ce_delta"))
+            ce1_tht_str = _fmt_theta(s1.get("ce_theta"))
+            ce2_tht_str = _fmt_theta(s2.get("ce_theta"))
+
+            pe1_ltp_str = _fmt_ltp(pe1_ltp)
+            pe2_ltp_str = _fmt_ltp(pe2_ltp)
+            pe1_iv_str  = _fmt_iv(s1.get("pe_iv"))
+            pe2_iv_str  = _fmt_iv(s2.get("pe_iv"))
+            pe1_dlt_str = _fmt_delta(s1.get("pe_delta"))
+            pe2_dlt_str = _fmt_delta(s2.get("pe_delta"))
+            pe1_tht_str = _fmt_theta(s1.get("pe_theta"))
+            pe2_tht_str = _fmt_theta(s2.get("pe_theta"))
+
+            ce1_click = _make_strike_click(ce1_sym, ce1_ltp, is_call=True, exp_num=1)
+            ce2_click = _make_strike_click(ce2_sym, ce2_ltp, is_call=True, exp_num=2)
+            pe1_click = _make_strike_click(pe1_sym, pe1_ltp, is_call=False, exp_num=1)
+            pe2_click = _make_strike_click(pe2_sym, pe2_ltp, is_call=False, exp_num=2)
+
+            is_atm = (k == atm1 or k == atm2)
+            stk_style = "class:oc.atm" if is_atm else "class:oc.strike"
+            s_str = str(int(k))
+            disp_stk = f"[{s_str:^8}]" if is_atm else f" {s_str:^8} "
+
+            frags.append(("class:oc.border", "│"))
+            # Call LTP1 & LTP2
+            frags.append(("class:oc.set1.ce", ce1_ltp_str, ce1_click))
+            frags.append(("", " "))
+            frags.append(("class:oc.set2.ce", ce2_ltp_str, ce2_click))
+            frags.append(("class:oc.border", "│"))
+            # Call IV1 & IV2
+            frags.append(("class:oc.set1.ce", ce1_iv_str, ce1_click))
+            frags.append(("", " "))
+            frags.append(("class:oc.set2.ce", ce2_iv_str, ce2_click))
+            frags.append(("class:oc.border", "│"))
+            # Call Delta 1 & 2
+            frags.append(("class:oc.set1.ce", ce1_dlt_str, ce1_click))
+            frags.append(("", " "))
+            frags.append(("class:oc.set2.ce", ce2_dlt_str, ce2_click))
+            frags.append(("class:oc.border", "│"))
+            # Call Theta 1 & 2
+            frags.append(("class:oc.set1.ce", ce1_tht_str, ce1_click))
+            frags.append(("", " "))
+            frags.append(("class:oc.set2.ce", ce2_tht_str, ce2_click))
+            frags.append(("class:oc.border", "│"))
+            # Strike
+            frags.append((stk_style, disp_stk))
+            frags.append(("class:oc.border", "│"))
+            # Put LTP1 & LTP2
+            frags.append(("class:oc.set1.pe", pe1_ltp_str, pe1_click))
+            frags.append(("", " "))
+            frags.append(("class:oc.set2.pe", pe2_ltp_str, pe2_click))
+            frags.append(("class:oc.border", "│"))
+            # Put IV1 & IV2
+            frags.append(("class:oc.set1.pe", pe1_iv_str, pe1_click))
+            frags.append(("", " "))
+            frags.append(("class:oc.set2.pe", pe2_iv_str, pe2_click))
+            frags.append(("class:oc.border", "│"))
+            # Put Delta 1 & 2
+            frags.append(("class:oc.set1.pe", pe1_dlt_str, pe1_click))
+            frags.append(("", " "))
+            frags.append(("class:oc.set2.pe", pe2_dlt_str, pe2_click))
+            frags.append(("class:oc.border", "│"))
+            # Put Theta 1 & 2
+            frags.append(("class:oc.set1.pe", pe1_tht_str, pe1_click))
+            frags.append(("", " "))
+            frags.append(("class:oc.set2.pe", pe2_tht_str, pe2_click))
+            frags.append(("class:oc.border", "│\n"))
+
+        frags.append(("class:oc.border", "└───────────────┴─────────────┴───────────┴───────────┴──────────┴───────────────┴─────────────┴───────────┴───────────┘\n"))
+        frags.append(("class:oc.tip", " Tip: Click any strike to stage order | Click dropdowns to switch expiries\n"))
+        return frags
 
     def _render_advisor_text(self) -> str:
         """Render Tuesday strangle advisor plan into plain text."""
@@ -5509,12 +6740,16 @@ class KCLILiveSession:
 
 
     def get_symbol_ltp(self, symbol: str) -> float | None:
-        """Look up current LTP for a symbol from WebSocket caches or positions."""
+        """Look up current LTP for a symbol from WebSocket caches, positions, or option chains."""
         if not symbol:
             return None
         sym_clean = symbol.strip().upper()
         if hasattr(self, "ws_symbol_ltp_cache") and sym_clean in self.ws_symbol_ltp_cache:
             return float(self.ws_symbol_ltp_cache[sym_clean])
+        if hasattr(self, "ws_symbol_to_token") and sym_clean in self.ws_symbol_to_token:
+            tok = self.ws_symbol_to_token[sym_clean]
+            if hasattr(self, "ws_ltp_cache") and tok in self.ws_ltp_cache:
+                return float(self.ws_ltp_cache[tok])
         for p in getattr(self, "active_positions", []):
             if p.get("tradingsymbol", "").upper() == sym_clean and p.get("last_price"):
                 return float(p["last_price"])
@@ -5530,6 +6765,15 @@ class KCLILiveSession:
                     return float(s["ce_ltp"])
                 if s.get("pe_symbol") == sym_clean and s.get("pe_ltp"):
                     return float(s["pe_ltp"])
+        if hasattr(self, "oc_dual_data") and self.oc_dual_data:
+            for oc_k in ("oc1", "oc2"):
+                chain = self.oc_dual_data.get(oc_k)
+                if chain:
+                    for s in chain.get("strikes", []):
+                        if s.get("ce_symbol") == sym_clean and s.get("ce_ltp"):
+                            return float(s["ce_ltp"])
+                        if s.get("pe_symbol") == sym_clean and s.get("pe_ltp"):
+                            return float(s["pe_ltp"])
         return None
 
     def _render_orders_pane(self, response: dict, mode: str) -> str:
@@ -5963,7 +7207,7 @@ class KCLILiveSession:
                     """
                     SELECT timestamp, account_name, user_id, tradingsymbol, transaction_type, quantity, price, order_id, status, COALESCE(is_settled_externally, 0), COALESCE(total_charges, 0.0)
                     FROM executed_order_context
-                    WHERE UPPER(status) = 'COMPLETE'
+                    WHERE (UPPER(status) = 'COMPLETE' OR (quantity > 0 AND UPPER(status) NOT IN ('REJECTED', 'OPEN')))
                     ORDER BY id ASC;
                     """
                 )
@@ -6465,8 +7709,14 @@ class KCLILiveSession:
         if not hasattr(self, "_info_control"):
             return
         if self.info_mode == "orders_pending":
+            resp = getattr(self, "last_orders_response", None)
+            if resp:
+                self._last_pending_text = self._render_orders_pane(resp, "orders_pending")
             text = self._last_pending_text
         elif self.info_mode == "orders_executed":
+            resp = getattr(self, "last_orders_response", None)
+            if resp:
+                self._last_executed_text = self._render_orders_pane(resp, "orders_executed")
             text = self._last_executed_text
         elif self.info_mode == "advisor":
             try:
@@ -6492,6 +7742,8 @@ class KCLILiveSession:
             except Exception as exc:
                 self._last_holdings_text = f"=== Holdings / Portfolio ===\n\nFailed to fetch holdings: {exc}"
             text = self._last_holdings_text
+        elif self.info_mode == "oc_dual":
+            text = self._last_oc_dual_text
         elif self.info_mode == "help":
             text = self._build_help_text()
         else:
@@ -6500,7 +7752,12 @@ class KCLILiveSession:
         if reset_scroll:
             self._info_control.vertical_scroll_position = 0
 
-        self._info_control.text = to_formatted_text(ANSI(text))
+        if self.info_mode == "oc":
+            self._info_control.text = self._build_oc_formatted_fragments()
+        elif self.info_mode == "oc_dual":
+            self._info_control.text = self._build_oc_dual_formatted_fragments()
+        else:
+            self._info_control.text = to_formatted_text(ANSI(text))
         if hasattr(self, "app") and self.app:
             self.app.invalidate()
 

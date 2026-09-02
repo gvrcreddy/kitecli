@@ -645,6 +645,10 @@ class KCLIClient:
         """Fetch NFO tradingsymbol → lot_size map (one-shot, cache at startup)."""
         return _kite_manager.get_nfo_lot_sizes()
 
+    def get_nfo_symbol_token_map(self) -> dict:
+        """Fetch NFO tradingsymbol → instrument_token map."""
+        return _kite_manager.get_nfo_symbol_token_map()
+
     def get_market_indices(self) -> dict:
         """Fetch live Nifty, Sensex, and India VIX."""
         return _kite_manager.get_market_indices()

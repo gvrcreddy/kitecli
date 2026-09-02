@@ -144,6 +144,10 @@ class BaseBrokerManager(ABC):
         """
         return {}
 
+    def get_nfo_symbol_token_map(self) -> dict[str, int]:
+        """Return tradingsymbol → instrument_token map for NFO instruments. Default: empty dict."""
+        return {}
+
     def get_market_indices(self) -> dict[str, Any]:
         """Return Nifty / Sensex / India VIX snapshot. Default: not supported."""
         return {"status": "error", "message": "not supported by this broker"}

@@ -200,25 +200,38 @@ def format_strike_display(info: Dict[str, Any]) -> str:
 
 
 def implied_volatility(
-    spot_price: float, strike_price: float, T: float, option_price: float, is_call: bool, r: float = 0.07
+    spot_price: float,
+    strike_price: float,
+    T: float,
+    option_price: float,
+    is_call: bool,
+    r: float = 0.0,
+    forward_price: float | None = None,
 ) -> float | None:
-    """Solve for Implied Volatility (IV %) from option price using Newton-Raphson."""
-    if option_price <= 0 or T <= 0:
+    """Solve for Implied Volatility (IV %) from option price using Black-76 Newton-Raphson."""
+    F = forward_price if (forward_price and forward_price > 0) else spot_price
+    if option_price <= 0 or T <= 0 or F <= 0 or strike_price <= 0:
         return None
-    sigma = 0.25
+
+    intrinsic = max(0.0, (F - strike_price) if is_call else (strike_price - F))
+    if option_price < intrinsic - 1e-4:
+        return None
+
+    sigma = 0.20
+    df = math.exp(-r * T)
     for _ in range(100):
-        d1 = (math.log(spot_price / strike_price) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d1 = (math.log(F / strike_price) + (0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
         d2 = d1 - sigma * math.sqrt(T)
         if is_call:
-            price = spot_price * _norm_cdf(d1) - strike_price * math.exp(-r * T) * _norm_cdf(d2)
+            price = df * (F * _norm_cdf(d1) - strike_price * _norm_cdf(d2))
         else:
-            price = strike_price * math.exp(-r * T) * _norm_cdf(-d2) - spot_price * _norm_cdf(-d1)
+            price = df * (strike_price * _norm_cdf(-d2) - F * _norm_cdf(-d1))
 
         diff = price - option_price
         if abs(diff) < 1e-4:
             return sigma * 100.0
 
-        vega = spot_price * math.sqrt(T) * _norm_pdf(d1)
+        vega = df * F * math.sqrt(T) * _norm_pdf(d1)
         if vega < 1e-8:
             break
         sigma -= diff / vega
@@ -251,39 +264,48 @@ def calculate_greeks(
     expiry_date: str | datetime | date,
     option_type: str,
     vix_pct: float = 15.0,
-    risk_free_rate: float = 0.07,
+    risk_free_rate: float = 0.0,
     option_price: float | None = None,
+    forward_price: float | None = None,
 ) -> Dict[str, Optional[float]]:
-    """Calculate Black-Scholes Option Greeks.
+    """Calculate Black-76 Option Greeks using Forward / Synthetic Future price.
 
     Args:
-        spot_price: Current spot price of underlying index/stock (e.g. 24500.0)
-        strike_price: Strike price of option (e.g. 24500.0)
+        spot_price: Current spot price of underlying index/stock (e.g. 24055.80)
+        strike_price: Strike price of option (e.g. 24000.0)
         expiry_date: Expiry date string (YYYY-MM-DD), date, or datetime object
         option_type: 'CE' / 'CALL' or 'PE' / 'PUT'
         vix_pct: Baseline Volatility percentage (e.g. 15.2 for 15.2% India VIX)
-        risk_free_rate: Annual risk-free interest rate (default 7% = 0.07)
+        risk_free_rate: Annual risk-free interest rate (default 0.0 for Forward pricing)
         option_price: Optional option market price (LTP) to solve for exact IV.
+        forward_price: Optional Synthetic Forward price (F) from Put-Call Parity.
 
     Returns:
         Dict containing delta, gamma, theta, vega, and iv.
     """
-    if spot_price <= 0 or strike_price <= 0:
+    F = forward_price if (forward_price and forward_price > 0) else spot_price
+    if F <= 0 or strike_price <= 0:
         return {"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None}
 
-    # Calculate time to expiry in years
+    # Calculate time to expiry in years targeting 15:30 IST market close
+    from datetime import time as _time
     if isinstance(expiry_date, str):
         try:
-            exp_dt = datetime.strptime(expiry_date, "%Y-%m-%d")
+            exp_d = datetime.strptime(expiry_date[:10], "%Y-%m-%d").date()
         except ValueError:
-            exp_dt = datetime.now() + timedelta(days=7)
-    elif isinstance(expiry_date, date) and not isinstance(expiry_date, datetime):
-        exp_dt = datetime.combine(expiry_date, datetime.min.time())
+            exp_d = date.today() + timedelta(days=7)
+    elif isinstance(expiry_date, datetime):
+        exp_d = expiry_date.date()
+    elif isinstance(expiry_date, date):
+        exp_d = expiry_date
     else:
-        exp_dt = expiry_date
+        exp_d = date.today() + timedelta(days=7)
 
+    exp_dt = datetime.combine(exp_d, _time(15, 30))
     now = datetime.now()
-    days_to_exp = max((exp_dt - now).total_seconds() / 86400.0, 0.25)
+    seconds = max((exp_dt - now).total_seconds(), 0.0)
+    # Minimum 0.05 days (~1.2 hours) for numerical stability on expiry day close
+    days_to_exp = max(seconds / 86400.0, 0.05)
     T = days_to_exp / 365.0
 
     opt_type_upper = option_type.upper()
@@ -291,44 +313,196 @@ def calculate_greeks(
 
     eff_vix = vix_pct
     if option_price and option_price > 0:
-        solved_iv = implied_volatility(spot_price, strike_price, T, option_price, is_call, risk_free_rate)
+        solved_iv = implied_volatility(
+            spot_price=spot_price,
+            strike_price=strike_price,
+            T=T,
+            option_price=option_price,
+            is_call=is_call,
+            r=risk_free_rate,
+            forward_price=F,
+        )
         if not solved_iv or solved_iv <= 0:
             return {"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None}
         eff_vix = solved_iv
 
     sigma = max(eff_vix / 100.0, 0.01)
+    df = math.exp(-risk_free_rate * T)
 
-    # Black-Scholes d1 and d2 calculations
-    d1 = (math.log(spot_price / strike_price) + (risk_free_rate + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    # Black-76 d1 and d2 calculations
+    d1 = (math.log(F / strike_price) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
-
-    opt_type_upper = option_type.upper()
-    is_call = "CE" in opt_type_upper or "CALL" in opt_type_upper
 
     # 1. Delta
     if is_call:
-        delta = _norm_cdf(d1)
+        delta = df * _norm_cdf(d1)
     else:
-        delta = _norm_cdf(d1) - 1.0
+        delta = df * (_norm_cdf(d1) - 1.0)
 
     # 2. Gamma
-    gamma = _norm_pdf(d1) / (spot_price * sigma * math.sqrt(T))
+    gamma = (df * _norm_pdf(d1)) / (F * sigma * math.sqrt(T))
 
     # 3. Theta (daily decay)
-    term1 = -(spot_price * _norm_pdf(d1) * sigma) / (2.0 * math.sqrt(T))
-    if is_call:
-        term2 = -risk_free_rate * strike_price * math.exp(-risk_free_rate * T) * _norm_cdf(d2)
-    else:
-        term2 = risk_free_rate * strike_price * math.exp(-risk_free_rate * T) * _norm_cdf(-d2)
-    theta = (term1 + term2) / 365.0
+    theta = -(F * _norm_pdf(d1) * sigma) / (2.0 * math.sqrt(T) * 365.0)
 
     # 4. Vega (per 1% change in volatility)
-    vega = (spot_price * math.sqrt(T) * _norm_pdf(d1)) / 100.0
+    vega = (df * F * math.sqrt(T) * _norm_pdf(d1)) / 100.0
 
     return {
-        "delta": round(delta, 4),
+        "delta": round(delta, 2),
         "gamma": round(gamma, 6),
         "theta": round(theta, 2),
         "vega": round(vega, 2),
         "iv": round(eff_vix, 2),
     }
+
+
+def enrich_option_chain_greeks(
+    strikes: list[dict],
+    spot_price: float,
+    expiry_date: str | datetime | date,
+    vix_pct: float = 15.0,
+    risk_free_rate: float = 0.0,
+) -> Dict[str, Any]:
+    """Calculate Greeks for every strike in the option chain using Black-76 forward model.
+
+    Derives the Synthetic Forward Price (F) from Put-Call parity across liquid pairs.
+
+    Returns a summary dict with:
+      - 'atm_strike': float
+      - 'atm_straddle': float | None
+      - 'pcr': float
+      - 'max_pain': float
+      - 'total_ce_oi': int
+      - 'total_pe_oi': int
+      - 'forward_price': float
+    """
+    if not strikes or spot_price <= 0:
+        return {
+            "atm_strike": 0.0,
+            "atm_straddle": None,
+            "pcr": 0.0,
+            "max_pain": 0.0,
+            "total_ce_oi": 0,
+            "total_pe_oi": 0,
+            "forward_price": 0.0,
+        }
+
+    # 1. Derive Forward Price (F) from liquid strike pairs via Put-Call Parity:
+    # F_i = K_i + CE_ltp_i - PE_ltp_i
+    fwd_estimates = []
+    for s in strikes:
+        k = float(s.get("strike", 0.0))
+        ce = s.get("ce_ltp")
+        pe = s.get("pe_ltp")
+        if ce is not None and pe is not None and ce > 0 and pe > 0:
+            if spot_price <= 0 or abs(k - spot_price) / spot_price <= 0.05:
+                fwd_estimates.append(k + ce - pe)
+
+    if fwd_estimates:
+        fwd_estimates.sort()
+        mid = len(fwd_estimates) // 2
+        forward_price = (
+            fwd_estimates[mid]
+            if len(fwd_estimates) % 2 == 1
+            else (fwd_estimates[mid - 1] + fwd_estimates[mid]) / 2.0
+        )
+    else:
+        forward_price = spot_price
+
+    total_ce_oi = 0
+    total_pe_oi = 0
+    atm_strike = None
+    min_fwd_diff = float("inf")
+    atm_straddle = None
+
+    for s in strikes:
+        strike = float(s.get("strike", 0.0))
+        ce_ltp = s.get("ce_ltp")
+        pe_ltp = s.get("pe_ltp")
+        ce_oi = int(s.get("ce_oi") or 0)
+        pe_oi = int(s.get("pe_oi") or 0)
+        total_ce_oi += ce_oi
+        total_pe_oi += pe_oi
+
+        # Find ATM strike (closest strike to Forward Price)
+        diff = abs(strike - forward_price)
+        if diff < min_fwd_diff:
+            min_fwd_diff = diff
+            atm_strike = strike
+            if ce_ltp is not None and pe_ltp is not None:
+                atm_straddle = round(ce_ltp + pe_ltp, 2)
+            else:
+                atm_straddle = None
+
+        # Calculate CE Greeks
+        if ce_ltp is not None and ce_ltp > 0:
+            ce_g = calculate_greeks(
+                spot_price=spot_price,
+                strike_price=strike,
+                expiry_date=expiry_date,
+                option_type="CE",
+                vix_pct=vix_pct,
+                risk_free_rate=risk_free_rate,
+                option_price=ce_ltp,
+                forward_price=forward_price,
+            )
+            s["ce_delta"] = ce_g.get("delta")
+            s["ce_iv"] = ce_g.get("iv")
+            s["ce_theta"] = ce_g.get("theta")
+        else:
+            s["ce_delta"] = None
+            s["ce_iv"] = None
+            s["ce_theta"] = None
+
+        # Calculate PE Greeks
+        if pe_ltp is not None and pe_ltp > 0:
+            pe_g = calculate_greeks(
+                spot_price=spot_price,
+                strike_price=strike,
+                expiry_date=expiry_date,
+                option_type="PE",
+                vix_pct=vix_pct,
+                risk_free_rate=risk_free_rate,
+                option_price=pe_ltp,
+                forward_price=forward_price,
+            )
+            s["pe_delta"] = pe_g.get("delta")
+            s["pe_iv"] = pe_g.get("iv")
+            s["pe_theta"] = pe_g.get("theta")
+        else:
+            s["pe_delta"] = None
+            s["pe_iv"] = None
+            s["pe_theta"] = None
+
+    # Calculate PCR
+    pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0.0
+
+    # Calculate Max Pain
+    max_pain = atm_strike or 0.0
+    min_total_payout = float("inf")
+    for target in strikes:
+        k_target = float(target.get("strike", 0.0))
+        total_payout = 0.0
+        for s in strikes:
+            k = float(s.get("strike", 0.0))
+            ce_oi = int(s.get("ce_oi") or 0)
+            pe_oi = int(s.get("pe_oi") or 0)
+            if k_target > k:
+                total_payout += (k_target - k) * ce_oi
+            elif k_target < k:
+                total_payout += (k - k_target) * pe_oi
+        if total_payout < min_total_payout:
+            min_total_payout = total_payout
+            max_pain = k_target
+
+    return {
+        "atm_strike": atm_strike,
+        "atm_straddle": atm_straddle,
+        "pcr": pcr,
+        "max_pain": max_pain,
+        "total_ce_oi": total_ce_oi,
+        "total_pe_oi": total_pe_oi,
+        "forward_price": round(forward_price, 2),
+    }
+

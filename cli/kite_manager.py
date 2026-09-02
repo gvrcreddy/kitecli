@@ -68,6 +68,7 @@ class KiteAccountManager(BaseBrokerManager):
         self._authenticated: dict[str, bool] = {}
         self._proxies: dict[str, dict] = {}  # per-account proxy dicts for requests.Session
         self._nfo_lot_size_cache: dict[str, int] = {}  # fetched once, reused across calls
+        self._nfo_symbol_token_cache: dict[str, int] = {}  # tradingsymbol -> instrument_token map
 
     # ── public init helpers (named with _by_key suffix to avoid ABC clash) ────
 
@@ -858,39 +859,89 @@ class KiteAccountManager(BaseBrokerManager):
                 "message": "No active expiry dates found.",
             }
 
+        # Identify monthly expiries (last expiry for each year-month)
+        month_last_expiry = {}
+        for exp in all_expiries:
+            month_key = (exp.year, exp.month)
+            month_last_expiry[month_key] = exp
+        monthly_expiries = set(month_last_expiry.values())
+        sorted_monthly = sorted(monthly_expiries)
+
         # Build available_expiries labels
         available_expiries = []
         for i, exp in enumerate(all_expiries):
+            is_monthly = exp in monthly_expiries
+            month_name = exp.strftime("%b")
+
+            # Weekly designation
             if i == 0:
-                label = "Current Week"
+                week_desc = "Current Week"
             elif i == 1:
-                label = "Next Week"
+                week_desc = "Next Week"
+            elif i == 2:
+                week_desc = "Far Week"
             else:
-                label = f"Week +{i}"
-            available_expiries.append({"expiry": exp.isoformat(), "week_label": label})
+                week_desc = f"Week +{i}"
+
+            # Monthly designation
+            month_desc = ""
+            if is_monthly:
+                m_idx = sorted_monthly.index(exp)
+                if m_idx == 0:
+                    month_desc = f"Current Month ({month_name})"
+                elif m_idx == 1:
+                    month_desc = f"Next Month ({month_name})"
+                elif m_idx == 2:
+                    month_desc = f"Far Month ({month_name})"
+                else:
+                    month_desc = f"{month_name} Monthly"
+
+            label = f"{month_desc}" if is_monthly and i >= 2 else f"{week_desc} ({month_name} Monthly)" if is_monthly else week_desc
+
+            available_expiries.append({
+                "expiry": exp.isoformat(),
+                "week_label": label,
+                "week_desc": week_desc,
+                "month_desc": month_desc,
+                "is_monthly": is_monthly,
+            })
 
         # Resolve target expiry
         if expiry_date:
-            try:
-                target_expiry = datetime.date.fromisoformat(expiry_date)
-            except ValueError:
-                return {
-                    "underlying": underlying,
-                    "expiry": "",
-                    "strikes": [],
-                    "available_expiries": available_expiries,
-                    "status": "error",
-                    "message": f"Invalid expiry_date format '{expiry_date}'. Use YYYY-MM-DD.",
-                }
-            if target_expiry not in all_expiries:
-                return {
-                    "underlying": underlying,
-                    "expiry": expiry_date,
-                    "strikes": [],
-                    "available_expiries": available_expiries,
-                    "status": "error",
-                    "message": f"Expiry date '{expiry_date}' not found for {underlying}.",
-                }
+            exp_date_lower = expiry_date.strip().lower()
+            if exp_date_lower in ("monthly", "month", "m", "current month", "current monthly"):
+                target_expiry = sorted_monthly[0] if sorted_monthly else all_expiries[0]
+            elif exp_date_lower in ("next monthly", "next month", "next_month", "month 1", "monthly 1"):
+                target_expiry = sorted_monthly[1] if len(sorted_monthly) > 1 else (sorted_monthly[0] if sorted_monthly else all_expiries[-1])
+            elif exp_date_lower in ("far monthly", "far month", "far_month", "month 2", "monthly 2"):
+                target_expiry = sorted_monthly[2] if len(sorted_monthly) > 2 else (sorted_monthly[-1] if sorted_monthly else all_expiries[-1])
+            elif exp_date_lower in ("current week", "current"):
+                target_expiry = all_expiries[0]
+            elif exp_date_lower in ("next week", "next"):
+                target_expiry = all_expiries[1] if len(all_expiries) > 1 else all_expiries[0]
+            elif exp_date_lower in ("far week", "far"):
+                target_expiry = all_expiries[2] if len(all_expiries) > 2 else all_expiries[-1]
+            else:
+                try:
+                    target_expiry = datetime.date.fromisoformat(expiry_date)
+                except ValueError:
+                    return {
+                        "underlying": underlying,
+                        "expiry": "",
+                        "strikes": [],
+                        "available_expiries": available_expiries,
+                        "status": "error",
+                        "message": f"Invalid expiry_date format '{expiry_date}'. Use 'monthly', 'next month', 'week <N>', or YYYY-MM-DD.",
+                    }
+                if target_expiry not in all_expiries:
+                    return {
+                        "underlying": underlying,
+                        "expiry": expiry_date,
+                        "strikes": [],
+                        "available_expiries": available_expiries,
+                        "status": "error",
+                        "message": f"Expiry date '{expiry_date}' not found for {underlying}.",
+                    }
         else:
             idx = min(expiry_week, len(all_expiries) - 1)
             target_expiry = all_expiries[idx]
@@ -917,47 +968,84 @@ class KiteAccountManager(BaseBrokerManager):
 
         strikes = sorted(strike_map.values(), key=lambda x: x["strike"])
 
-        # Batch-fetch LTP for all option symbols in one call
-        all_symbols = []
+        # Map spot underlying symbol
+        index_spot_map = {
+            "NIFTY": "NSE:NIFTY 50",
+            "BANKNIFTY": "NSE:NIFTY BANK",
+            "FINNIFTY": "NSE:NIFTY FIN SERVICE",
+            "MIDCPNIFTY": "NSE:NIFTY MID SELECT",
+            "SENSEX": "BSE:SENSEX",
+            "BANKEX": "BSE:BANKEX",
+        }
+        spot_symbol = index_spot_map.get(underlying, f"NSE:{underlying}")
+
+        # Batch-fetch Quote (LTP, OI, Volume) for all option symbols + Spot Index
+        all_symbols = [spot_symbol]
         for s in strikes:
             if s.get("ce_symbol"):
                 all_symbols.append(f"NFO:{s['ce_symbol']}")
             if s.get("pe_symbol"):
                 all_symbols.append(f"NFO:{s['pe_symbol']}")
 
-        ltp_data: dict = {}
+        quote_data: dict = {}
         if all_symbols:
             try:
-                # kite.ltp() accepts up to 500 symbols at once
+                # kite.quote() accepts up to 500 symbols at once
                 for i in range(0, len(all_symbols), 500):
                     chunk = all_symbols[i : i + 500]
-                    ltp_data.update(kite.ltp(chunk))
+                    quote_data.update(kite.quote(chunk))
             except Exception as exc:
-                logger.warning("Failed to fetch LTP for option chain: %s", exc)
+                logger.warning("kite.quote failed for option chain, falling back to kite.ltp: %s", exc)
+                try:
+                    for i in range(0, len(all_symbols), 500):
+                        chunk = all_symbols[i : i + 500]
+                        quote_data.update(kite.ltp(chunk))
+                except Exception as exc2:
+                    logger.warning("kite.ltp also failed for option chain: %s", exc2)
 
-        # Enrich each strike entry with live LTP and instrument tokens. The
-        # tokens let the live TUI subscribe to these options on the WebSocket so
-        # the option-chain LTPs can stream rather than being a one-shot snapshot.
+        spot_price = 0.0
+        if spot_symbol in quote_data:
+            spot_price = float(quote_data[spot_symbol].get("last_price") or 0.0)
+
+        # Enrich each strike entry with live LTP, instrument tokens, OI, and volume
         for s in strikes:
             ce_key = f"NFO:{s.get('ce_symbol', '')}"
             pe_key = f"NFO:{s.get('pe_symbol', '')}"
-            if ce_key in ltp_data:
-                s["ce_ltp"] = ltp_data[ce_key].get("last_price")
-                s["ce_token"] = ltp_data[ce_key].get("instrument_token")
-            if pe_key in ltp_data:
-                s["pe_ltp"] = ltp_data[pe_key].get("last_price")
-                s["pe_token"] = ltp_data[pe_key].get("instrument_token")
+            if ce_key in quote_data:
+                q = quote_data[ce_key]
+                s["ce_ltp"] = q.get("last_price")
+                s["ce_token"] = q.get("instrument_token")
+                s["ce_oi"] = q.get("oi") or 0
+                s["ce_volume"] = q.get("volume") or 0
+            if pe_key in quote_data:
+                q = quote_data[pe_key]
+                s["pe_ltp"] = q.get("last_price")
+                s["pe_token"] = q.get("instrument_token")
+                s["pe_oi"] = q.get("oi") or 0
+                s["pe_volume"] = q.get("volume") or 0
+
+        # Enrich with Greeks (Delta, IV, Theta, ATM Straddle, PCR, Max Pain)
+        from cli.greeks import enrich_option_chain_greeks
+        summary = enrich_option_chain_greeks(
+            strikes=strikes,
+            spot_price=spot_price,
+            expiry_date=target_expiry,
+        )
 
         logger.info(
-            "Option chain: %s, expiry=%s, strikes=%d",
+            "Option chain: %s (Spot: %.2f), expiry=%s, strikes=%d, PCR=%.2f",
             underlying,
+            spot_price,
             target_expiry.isoformat(),
             len(strikes),
+            summary.get("pcr", 0.0),
         )
 
         return {
             "underlying": underlying,
             "expiry": target_expiry.isoformat(),
+            "spot_price": spot_price,
+            "summary": summary,
             "strikes": strikes,
             "available_expiries": available_expiries,
             "status": "success",
@@ -1135,11 +1223,23 @@ class KiteAccountManager(BaseBrokerManager):
                             for inst in instruments
                             if inst.get("tradingsymbol")
                         }
+                        self._nfo_symbol_token_cache = {
+                            inst["tradingsymbol"]: int(inst["instrument_token"])
+                            for inst in instruments
+                            if inst.get("tradingsymbol") and inst.get("instrument_token")
+                        }
                         return self._nfo_lot_size_cache
                     except Exception as exc:
                         logger.warning("get_nfo_lot_sizes failed: %s", exc)
                         return {}
         return {}
+
+    def get_nfo_symbol_token_map(self) -> dict[str, int]:
+        """Return tradingsymbol → instrument_token map for NFO instruments."""
+        if self._nfo_symbol_token_cache:
+            return self._nfo_symbol_token_cache
+        self.get_nfo_lot_sizes()
+        return self._nfo_symbol_token_cache
 
     def get_market_indices(self) -> dict[str, Any]:
         # 1. Try Kite ohlc first for last_price and yesterday's close

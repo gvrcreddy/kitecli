@@ -1002,6 +1002,14 @@ class KotakAccountManager(BaseBrokerManager):
         positions = self.get_positions(account_key)
         orders_placed = []
 
+        existing_orders = []
+        try:
+            existing_orders = self.get_orders(account_key) or []
+        except Exception as exc:
+            logger.warning("Failed to fetch open orders during exit for Kotak key=%s: %s", account_key[:8], exc)
+
+        PENDING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED"}
+
         for pos in positions:
             qty = pos.get("quantity", 0)
             if qty == 0:
@@ -1016,6 +1024,25 @@ class KotakAccountManager(BaseBrokerManager):
             product = pos.get("product", "NRML")
             exchange = pos.get("exchange", "NFO")
             order_type = "LIMIT" if price is not None else "MARKET"
+
+            # Cancel existing pending orders for this symbol before placing new exit order
+            cancelled_ids = []
+            for ord_item in existing_orders:
+                o_status = str(ord_item.get("status", "")).upper()
+                if o_status in PENDING_STATUSES:
+                    o_sym = str(ord_item.get("tradingsymbol", "")).upper()
+                    if o_sym == sym.upper():
+                        oid = str(ord_item.get("order_id", ""))
+                        if oid and oid not in cancelled_ids:
+                            try:
+                                logger.info(
+                                    "Cancelling existing pending Kotak order #%s for %s before placing exit order",
+                                    oid, sym
+                                )
+                                self.cancel_order(account_key, oid)
+                                cancelled_ids.append(oid)
+                            except Exception as c_exc:
+                                logger.warning("Could not cancel existing Kotak order #%s for %s: %s", oid, sym, c_exc)
 
             try:
                 order_ids = self.place_order(
@@ -1034,6 +1061,7 @@ class KotakAccountManager(BaseBrokerManager):
                         "quantity": exit_qty,
                         "product": product,
                         "order_id": oid,
+                        "cancelled_order_ids": cancelled_ids,
                     })
             except Exception as exc:
                 logger.error("Kotak exit failed for %s: %s", sym, exc)

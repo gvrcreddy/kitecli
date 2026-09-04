@@ -18,13 +18,20 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame, TextArea
 
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
-from prompt_toolkit.mouse_events import MouseEventType
+try:
+    from prompt_toolkit.mouse_events import MouseEventType, MouseButton
+except ImportError:
+    from prompt_toolkit.mouse_events import MouseEventType
+    MouseButton = None
 from prompt_toolkit.history import InMemoryHistory, FileHistory
 from collections import UserDict, defaultdict
 from prompt_toolkit.widgets import SearchToolbar
 from prompt_toolkit.search import start_search, is_searching, do_incremental_search, SearchDirection
 from prompt_toolkit.filters import has_focus
 from prompt_toolkit.data_structures import Point
+
+from cli.highlighter import KiteCLILexer, KiteCLICompleter, correct_command_typos
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
 from cli.api_client import KCLIClient, KCLIClientError
 from cli.display import render_positions_to_string, render_holdings_to_string
@@ -431,8 +438,11 @@ class KCLILiveSession:
         self.oc_dual_dropdown_1: bool = False
         self.oc_dual_dropdown_2: bool = False
         self.oc_dual_exp1_idx: int = 0
-        self.oc_dual_exp2_idx: int = 1
         self._last_oc_dual_text: str = "Press F3 or run 'oc comp <UNDERLYING>' to compare option chains."
+        self.oc_depth_symbol: str | None = None
+        self.oc_depth_side: str = "CE"
+        self.oc_depth_strike: float | None = None
+        self.oc_depth_cache: dict[str, dict] = {}
         self._last_pending_text: str = "Fetching pending orders..."
         self._last_executed_text: str = "Fetching executed orders..."
         self._last_advisor_text: str = "Press F4 to view Tuesday Option Strangle Advisor plan."
@@ -529,6 +539,37 @@ class KCLILiveSession:
             "oc.set2.pe": "fg:#f1e05a",           # Set 2 Puts (Gold / Amber)
             "oc.set2.hdr": "fg:#79c0ff bold",      # Set 2 Header
             "oc.set2.btn": "bg:#0c2d48 fg:#79c0ff bold", # Set 2 Expiry Button
+
+            # Command Input Syntax Highlighting & Auto-Correction styles
+            "cmd.buy": "fg:#56d364 bold",         # Emerald green for BUY / B
+            "cmd.sell": "fg:#ff7b72 bold",        # Coral red for SELL / S
+            "cmd.exit": "fg:#f85149 bold",        # Red for EXIT / X
+            "cmd.modify": "fg:#d29922 bold",      # Gold/Orange for MODIFY / M
+            "cmd.cancel": "fg:#e3b341 bold",      # Yellow/Gold for CANCEL / C
+            "cmd.select": "fg:#58a6ff bold",      # Sky blue for SELECT / ACCOUNT
+            "cmd.view": "fg:#79c0ff bold",        # Cyan for OC / PNL / HOLDINGS / MD / ADVISOR
+            "cmd.account": "fg:#d2a8ff bold",     # Light purple for @ACCOUNT
+            "cmd.symbol": "fg:#f1e05a bold",      # Amber/Yellow for tradingsymbols
+            "cmd.qty": "fg:#f778ba bold",         # Pink/Magenta for quantities & lots (e.g. 27L)
+            "cmd.price": "fg:#39c5bb bold",       # Teal/Cyan for prices (e.g. 130.20)
+            "cmd.product": "fg:#7ee787",          # Mint green for NRML / MIS / CNC
+            "cmd.time": "fg:#e3b341",             # Gold for times & dates
+            "cmd.keyword": "fg:#8b949e",          # Slate for keywords (at, on)
+            "cmd.chain": "fg:#ffffff bold",       # Bright white for chaining (&&, THEN, ->)
+            "cmd.flag": "fg:#8b949e italic",      # Slate italic for flags (all, deep, summary)
+            "cmd.id": "fg:#bc8cff bold",          # Lavender for numeric IDs
+            "cmd.nli": "fg:#d787ff italic",       # Purple italic for NLI /prompt
+            "cmd.text": "fg:#e6edf3",             # Default white
+            "cmd.error": "fg:#ff5555 underline",  # Error red underline
+
+            # In-Option-Chain Market Depth Card styles
+            "oc.md.border": "fg:#38434f",
+            "oc.md.header": "fg:#58a6ff bold",
+            "oc.md.bid": "fg:#56d364 bold",
+            "oc.md.ask": "fg:#ff7b72 bold",
+            "oc.md.val": "fg:#e6edf3",
+            "oc.md.muted": "fg:#8b949e",
+            "oc.md.close": "bg:#3c1f24 fg:#ff7b72 bold",
         })
 
     def _strip_rich_markup(self, text: str) -> str:
@@ -1126,6 +1167,11 @@ class KCLILiveSession:
                     elif mode == "oc":
                         if getattr(self, "oc_data", None):
                             self._update_oc_subscriptions(self.oc_data.get("strikes", []))
+                        else:
+                            ak = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
+                            if ak:
+                                self.oc_context_mode = "weekly"
+                                self._run_coroutine_threadsafe(self._fetch_and_display_option_chain(ak, "NIFTY", expiry_week=0))
                     self.info_mode = mode
                     self._update_info_buffer()
                     if hasattr(self, "app") and self.app:
@@ -1423,6 +1469,12 @@ class KCLILiveSession:
                 "[#ff8700]No stream-capable account:[/#] indices and option "
                 "chain will use REST snapshots only (no live streaming)."
             )
+
+        # Pre-fetch NIFTY current week option chain in background so OC is ready immediately
+        ak = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
+        if ak:
+            self.oc_context_mode = "weekly"
+            asyncio.create_task(self._fetch_and_display_option_chain(ak, "NIFTY", expiry_week=0))
 
         # Connect WebSockets for accounts that support it (Zerodha and Kotak).
         for acct in self.accounts:
@@ -3320,9 +3372,12 @@ class KCLILiveSession:
                 status = res.get("status", "error")
                 msg = res.get("message", "")
                 placed = res.get("orders_placed", [])
-                
+                cancelled = res.get("orders_cancelled", [])
+
                 if status == "success":
                     has_success = True
+                    if cancelled:
+                        self.log_message(f"[#ff8700]⚠ {name}:[/#] Cancelled {len(cancelled)} existing open order(s) (#{', #'.join(cancelled)}) before placing exit")
                     if placed:
                         symbols_exited = ", ".join(f"{item.get('tradingsymbol')} ({item.get('quantity')})" for item in placed)
                         self.log_message(f"[#00ff00]✓ {name}:[/#] Exited {symbols_exited}")
@@ -3337,6 +3392,22 @@ class KCLILiveSession:
 
         except KCLIClientError as exc:
             self.log_message(f"[#ff0000]Exit Execution Failed:[/#] {exc}")
+
+    def _get_matching_pending_exit_orders_count(self, symbol: str | None, api_keys: list[str]) -> int:
+        """Count pending open orders that will be automatically cancelled before exiting."""
+        if not getattr(self, "last_orders_response", None):
+            return 0
+        PENDING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED"}
+        count = 0
+        target_sym = symbol.upper() if symbol and symbol.lower() != "all" else None
+        for acct in self.last_orders_response.get("accounts", []):
+            if not api_keys or acct.get("api_key") in api_keys:
+                for o in acct.get("orders", []):
+                    if str(o.get("status", "")).upper() in PENDING_STATUSES:
+                        o_sym = str(o.get("tradingsymbol", "")).upper()
+                        if target_sym is None or o_sym == target_sym:
+                            count += 1
+        return count
 
     async def execute_modify(self, order_id: str, qty_str: str | None, price_str: str, api_key: str) -> None:
         """Modify open order in executor."""
@@ -3456,10 +3527,22 @@ class KCLILiveSession:
             logger.error("Error processing input: %s", exc, exc_info=True)
 
     def _handle_input_core(self, buffer) -> None:
-        """Process entered command line, supporting command chaining via &&."""
+        """Process entered command line, supporting command chaining via && and typo auto-correction."""
         raw_text = buffer.text.strip()
         if not raw_text:
             return
+
+        # If waiting for confirmation of a staged order, pass directly to execution
+        if hasattr(self, "pending_order") and self.pending_order:
+            self._execute_single_command(raw_text)
+            return
+
+        # Attempt typo auto-correction if not an explicit NLI translation command
+        if not raw_text.startswith("/"):
+            corrected = correct_command_typos(raw_text, session=self)
+            if corrected and corrected != raw_text:
+                self.log_message(f"[#39c5bb]💡 Auto-corrected:[/#] '[#8b949e]{raw_text}[/#]' ➔ '[#56d364 bold]{corrected}[/#]'")
+                raw_text = corrected
 
         # Support command chaining via '&&'
         commands = [c.strip() for c in raw_text.split("&&") if c.strip()]
@@ -3631,7 +3714,11 @@ class KCLILiveSession:
             self.log_message("Switched info pane to [bold]Executed Orders[/bold].")
             return
         elif cmd_norm in ("oc", "optionchain", "chain", "3", "/3", "/oc"):
-            if getattr(self, "oc_data", None):
+            ak = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
+            if not getattr(self, "oc_data", None) and ak:
+                self.oc_context_mode = "weekly"
+                self._run_coroutine_threadsafe(self._fetch_and_display_option_chain(ak, "NIFTY", expiry_week=0))
+            elif getattr(self, "oc_data", None):
                 self._update_oc_subscriptions(self.oc_data.get("strikes", []))
             self.info_mode = "oc"
             self._update_info_buffer()
@@ -4076,8 +4163,10 @@ class KCLILiveSession:
                             api_key=api_keys[0] if api_keys else None
                         )
                         
-                        self.prompt_control.text = f" Confirm EXIT of {target_display} positions {price_desc}? (y/n)> "
-                        self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT {target_display} positions {price_desc}. Press [bold]y[/bold] to confirm.")
+                        pending_count = self._get_matching_pending_exit_orders_count(symbol, api_keys)
+                        cancel_notice = f" (cancels {pending_count} open order{'s' if pending_count > 1 else ''})" if pending_count > 0 else ""
+                        self.prompt_control.text = f" Confirm EXIT of {target_display} positions {price_desc}{cancel_notice}? (y/n)> "
+                        self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT {target_display} positions {price_desc}{cancel_notice}. Press [bold]y[/bold] to confirm.")
                         continue
 
                     elif isinstance(parsed, CancelOrderCommand):
@@ -5266,14 +5355,16 @@ class KCLILiveSession:
                 api_key=target_keys[0] if len(target_keys) == 1 else None,
             )
 
+            pending_count = self._get_matching_pending_exit_orders_count(raw_symbol, target_keys)
+            cancel_notice = f" (cancels {pending_count} open order{'s' if pending_count > 1 else ''})" if pending_count > 0 else ""
             price_desc = f" @{price_val:.2f}" if price_val is not None else ""
             if raw_symbol and raw_symbol.lower() != "all":
                 symbol = self.pending_order["symbol"]
-                self.prompt_control.text = f" Confirm EXIT of {symbol} on {accts_desc}{price_desc}? (y/n)> "
-                self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT open positions for {symbol} on {accts_desc}{price_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+                self.prompt_control.text = f" Confirm EXIT of {symbol} on {accts_desc}{price_desc}{cancel_notice}? (y/n)> "
+                self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT open positions for {symbol} on {accts_desc}{price_desc}{cancel_notice}. Press [bold]y[/bold] to confirm, any other key to cancel.")
             else:
-                self.prompt_control.text = f" Confirm EXIT of ALL positions on {accts_desc}{price_desc}? (y/n)> "
-                self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT ALL open positions on {accts_desc}{price_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+                self.prompt_control.text = f" Confirm EXIT of ALL positions on {accts_desc}{price_desc}{cancel_notice}? (y/n)> "
+                self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT ALL open positions on {accts_desc}{price_desc}{cancel_notice}. Press [bold]y[/bold] to confirm, any other key to cancel.")
             return
 
         # Option Chain Command
@@ -5329,17 +5420,9 @@ class KCLILiveSession:
                 return
 
             if len(parts) < 2:
-                self.log_message("[#ff0000]Usage:[/#] oc <UNDERLYING> [monthly | next month | far month | week <N> | <YYYY-MM-DD>]")
-                self.log_message("  e.g. [bold]oc NIFTY[/bold]              — current week")
-                self.log_message("  e.g. [bold]oc NIFTY monthly[/bold]      — current month's monthly expiry")
-                self.log_message("  e.g. [bold]oc NIFTY next month[/bold]   — next month's monthly expiry")
-                self.log_message("  e.g. [bold]oc NIFTY far month[/bold]    — far month's monthly expiry")
-                self.log_message("  e.g. [bold]oc NIFTY week 1[/bold]       — next week expiry")
-                self.log_message("  e.g. [bold]oc NIFTY far week[/bold]     — far week expiry")
-                self.log_message("  e.g. [bold]oc BANKNIFTY 2024-06-27[/bold] — specific date")
-                return
-
-            underlying = parts[1].upper()
+                underlying = "NIFTY"
+            else:
+                underlying = parts[1].upper()
             expiry_week = 0
             expiry_date = None
 
@@ -5547,15 +5630,16 @@ class KCLILiveSession:
             return f"{val:>8.2f}"
 
         # Classify weekly vs monthly expiries
-        weekly_expiries = [e for e in expiries if not e.get("is_monthly")]
+        # Weekly expiries must include all upcoming expiries chronologically so Current Week is never skipped
+        weekly_expiries = list(expiries)
         monthly_expiries = [e for e in expiries if e.get("is_monthly")]
-        is_monthly_context = any(e.get("expiry") == expiry and e.get("is_monthly") for e in expiries) or getattr(self, "oc_context_mode", "weekly") == "monthly"
+        is_monthly_context = (getattr(self, "oc_context_mode", "weekly") == "monthly")
 
         # 1. Top Expiry Tabs (Exactly 3 tabs + 1 dropdown tab)
         top_tabs = []
         if is_monthly_context and monthly_expiries:
             for i, m in enumerate(monthly_expiries[:3]):
-                lbl = "Current" if i == 0 else "Next" if i == 1 else "Far"
+                lbl = "Current Month" if i == 0 else "Next Month" if i == 1 else "Far Month"
                 dt_disp = _fmt_tab_dt(m.get("expiry", ""))
                 is_active = (m.get("expiry") == expiry)
                 prefix = "● " if is_active else ""
@@ -5749,9 +5833,7 @@ class KCLILiveSession:
                     und = self.oc_data.get("underlying", "NIFTY")
                     ak = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
                     if ak:
-                        self.log_message(f"Loading Option Chain for [bold]{und}[/bold] expiry [bold]{exp_val}[/bold]...")
-                        import asyncio
-                        asyncio.create_task(self._fetch_and_display_option_chain(ak, und, expiry_week=w_idx, expiry_date=exp_val))
+                        self._run_coroutine_threadsafe(self._fetch_and_display_option_chain(ak, und, expiry_week=w_idx, expiry_date=exp_val))
             return _handler
 
         def _make_dropdown_toggle():
@@ -5764,14 +5846,14 @@ class KCLILiveSession:
             return _handler
 
         # 1. Top Expiry Navigation Tabs (3 tabs + 1 dropdown tab)
-        weekly_expiries = [(i, e) for i, e in enumerate(expiries) if not e.get("is_monthly")]
+        weekly_expiries = list(enumerate(expiries))
         monthly_expiries = [(i, e) for i, e in enumerate(expiries) if e.get("is_monthly")]
-        is_monthly_context = any(e.get("expiry") == expiry and e.get("is_monthly") for e in expiries) or getattr(self, "oc_context_mode", "weekly") == "monthly"
+        is_monthly_context = (getattr(self, "oc_context_mode", "weekly") == "monthly")
 
         frags = [("", " ")]
         if is_monthly_context and monthly_expiries:
             for count, (idx, m) in enumerate(monthly_expiries[:3]):
-                lbl = "Current" if count == 0 else "Next" if count == 1 else "Far"
+                lbl = "Current Month" if count == 0 else "Next Month" if count == 1 else "Far Month"
                 m_dt = m.get("expiry", "")
                 dt_disp = _fmt_tab_dt(m_dt)
                 is_cur = (m_dt == expiry)
@@ -5851,9 +5933,143 @@ class KCLILiveSession:
             ("class:oc.border",       "────────────────────────────────┼──────────┼────────────────────────────────\n"),
         ]
 
-        def _make_ce_click(sym, ltp):
+        def _render_oc_depth_card(active_sym: str, active_side: str, ce_sym: str, pe_sym: str, strike_val: float) -> list:
+            import time as _t
+            card_frags = []
+            now = _t.time()
+            cached = getattr(self, "oc_depth_cache", {}).get(active_sym)
+            if cached and (now - cached.get("_ts", 0) < 2.0):
+                md_res = cached
+            else:
+                try:
+                    md_res = self.client.get_market_depth(active_sym)
+                except Exception:
+                    md_res = {"status": "error"}
+                if md_res.get("status") == "success":
+                    md_res["_ts"] = now
+                    if not hasattr(self, "oc_depth_cache"):
+                        self.oc_depth_cache = {}
+                    self.oc_depth_cache[active_sym] = md_res
+                elif cached:
+                    md_res = cached
+
+            ltp = float(md_res.get("last_price", 0.0))
+            chg = float(md_res.get("change", 0.0))
+            vol = int(md_res.get("volume", 0))
+            oi = int(md_res.get("oi", 0))
+            tot_b = int(md_res.get("total_buy_quantity", 0))
+            tot_s = int(md_res.get("total_sell_quantity", 0))
+            bids = md_res.get("buy_depth", [])
+            asks = md_res.get("sell_depth", [])
+
+            tot_vol = max(1, tot_b + tot_s)
+            b_ratio = tot_b / tot_vol
+            b_blocks = min(8, max(0, int(round(b_ratio * 8))))
+            gauge_str = "█" * b_blocks + "░" * (8 - b_blocks)
+
+            b_str = f"{tot_b:,}" if tot_b < 100_000 else f"{tot_b / 100_000:.1f}L"
+            s_str = f"{tot_s:,}" if tot_s < 100_000 else f"{tot_s / 100_000:.1f}L"
+            vol_str = f"{vol:,}" if vol < 100_000 else f"{vol / 100_000:.1f}L"
+            oi_str = f"{oi:,}" if oi < 100_000 else f"{oi / 100_000:.1f}L"
+
+            def _make_side_switch(target_side, target_sym):
+                def _handler(mouse_event):
+                    if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                        if target_sym and target_sym != "-":
+                            self.oc_depth_side = target_side
+                            self.oc_depth_symbol = target_sym
+                            self._update_info_buffer(reset_scroll=False)
+                            self._update_display_and_invalidate()
+                return _handler
+
+            def _make_close():
+                def _handler(mouse_event):
+                    if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                        self.oc_depth_symbol = None
+                        self.oc_depth_strike = None
+                        self._update_info_buffer(reset_scroll=False)
+                        self._update_display_and_invalidate()
+                return _handler
+
+            # Line 1: Header (exact 76 chars wide)
+            ce_tab_style = "class:oc.expiry.active" if active_side == "CE" else "class:oc.expiry.inactive"
+            pe_tab_style = "class:oc.expiry.active" if active_side == "PE" else "class:oc.expiry.inactive"
+            sym_clean = active_sym[:24]
+
+            card_frags.append(("class:oc.md.border", "┌── Depth: "))
+            card_frags.append((ce_tab_style, f"[{'● ' if active_side == 'CE' else '  '}CE]", _make_side_switch("CE", ce_sym)))
+            card_frags.append(("class:oc.md.border", " "))
+            card_frags.append((pe_tab_style, f"[{'● ' if active_side == 'PE' else '  '}PE]", _make_side_switch("PE", pe_sym)))
+            card_frags.append(("class:oc.md.border", "  "))
+            card_frags.append(("class:oc.header.spot", f"{sym_clean:<24}"))
+            card_frags.append(("class:oc.md.border", " ────── "))
+            card_frags.append(("class:oc.md.close", "[× Close]", _make_close()))
+            card_frags.append(("class:oc.md.border", " ──┐\n"))
+
+            # Line 2: Metrics (exact 76 chars wide)
+            chg_sign = f"{chg:+.2f}" if chg != 0 else "0.00"
+            ltp_part = f"LTP: ₹{ltp:.2f} ({chg_sign})"
+            vol_part = f"Vol: {vol_str}"
+            oi_part = f"OI: {oi_str}"
+            book_part = f"B: {b_str} [{gauge_str}] S: {s_str}"
+            summary_content = f" {ltp_part:<18} {vol_part:<11} {oi_part:<10} {book_part:<29} "[:74]
+            card_frags.append(("class:oc.md.border", "│"))
+            card_frags.append(("class:oc.md.val", f"{summary_content:<74}"))
+            card_frags.append(("class:oc.md.border", "│\n"))
+
+            # Line 3: Table Header (exact 76 chars wide)
+            card_frags.append(("class:oc.md.border", "├───────────────────────────────────┬────────────────────────────────────────┤\n"))
+            card_frags.append(("class:oc.md.border", "│ "))
+            card_frags.append(("class:oc.table.cols", " Orders    Quantity       Bid Price"))
+            card_frags.append(("class:oc.md.border", " │ "))
+            card_frags.append(("class:oc.table.cols", "  Ask Price       Quantity    Orders "))
+            card_frags.append(("class:oc.md.border", "│\n"))
+            card_frags.append(("class:oc.md.border", "├─────────┬──────────┬──────────────┼──────────────┬──────────┬──────────────┤\n"))
+
+            # Lines 4-8: 5 Rows of Bids vs Asks (exact 76 chars wide)
+            for i in range(5):
+                b = bids[i] if i < len(bids) else {}
+                a = asks[i] if i < len(asks) else {}
+
+                b_ord = f"{b.get('orders', 0):>7}" if b.get("orders") else "      -"
+                b_qty = f"{b.get('quantity', 0):>8,}" if b.get("quantity") else "       -"
+                b_pr = f"₹{b.get('price', 0.0):>9.2f}" if b.get("price") else "        -"
+
+                a_pr = f"₹{a.get('price', 0.0):>9.2f}" if a.get("price") else "        -"
+                a_qty = f"{a.get('quantity', 0):>8,}" if a.get("quantity") else "       -"
+                a_ord = f"{a.get('orders', 0):<7}" if a.get("orders") else "-      "
+
+                card_frags.append(("class:oc.md.border", "│"))
+                card_frags.append(("class:oc.md.muted", f" {b_ord} "))
+                card_frags.append(("class:oc.md.border", "│"))
+                card_frags.append(("class:oc.md.val", f" {b_qty} "))
+                card_frags.append(("class:oc.md.border", "│"))
+                card_frags.append(("class:oc.md.bid", f" {b_pr:<12} "))
+                card_frags.append(("class:oc.md.border", "│"))
+                card_frags.append(("class:oc.md.ask", f" {a_pr:>12} "))
+                card_frags.append(("class:oc.md.border", "│"))
+                card_frags.append(("class:oc.md.val", f" {a_qty} "))
+                card_frags.append(("class:oc.md.border", "│"))
+                card_frags.append(("class:oc.md.muted", f" {a_ord} "))
+                card_frags.append(("class:oc.md.border", "│\n"))
+
+            # Line 9: Footer (exact 76 chars wide)
+            card_frags.append(("class:oc.md.border", "└─────────┴──────────┴──────────────┴──────────────┴──────────┴──────────────┘\n"))
+            return card_frags
+
+        def _make_ce_click(sym, ltp, strike=None):
             def _handler(mouse_event):
                 if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    is_right = getattr(mouse_event, "button", None) == getattr(MouseButton, "RIGHT", None)
+                    is_shift = getattr(mouse_event, "shift", False) or getattr(mouse_event, "modifier", None) == "shift"
+                    if (is_right or is_shift) and sym and sym != "-":
+                        self.oc_depth_symbol = sym
+                        self.oc_depth_side = "CE"
+                        self.oc_depth_strike = strike
+                        self._update_info_buffer(reset_scroll=False)
+                        self._update_display_and_invalidate()
+                        return
+
                     if sym and sym != "-":
                         self.log_message(f"Selected [bold green]Call (CE): {sym}[/bold green] (LTP: {ltp or 'N/A'})")
                         if hasattr(self, "input_field") and self.input_field:
@@ -5866,9 +6082,19 @@ class KCLILiveSession:
                         self._update_display_and_invalidate()
             return _handler
 
-        def _make_pe_click(sym, ltp):
+        def _make_pe_click(sym, ltp, strike=None):
             def _handler(mouse_event):
                 if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    is_right = getattr(mouse_event, "button", None) == getattr(MouseButton, "RIGHT", None)
+                    is_shift = getattr(mouse_event, "shift", False) or getattr(mouse_event, "modifier", None) == "shift"
+                    if (is_right or is_shift) and sym and sym != "-":
+                        self.oc_depth_symbol = sym
+                        self.oc_depth_side = "PE"
+                        self.oc_depth_strike = strike
+                        self._update_info_buffer(reset_scroll=False)
+                        self._update_display_and_invalidate()
+                        return
+
                     if sym and sym != "-":
                         self.log_message(f"Selected [bold red]Put (PE): {sym}[/bold red] (LTP: {ltp or 'N/A'})")
                         if hasattr(self, "input_field") and self.input_field:
@@ -5879,6 +6105,52 @@ class KCLILiveSession:
                             if hasattr(self, "app") and self.app:
                                 self.app.layout.focus(self.input_field)
                         self._update_display_and_invalidate()
+            return _handler
+
+        def _make_ce_md_click(sym, strike):
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    if sym and sym != "-":
+                        if self.oc_depth_symbol == sym and self.oc_depth_strike == strike:
+                            self.oc_depth_symbol = None
+                            self.oc_depth_strike = None
+                        else:
+                            self.oc_depth_symbol = sym
+                            self.oc_depth_side = "CE"
+                            self.oc_depth_strike = strike
+                        self._update_info_buffer(reset_scroll=False)
+                        self._update_display_and_invalidate()
+            return _handler
+
+        def _make_pe_md_click(sym, strike):
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    if sym and sym != "-":
+                        if self.oc_depth_symbol == sym and self.oc_depth_strike == strike:
+                            self.oc_depth_symbol = None
+                            self.oc_depth_strike = None
+                        else:
+                            self.oc_depth_symbol = sym
+                            self.oc_depth_side = "PE"
+                            self.oc_depth_strike = strike
+                        self._update_info_buffer(reset_scroll=False)
+                        self._update_display_and_invalidate()
+            return _handler
+
+        def _make_strike_md_click(strike_val, ce_s, pe_s):
+            def _handler(mouse_event):
+                if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    if self.oc_depth_strike == strike_val:
+                        self.oc_depth_symbol = None
+                        self.oc_depth_strike = None
+                    else:
+                        self.oc_depth_strike = strike_val
+                        cur_side = getattr(self, "oc_depth_side", "CE")
+                        target_s = ce_s if cur_side == "CE" and ce_s != "-" else (pe_s if pe_s != "-" else ce_s)
+                        self.oc_depth_side = "CE" if target_s == ce_s else "PE"
+                        self.oc_depth_symbol = target_s
+                    self._update_info_buffer(reset_scroll=False)
+                    self._update_display_and_invalidate()
             return _handler
 
         # 6. Render ALL strikes with OI Depth Spark-Bars, Wall Annotations, and ITM/OTM Shading
@@ -5911,8 +6183,11 @@ class KCLILiveSession:
             pe_bar = _fmt_spark(s.get("pe_oi"), max_oi, is_call=False)
             pe_oi_str = _fmt_oi(s.get("pe_oi"))
 
-            ce_click = _make_ce_click(ce_sym, ce_ltp)
-            pe_click = _make_pe_click(pe_sym, pe_ltp)
+            ce_click = _make_ce_click(ce_sym, ce_ltp, strike)
+            pe_click = _make_pe_click(pe_sym, pe_ltp, strike)
+            ce_md_click = _make_ce_md_click(ce_sym, strike)
+            pe_md_click = _make_pe_md_click(pe_sym, strike)
+            strike_click = _make_strike_md_click(strike, ce_sym, pe_sym)
 
             # ITM vs OTM Shading
             is_ce_itm = (spot_price > 0 and strike < spot_price)
@@ -5921,35 +6196,43 @@ class KCLILiveSession:
             ce_style = "class:oc.ce.itm" if is_ce_itm else "class:oc.ce"
             pe_style = "class:oc.pe.itm" if is_pe_itm else "class:oc.pe"
 
-            # Call Side (33 chars)
-            frags.append((ce_style, f"{ce_oi_str} ", ce_click))
-            frags.append(("class:oc.bar.call", f"{ce_bar} ", ce_click))
-            frags.append((ce_style, f"{ce_iv_str} {ce_delta_str} {ce_ltp_str} ", ce_click))
+            # Call Side (33 chars): OI, Bar, IV, Delta open Depth; LTP stages order
+            frags.append((ce_style, f"{ce_oi_str} ", ce_md_click))
+            frags.append(("class:oc.bar.call", f"{ce_bar} ", ce_md_click))
+            frags.append((ce_style, f"{ce_iv_str} {ce_delta_str} ", ce_md_click))
+            frags.append((ce_style, f"{ce_ltp_str} ", ce_click))
 
             frags.append(("class:oc.border", "│"))
 
-            # Strike Column (8 chars)
+            # Strike Column (8 chars): Clicking Strike toggles Depth
             if is_atm:
-                frags.append(("class:oc.atm", f"[{int(strike):^6}]"))
+                frags.append(("class:oc.atm", f"[{int(strike):^6}]", strike_click))
             elif strike == max_ce_strike:
-                frags.append(("class:oc.wall.call", f" {int(strike)} R"))
+                frags.append(("class:oc.wall.call", f" {int(strike)} R", strike_click))
             elif strike == max_pe_strike:
-                frags.append(("class:oc.wall.put", f" {int(strike)} S"))
+                frags.append(("class:oc.wall.put", f" {int(strike)} S", strike_click))
             elif max_pain and int(strike) == int(max_pain):
-                frags.append(("class:oc.maxpain", f" {int(strike)} *"))
+                frags.append(("class:oc.maxpain", f" {int(strike)} *", strike_click))
             else:
-                frags.append(("class:oc.strike", f" {int(strike):^6} "))
+                frags.append(("class:oc.strike", f" {int(strike):^6} ", strike_click))
 
             frags.append(("class:oc.border", "│"))
 
-            # Put Side (33 chars)
-            frags.append((pe_style, f" {pe_ltp_str} {pe_delta_str} {pe_iv_str} ", pe_click))
-            frags.append(("class:oc.bar.put", f"{pe_bar} ", pe_click))
-            frags.append((pe_style, f"{pe_oi_str}", pe_click))
+            # Put Side (33 chars): LTP stages order; Delta, IV, Bar, OI open Depth
+            frags.append((pe_style, f" {pe_ltp_str} ", pe_click))
+            frags.append((pe_style, f"{pe_delta_str} {pe_iv_str} ", pe_md_click))
+            frags.append(("class:oc.bar.put", f"{pe_bar} ", pe_md_click))
+            frags.append((pe_style, f"{pe_oi_str}", pe_md_click))
             frags.append(("", "\n"))
 
+            # Render in-place 5-level Market Depth popup card directly under the active strike
+            if getattr(self, "oc_depth_symbol", None) and getattr(self, "oc_depth_strike", None) == strike:
+                active_side = getattr(self, "oc_depth_side", "CE")
+                active_sym = self.oc_depth_symbol
+                frags.extend(_render_oc_depth_card(active_sym, active_side, ce_sym, pe_sym, strike))
+
         frags.append(("class:oc.border", "────────────────────────────────┴──────────┴────────────────────────────────\n"))
-        frags.append(("class:oc.tip", " Tip: Click any strike to stage order | Type 'oc <SYM> monthly' or 'oc <SYM> week <N>'\n"))
+        frags.append(("class:oc.tip", " Tip: Click Strike/OI or Shift-Click LTP for Depth | Click LTP to stage order | Esc closes\n"))
         return frags
 
     def _update_oc_subscriptions(self, strikes: list[dict]) -> None:
@@ -7870,6 +8153,10 @@ class KCLILiveSession:
             history=FileHistory(str(history_file)),
             focus_on_click=True,
             search_field=self.search_field,
+            lexer=KiteCLILexer(session=self),
+            completer=KiteCLICompleter(session=self),
+            auto_suggest=AutoSuggestFromHistory(),
+            complete_while_typing=False,
         )
         self.prompt_control = FormattedTextControl(text=" kcli> ")
 
@@ -8111,6 +8398,13 @@ class KCLILiveSession:
 
         @kb.add("escape")
         def _deselect(event):
+            if getattr(self, "oc_depth_symbol", None):
+                self.oc_depth_symbol = None
+                self.oc_depth_strike = None
+                self._update_info_buffer(reset_scroll=False)
+                self._update_display_and_invalidate()
+                return
+
             if (
                 (hasattr(self, "selected_symbol") and self.selected_symbol)
                 or (hasattr(self, "selected_account_name") and self.selected_account_name)
@@ -8161,12 +8455,29 @@ class KCLILiveSession:
             cur = event.app.layout.current_control
             if hasattr(cur, "vertical_scroll_position"):
                 cur.vertical_scroll_position += 10
-            elif hasattr(cur, "buffer"):
-                for _ in range(10):
-                    cur.buffer.cursor_down()
+        @kb.add("right", filter=has_focus(self.input_field))
+        def _right_input(event):
+            """Accept auto-suggestion if at end of input buffer, otherwise move right."""
+            buf = self.input_field.buffer
+            if buf.cursor_position == len(buf.text) and buf.suggestion and buf.suggestion.text:
+                buf.insert_text(buf.suggestion.text)
+            else:
+                buf.cursor_right()
 
-        @kb.add("tab")
-        def _tab(event):
+        @kb.add("tab", filter=has_focus(self.input_field))
+        def _tab_input(event):
+            """Fill auto-suggestion or trigger/cycle tab completion in input field."""
+            buf = self.input_field.buffer
+            if buf.complete_state:
+                buf.complete_next()
+            elif buf.suggestion and buf.suggestion.text:
+                buf.insert_text(buf.suggestion.text)
+            else:
+                buf.start_completion(select_first=True)
+
+        @kb.add("tab", filter=~has_focus(self.input_field))
+        @kb.add("s-tab")
+        def _tab_cycle_focus(event):
             """Cycle focus: input -> positions -> info pane -> input."""
             cur = event.app.layout.current_control
             cycle = [
@@ -8204,6 +8515,11 @@ class KCLILiveSession:
         @kb.add("escape", "3")
         @kb.add("f3")
         def _c3(event):
+            if not getattr(self, "oc_data", None):
+                ak = self.primary_api_key or (self.accounts[0]["api_key"] if self.accounts else "")
+                if ak:
+                    self.oc_context_mode = "weekly"
+                    self._run_coroutine_threadsafe(self._fetch_and_display_option_chain(ak, "NIFTY", expiry_week=0))
             self.info_mode = "oc"
             self._update_info_buffer()
             event.app.invalidate()

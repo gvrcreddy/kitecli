@@ -652,9 +652,17 @@ class KiteAccountManager(BaseBrokerManager):
             logger.error("Failed to fetch positions during exit for api_key=%s…", api_key[:8])
             raise RuntimeError(f"Failed to fetch positions: {exc}") from exc
 
+        # 2. Fetch existing orders to cancel any pending orders and prevent duplicate exits
+        existing_orders = []
+        try:
+            existing_orders = kite.orders() or []
+        except Exception as exc:
+            logger.warning("Failed to fetch open orders during exit for api_key=%s: %s", api_key[:8], exc)
+
+        PENDING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED"}
         orders_placed = []
 
-        # 2. Iterate and square off open positions
+        # 3. Iterate and square off open positions
         for pos in net_positions:
             qty = pos.get("quantity", 0)
             if qty == 0:
@@ -672,6 +680,25 @@ class KiteAccountManager(BaseBrokerManager):
             exit_qty = abs(qty)
             product = pos.get("product", "")
             exchange = pos.get("exchange", "")
+
+            # Cancel existing pending orders for this symbol before placing new exit order
+            cancelled_ids = []
+            for ord_item in existing_orders:
+                o_status = str(ord_item.get("status", "")).upper()
+                if o_status in PENDING_STATUSES:
+                    o_sym = str(ord_item.get("tradingsymbol", "")).upper()
+                    if o_sym == symbol.upper():
+                        oid = str(ord_item.get("order_id", ""))
+                        if oid and oid not in cancelled_ids:
+                            try:
+                                logger.info(
+                                    "Cancelling existing pending order #%s for %s before placing exit order",
+                                    oid, symbol
+                                )
+                                self.cancel_order(api_key, oid)
+                                cancelled_ids.append(oid)
+                            except Exception as c_exc:
+                                logger.warning("Could not cancel existing order #%s for %s: %s", oid, symbol, c_exc)
 
             logger.info(
                 "Square off position for account '%s': %s %d %s (%s)",
@@ -698,7 +725,8 @@ class KiteAccountManager(BaseBrokerManager):
                         "tradingsymbol": symbol,
                         "quantity": exit_qty,
                         "product": product,
-                        "order_id": order_id
+                        "order_id": order_id,
+                        "cancelled_order_ids": cancelled_ids,
                     })
             except Exception as exc:
                 logger.error(
@@ -710,7 +738,6 @@ class KiteAccountManager(BaseBrokerManager):
                 # Raise an error only if the targeted symbol exit failed completely
                 if tradingsymbol:
                     raise RuntimeError(f"Failed to place exit order for {symbol}: {exc}") from exc
-
 
         return orders_placed
 

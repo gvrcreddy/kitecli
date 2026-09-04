@@ -717,5 +717,89 @@ class TestApiClientBrokerRouting(unittest.TestCase):
             self.assertEqual(result["grand_total_day_change"], 700.0)
 
 
+class TestExitPositionsCancelsOpenOrders(unittest.TestCase):
+    """Test that exit_positions cancels existing open orders before placing exit orders."""
+
+    def test_kite_exit_positions_cancels_existing_open_orders(self):
+        from cli.kite_manager import KiteAccountManager
+        mgr = KiteAccountManager()
+        mock_kite = MagicMock()
+        mock_kite.positions.return_value = {
+            "net": [
+                {
+                    "tradingsymbol": "NIFTY2690824000CE",
+                    "quantity": 100,
+                    "product": "NRML",
+                    "exchange": "NFO",
+                }
+            ]
+        }
+        mock_kite.orders.return_value = [
+            {
+                "order_id": "ORD_STALE_1",
+                "status": "OPEN",
+                "tradingsymbol": "NIFTY2690824000CE",
+                "transaction_type": "SELL",
+            },
+            {
+                "order_id": "ORD_OTHER_2",
+                "status": "OPEN",
+                "tradingsymbol": "BANKNIFTY",
+                "transaction_type": "SELL",
+            },
+        ]
+        mock_kite.cancel_order.return_value = "ORD_STALE_1"
+        mock_kite.place_order.return_value = "NEW_EXIT_ORD"
+
+        mgr._clients["k1"] = mock_kite
+        mgr._authenticated["k1"] = True
+
+        orders = mgr.exit_positions("k1", "NIFTY2690824000CE", price=120.0)
+
+        # 1. Stale open order for NIFTY must be cancelled
+        mock_kite.cancel_order.assert_called_once_with(
+            variety=mock_kite.VARIETY_REGULAR,
+            order_id="ORD_STALE_1",
+        )
+        # 2. Placed exit order details
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["tradingsymbol"], "NIFTY2690824000CE")
+        self.assertEqual(orders[0]["order_id"], "NEW_EXIT_ORD")
+        self.assertEqual(orders[0]["cancelled_order_ids"], ["ORD_STALE_1"])
+
+    def test_kotak_exit_positions_cancels_existing_open_orders(self):
+        from cli.kotak_manager import KotakAccountManager
+        mgr = KotakAccountManager()
+        mgr._clients["k1"] = MagicMock()
+        mgr._authenticated["k1"] = True
+
+        # Mock get_positions and get_orders
+        mgr.get_positions = MagicMock(return_value=[
+            {
+                "tradingsymbol": "NIFTY2690824000PE",
+                "quantity": 75,
+                "product": "NRML",
+                "exchange": "NFO",
+            }
+        ])
+        mgr.get_orders = MagicMock(return_value=[
+            {
+                "order_id": "KOTAK_ORD_99",
+                "status": "OPEN",
+                "tradingsymbol": "NIFTY2690824000PE",
+                "transaction_type": "SELL",
+            }
+        ])
+        mgr.cancel_order = MagicMock(return_value="KOTAK_ORD_99")
+        mgr.place_order = MagicMock(return_value=["KOTAK_NEW_EXIT"])
+
+        orders = mgr.exit_positions("k1", "NIFTY2690824000PE", price=None)
+
+        mgr.cancel_order.assert_called_once_with("k1", "KOTAK_ORD_99")
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["cancelled_order_ids"], ["KOTAK_ORD_99"])
+        self.assertEqual(orders[0]["order_id"], "KOTAK_NEW_EXIT")
+
+
 if __name__ == "__main__":
     unittest.main()

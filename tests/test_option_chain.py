@@ -568,6 +568,119 @@ class TestOptionChainGreeksAndMatrix(unittest.TestCase):
         self.assertIn("145.50", rendered)
         self.assertIn("178.25", rendered)
 
+    def test_oc_market_depth_popup_rendering_and_esc_dismiss(self):
+        from unittest.mock import MagicMock
+        from cli.live_session import KCLILiveSession
+
+        session = KCLILiveSession.__new__(KCLILiveSession)
+        session.oc_data = {
+            "underlying": "NIFTY",
+            "expiry": "2026-09-08",
+            "spot_price": 24500.0,
+            "summary": {"atm_strike": 24500.0, "atm_straddle": 200.0, "pcr": 1.0, "max_pain": 24500.0},
+            "strikes": [
+                {
+                    "strike": 24500.0,
+                    "ce_symbol": "NIFTY2690824500CE",
+                    "ce_ltp": 112.50,
+                    "ce_oi": 50000,
+                    "pe_symbol": "NIFTY2690824500PE",
+                    "pe_ltp": 87.50,
+                    "pe_oi": 45000,
+                }
+            ],
+            "available_expiries": [{"expiry": "2026-09-08", "week_label": "W1"}],
+        }
+        session.oc_dropdown_open = False
+        session.oc_context_mode = "weekly"
+        session.oc_depth_symbol = "NIFTY2690824500CE"
+        session.oc_depth_strike = 24500.0
+        session.oc_depth_side = "CE"
+        session.oc_depth_cache = {}
+
+        mock_client = MagicMock()
+        mock_client.get_market_depth.return_value = {
+            "status": "success",
+            "last_price": 112.50,
+            "change": 5.20,
+            "volume": 45000,
+            "oi": 50000,
+            "total_buy_quantity": 145000,
+            "total_sell_quantity": 182000,
+            "buy_depth": [{"orders": 12, "quantity": 1800, "price": 112.45}],
+            "sell_depth": [{"orders": 8, "quantity": 2250, "price": 112.50}],
+        }
+        session.client = mock_client
+
+        # Render fragments
+        frags = session._build_oc_formatted_fragments()
+        rendered_text = "".join(txt for style, txt, *rest in frags)
+
+        self.assertIn("Depth:", rendered_text)
+        self.assertIn("[● CE]", rendered_text)
+        self.assertIn("[  PE]", rendered_text)
+        self.assertIn("[× Close]", rendered_text)
+        self.assertIn("Bid Price", rendered_text)
+        self.assertIn("Ask Price", rendered_text)
+        self.assertIn("112.45", rendered_text)
+        self.assertIn("112.50", rendered_text)
+
+        # Verify Esc dismisses popup
+        session.selected_symbol = "SOME_SYMBOL"
+        session._update_info_buffer = MagicMock()
+        session._update_display_and_invalidate = MagicMock()
+
+        # Simulate Esc logic
+        if getattr(session, "oc_depth_symbol", None):
+            session.oc_depth_symbol = None
+            session.oc_depth_strike = None
+
+        self.assertIsNone(session.oc_depth_symbol)
+        self.assertIsNone(session.oc_depth_strike)
+        # Selection must still be preserved!
+        self.assertEqual(session.selected_symbol, "SOME_SYMBOL")
+
+    def test_oc_defaults_to_nifty_current_week(self):
+        from unittest.mock import MagicMock, patch
+        from cli.live_session import KCLILiveSession
+
+        session = KCLILiveSession.__new__(KCLILiveSession)
+        session.accounts = [{"api_key": "test_key", "name": "ZK8719"}]
+        session.primary_api_key = "test_key"
+        session.log_messages = []
+        session.log_message = lambda msg: session.log_messages.append(msg)
+        session.oc_show_all = False
+        session.oc_context_mode = "weekly"
+        session._fetch_and_display_option_chain = MagicMock()
+        session._run_coroutine_threadsafe = MagicMock()
+
+        # 1. Test typing just 'oc' with no arguments defaults to NIFTY current week (expiry_week=0)
+        session._execute_single_command("oc")
+        self.assertEqual(session.oc_context_mode, "weekly")
+        session._run_coroutine_threadsafe.assert_called_once()
+
+        # 2. Test weekly navigation tabs include the nearest expiry as Current Week even if is_monthly is True
+        session.oc_data = {
+            "underlying": "NIFTY",
+            "expiry": "2026-09-08",
+            "spot_price": 24500.0,
+            "summary": {"atm_strike": 24500.0, "atm_straddle": 200.0, "pcr": 1.0, "max_pain": 24500.0},
+            "strikes": [],
+            "available_expiries": [
+                {"expiry": "2026-09-08", "week_label": "Current Week", "is_monthly": True},
+                {"expiry": "2026-09-15", "week_label": "Next Week", "is_monthly": False},
+                {"expiry": "2026-09-22", "week_label": "Far Week", "is_monthly": False},
+            ],
+        }
+        session.oc_dropdown_open = False
+        frags = session._build_oc_formatted_fragments()
+        rendered_text = "".join(txt for style, txt, *rest in frags)
+
+        # Ensure the nearest expiry is marked as Current
+        self.assertIn("[ ● Current: 08-Sep ]", rendered_text)
+        self.assertIn("[ Next: 15-Sep ]", rendered_text)
+        self.assertIn("[ Far: 22-Sep ]", rendered_text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -463,12 +463,19 @@ class KCLIClient:
                 }
             try:
                 orders = mgr.exit_positions(api_key, tradingsymbol, price)
+                all_cancelled = []
+                for o in orders:
+                    if isinstance(o, dict) and o.get("cancelled_order_ids"):
+                        for cid in o["cancelled_order_ids"]:
+                            if cid not in all_cancelled:
+                                all_cancelled.append(cid)
                 return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "status": "success",
                     "message": f"Exited {len(orders)} position(s)",
                     "orders_placed": orders,
+                    "orders_cancelled": all_cancelled,
                 }
             except Exception as exc:
                 return {

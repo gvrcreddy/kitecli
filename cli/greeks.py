@@ -322,9 +322,8 @@ def calculate_greeks(
             r=risk_free_rate,
             forward_price=F,
         )
-        if not solved_iv or solved_iv <= 0:
-            return {"delta": None, "gamma": None, "theta": None, "vega": None, "iv": None}
-        eff_vix = solved_iv
+        if solved_iv and solved_iv > 0:
+            eff_vix = solved_iv
 
     sigma = max(eff_vix / 100.0, 0.01)
     df = math.exp(-risk_free_rate * T)

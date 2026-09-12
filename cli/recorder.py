@@ -457,9 +457,9 @@ class DataRecorder:
             ts = item.get("timestamp")
             user_id = item.get("user_id")
             indices = item.get("index_values", {})
-            nifty = indices.get("nifty")
-            sensex = indices.get("sensex")
-            vix = indices.get("vix")
+            nifty = indices.get("nifty") if indices.get("nifty") is not None else indices.get("NIFTY")
+            sensex = indices.get("sensex") if indices.get("sensex") is not None else indices.get("SENSEX")
+            vix = indices.get("vix") if indices.get("vix") is not None else (indices.get("INDIA VIX") or indices.get("VIX"))
 
             if item_type == "order":
                 o = item.get("order_data", {})
@@ -534,7 +534,7 @@ class DataRecorder:
                 account_name = item.get("account_name")
 
                 chg = item.get("charges", {})
-                oid_str = str(o.get("order_id", "")).strip()
+                oid_str = str(o.get("order_id") or o.get("nOrdNo") or "").strip()
                 if oid_str:
                     cursor.execute("DELETE FROM executed_order_context WHERE order_id = ?;", (oid_str,))
 
@@ -559,20 +559,20 @@ class DataRecorder:
                         ts,
                         user_id,
                         account_name,
-                        str(o.get("order_id", "")),
-                        o.get("tradingsymbol", ""),
-                        o.get("exchange", ""),
-                        ("BUY" if str(o.get("transaction_type", "")).upper() in ("B", "BUY") else ("SELL" if str(o.get("transaction_type", "")).upper() in ("S", "SELL") else str(o.get("transaction_type", "")).upper())),
-                        int(o.get("quantity", 0)),
-                        float(o.get("average_price") or o.get("price") or 0.0),
+                        oid_str,
+                        o.get("tradingsymbol") or o.get("trdSym", ""),
+                        o.get("exchange", "NFO"),
+                        ("BUY" if str(o.get("transaction_type") or o.get("trnsTp", "")).upper() in ("B", "BUY") else ("SELL" if str(o.get("transaction_type") or o.get("trnsTp", "")).upper() in ("S", "SELL") else str(o.get("transaction_type", "")).upper())),
+                        int(o.get("filled_quantity") or o.get("quantity", 0)),
+                        float(o.get("average_price") or o.get("price") or o.get("avgPrc") or 0.0),
                         o.get("status", "COMPLETE"),
                         g.get("delta"),
                         g.get("gamma"),
                         g.get("theta"),
                         g.get("vega"),
                         g.get("iv"),
-                        m.get("margin_net"),
-                        m.get("margin_cash"),
+                        m.get("margin_net") if m.get("margin_net") is not None else m.get("net"),
+                        m.get("margin_cash") if m.get("margin_cash") is not None else (m.get("cash") or m.get("available_cash")),
                         nifty,
                         vix,
                         ind.get("nifty_ema_9"),
@@ -859,6 +859,8 @@ class DataRecorder:
             conn.commit()
             return sched_id
 
+    insert_scheduled_order = save_scheduled_order
+
     def get_pending_scheduled_orders(self) -> list[dict[str, Any]]:
         """Fetch all PENDING scheduled orders."""
         with self.get_connection() as conn:
@@ -932,6 +934,52 @@ class DataRecorder:
             count = cursor.rowcount
             conn.commit()
             return count > 0
+
+    def update_scheduled_order(
+        self,
+        sched_id: int,
+        trigger_time: Optional[str] = None,
+        price: Optional[float] = None,
+        quantity: Optional[str] = None,
+        command_raw: Optional[str] = None,
+    ) -> bool:
+        """Update fields of a pending scheduled order."""
+        fields = []
+        params = []
+        if trigger_time is not None:
+            fields.append("trigger_time = ?")
+            params.append(trigger_time)
+        if price is not None:
+            fields.append("price = ?")
+            params.append(price)
+        if quantity is not None:
+            fields.append("quantity = ?")
+            params.append(quantity)
+        if command_raw is not None:
+            fields.append("command_raw = ?")
+            params.append(command_raw)
+
+        if not fields:
+            return False
+
+        params.append(sched_id)
+        query = f"UPDATE scheduled_orders SET {', '.join(fields)} WHERE id = ? AND status = 'PENDING';"
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(query, tuple(params))
+            count = cursor.rowcount
+            conn.commit()
+            return count > 0
+
+    def get_scheduled_order_by_id(self, sched_id: int) -> Optional[dict[str, Any]]:
+        """Retrieve a specific scheduled order by ID."""
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM scheduled_orders WHERE id = ?;", (sched_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
 
     def cancel_all_scheduled_orders(self) -> int:
         """Cancel all pending scheduled orders."""

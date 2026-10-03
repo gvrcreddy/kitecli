@@ -69,6 +69,7 @@ class KiteAccountManager(BaseBrokerManager):
         self._proxies: dict[str, dict] = {}  # per-account proxy dicts for requests.Session
         self._nfo_lot_size_cache: dict[str, int] = {}  # fetched once, reused across calls
         self._nfo_symbol_token_cache: dict[str, int] = {}  # tradingsymbol -> instrument_token map
+        self._nfo_exchange_token_cache: dict[str, str] = {}  # tradingsymbol -> exchange_token map
 
     # ── public init helpers (named with _by_key suffix to avoid ABC clash) ────
 
@@ -836,7 +837,16 @@ class KiteAccountManager(BaseBrokerManager):
 
         kite = self._clients.get(api_key)
         if not kite:
-            raise ValueError(f"Account not found for api_key={api_key[:8]}…")
+            for k in self.get_all_account_keys():
+                if self.is_authenticated(k):
+                    kite = self._clients.get(k)
+                    api_key = k
+                    break
+            if not kite and self._clients:
+                api_key, kite = next(iter(self._clients.items()))
+
+        if not kite:
+            raise ValueError(f"Account not found for api_key={api_key[:8] if api_key else 'None'}…")
 
         if not self.is_authenticated(api_key):
             raise RuntimeError(
@@ -844,10 +854,23 @@ class KiteAccountManager(BaseBrokerManager):
             )
 
         underlying = underlying.upper().strip()
-        logger.info("Fetching NFO instruments for option chain (%s)…", underlying)
+        # Normalize aliases
+        if underlying in ("SENSEX 30", "BSE:SENSEX", "BSESENSEX"):
+            underlying = "SENSEX"
+        elif underlying in ("NIFTY 50", "NSE:NIFTY 50", "NIFTY50"):
+            underlying = "NIFTY"
+        elif underlying in ("NIFTY BANK", "NSE:NIFTY BANK", "BANK NIFTY"):
+            underlying = "BANKNIFTY"
+        elif underlying in ("NIFTY FIN SERVICE", "NSE:NIFTY FIN SERVICE", "FIN NIFTY"):
+            underlying = "FINNIFTY"
+        elif underlying in ("NIFTY MID SELECT", "NSE:NIFTY MID SELECT", "MIDCAP NIFTY"):
+            underlying = "MIDCPNIFTY"
 
-        # Fetch full NFO instrument list
-        instruments = kite.instruments("NFO")
+        opt_exchange = "BFO" if underlying in ("SENSEX", "BANKEX", "SENSEX50") else "NFO"
+        logger.info("Fetching %s instruments for option chain (%s)…", opt_exchange, underlying)
+
+        # Fetch instrument list for derivative exchange
+        instruments = kite.instruments(opt_exchange)
 
         # Filter to options (CE/PE) for the requested underlying
         options = [
@@ -856,6 +879,21 @@ class KiteAccountManager(BaseBrokerManager):
             and inst.get("instrument_type") in ("CE", "PE")
         ]
 
+        if not options and opt_exchange == "NFO":
+            # Fallback: check BFO if not found in NFO
+            try:
+                bfo_insts = kite.instruments("BFO")
+                bfo_options = [
+                    inst for inst in bfo_insts
+                    if inst.get("name", "").upper() == underlying
+                    and inst.get("instrument_type") in ("CE", "PE")
+                ]
+                if bfo_options:
+                    options = bfo_options
+                    opt_exchange = "BFO"
+            except Exception as bfo_err:
+                logger.debug("BFO fallback check error: %s", bfo_err)
+
         if not options:
             return {
                 "underlying": underlying,
@@ -863,8 +901,8 @@ class KiteAccountManager(BaseBrokerManager):
                 "strikes": [],
                 "available_expiries": [],
                 "status": "error",
-                "message": f"No options found for underlying '{underlying}' in NFO. "
-                           f"Check the name (e.g. NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY).",
+                "message": f"No options found for underlying '{underlying}' in {opt_exchange}. "
+                           f"Check the name (e.g. NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX).",
             }
 
         # Collect all unique expiry dates (sorted ascending)
@@ -915,21 +953,29 @@ class KiteAccountManager(BaseBrokerManager):
             if is_monthly:
                 m_idx = sorted_monthly.index(exp)
                 if m_idx == 0:
-                    month_desc = f"Current Month ({month_name})"
+                    month_desc = f"Current Month ({month_name} {exp.year})"
                 elif m_idx == 1:
-                    month_desc = f"Next Month ({month_name})"
+                    month_desc = f"Next Month ({month_name} {exp.year})"
                 elif m_idx == 2:
-                    month_desc = f"Far Month ({month_name})"
+                    month_desc = f"Far Month ({month_name} {exp.year})"
                 else:
-                    month_desc = f"{month_name} Monthly"
+                    month_desc = f"{month_name} {exp.year} Monthly"
 
-            label = f"{month_desc}" if is_monthly and i >= 2 else f"{week_desc} ({month_name} Monthly)" if is_monthly else week_desc
+            date_str = exp.strftime("%d-%b-%Y")
+            if is_monthly:
+                if i >= 2:
+                    label = f"{month_desc} ({date_str})"
+                else:
+                    label = f"{week_desc} ({month_desc}, {date_str})"
+            else:
+                label = f"{week_desc} ({date_str})"
 
             available_expiries.append({
                 "expiry": exp.isoformat(),
                 "week_label": label,
                 "week_desc": week_desc,
                 "month_desc": month_desc,
+                "formatted_date": date_str,
                 "is_monthly": is_monthly,
             })
 
@@ -1010,9 +1056,9 @@ class KiteAccountManager(BaseBrokerManager):
         all_symbols = [spot_symbol]
         for s in strikes:
             if s.get("ce_symbol"):
-                all_symbols.append(f"NFO:{s['ce_symbol']}")
+                all_symbols.append(f"{opt_exchange}:{s['ce_symbol']}")
             if s.get("pe_symbol"):
-                all_symbols.append(f"NFO:{s['pe_symbol']}")
+                all_symbols.append(f"{opt_exchange}:{s['pe_symbol']}")
 
         quote_data: dict = {}
         if all_symbols:
@@ -1036,8 +1082,8 @@ class KiteAccountManager(BaseBrokerManager):
 
         # Enrich each strike entry with live LTP, instrument tokens, OI, and volume
         for s in strikes:
-            ce_key = f"NFO:{s.get('ce_symbol', '')}"
-            pe_key = f"NFO:{s.get('pe_symbol', '')}"
+            ce_key = f"{opt_exchange}:{s.get('ce_symbol', '')}"
+            pe_key = f"{opt_exchange}:{s.get('pe_symbol', '')}"
             if ce_key in quote_data:
                 q = quote_data[ce_key]
                 s["ce_ltp"] = q.get("last_price")
@@ -1255,6 +1301,11 @@ class KiteAccountManager(BaseBrokerManager):
                             for inst in instruments
                             if inst.get("tradingsymbol") and inst.get("instrument_token")
                         }
+                        self._nfo_exchange_token_cache = {
+                            inst["tradingsymbol"]: str(inst["exchange_token"])
+                            for inst in instruments
+                            if inst.get("tradingsymbol") and inst.get("exchange_token")
+                        }
                         return self._nfo_lot_size_cache
                     except Exception as exc:
                         logger.warning("get_nfo_lot_sizes failed: %s", exc)
@@ -1267,6 +1318,13 @@ class KiteAccountManager(BaseBrokerManager):
             return self._nfo_symbol_token_cache
         self.get_nfo_lot_sizes()
         return self._nfo_symbol_token_cache
+
+    def get_nfo_exchange_token_map(self) -> dict[str, str]:
+        """Return tradingsymbol → exchange_token (NSE exchange token) map for NFO instruments."""
+        if hasattr(self, "_nfo_exchange_token_cache") and self._nfo_exchange_token_cache:
+            return self._nfo_exchange_token_cache
+        self.get_nfo_lot_sizes()
+        return getattr(self, "_nfo_exchange_token_cache", {})
 
     def get_market_indices(self) -> dict[str, Any]:
         # 1. Try Kite ohlc first for last_price and yesterday's close
@@ -1380,12 +1438,6 @@ class KiteAccountManager(BaseBrokerManager):
             return {"status": "error", "message": "Empty margin response from Zerodha"}
         except Exception as exc:
             logger.warning("Zerodha order_margins fetch failed for %s: %s", tradingsymbol, exc)
-            if price and price > 0 and transaction_type.upper() == "BUY":
-                return {
-                    "status": "success",
-                    "total": round(abs(quantity) * price, 2),
-                    "is_estimated": True,
-                }
             return {"status": "error", "message": str(exc)}
 
     def get_market_depth(self, symbol: str) -> dict[str, Any]:

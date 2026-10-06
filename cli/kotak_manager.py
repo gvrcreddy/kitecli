@@ -132,6 +132,7 @@ class KotakAccountManager(BaseBrokerManager):
         import threading as _threading
         self._auth_lock = _threading.Lock()
         self._last_login_time: dict[str, float] = {}
+        self._symbol_to_token: dict[str, str] = {}
 
     # ── account lifecycle ──────────────────────────────────────────────────────
 
@@ -348,8 +349,23 @@ class KotakAccountManager(BaseBrokerManager):
 
         return ""  # no login URL for Kotak
 
+    def _resolve_account_key(self, account_key: str) -> str:
+        """Resolve consumer_key if account_key is an account name or UCC."""
+        if not account_key:
+            return account_key
+        if account_key in self._credentials or account_key in self._clients:
+            return account_key
+        for ckey, info in self._credentials.items():
+            if info.get("ucc") == account_key:
+                return ckey
+        for ckey, name in self._account_names.items():
+            if name == account_key:
+                return ckey
+        return account_key
+
     def auto_login(self, account_key: str, **_kwargs) -> bool:
         """Perform TOTP-based auto-login for the Kotak account."""
+        account_key = self._resolve_account_key(account_key)
         import time
         with self._auth_lock:
             # Debounce: if we just logged in within the last 15 seconds, skip re-login.
@@ -572,8 +588,12 @@ class KotakAccountManager(BaseBrokerManager):
                 else 0.0
             )
 
+            trd_sym = pos.get("trdSym", pos.get("tradingsymbol", ""))
+            if tok and trd_sym:
+                self._symbol_to_token[str(trd_sym).strip().upper()] = str(tok)
+
             result.append({
-                "tradingsymbol": pos.get("trdSym", pos.get("tradingsymbol", "")),
+                "tradingsymbol": trd_sym,
                 "quantity": qty,
                 "average_price": avg_price,
                 "last_price": last_price,
@@ -656,25 +676,39 @@ class KotakAccountManager(BaseBrokerManager):
             except ValueError:
                 price = 0.0
 
-            ord_ts_str = str(ord.get("ordDtTm") or ord.get("ordEntTm") or ord.get("ordTm") or ord.get("order_timestamp") or ord.get("exchange_timestamp") or "")
+            tok = str(ord.get("tok", ""))
+            trd_sym = ord.get("trdSym", ord.get("tradingsymbol", ""))
+            if tok and trd_sym:
+                self._symbol_to_token[str(trd_sym).strip().upper()] = tok
+
+            raw_tt = str(ord.get("trnsTp", ord.get("transaction_type", ""))).upper()
+            tt_map = {"B": "BUY", "S": "SELL", "BUY": "BUY", "SELL": "SELL"}
+            transaction_type = tt_map.get(raw_tt, raw_tt)
+
+            raw_ot = str(ord.get("prcTp", ord.get("order_type", "MARKET"))).upper()
+            ot_map = {"L": "LIMIT", "M": "MARKET", "SL": "SL", "SL-M": "SL-M", "LIMIT": "LIMIT", "MARKET": "MARKET"}
+            order_type = ot_map.get(raw_ot, raw_ot)
+
+            ord_ts_str = str(ord.get("ordDtTm") or ord.get("ordEntTm") or ord.get("order_timestamp") or "")
+            ex_ts_str = str(ord.get("exCfmTm") or ord.get("exchange_timestamp") or ord_ts_str or "")
 
             result.append({
                 "order_id": str(ord.get("nOrdNo", ord.get("order_id", ""))),
-                "tradingsymbol": ord.get("trdSym", ord.get("tradingsymbol", "")),
-                "transaction_type": str(ord.get("trnsTp", ord.get("transaction_type", ""))).upper(),
+                "tradingsymbol": trd_sym,
+                "transaction_type": transaction_type,
                 "quantity": quantity,
                 "filled_quantity": filled_quantity,
                 "pending_quantity": pending_quantity,
                 "price": price,
                 "average_price": average_price,
-                "order_type": str(ord.get("prcTp", ord.get("order_type", "MARKET"))).upper(),
+                "order_type": order_type,
                 "status": status,
                 "product": str(ord.get("prod", ord.get("product", "NRML"))).upper(),
                 "exchange": str(ord.get("exch", ord.get("exchange", "NFO"))).upper(),
-                "parent_order_id": str(ord.get("refLmtPrc", ord.get("parent_order_id", ""))) or None,
+                "parent_order_id": str(ord.get("parent_order_id", "")) or None,
                 "status_message": str(ord.get("rejRsn", ord.get("status_message", ""))),
                 "order_timestamp": ord_ts_str,
-                "exchange_timestamp": ord_ts_str,
+                "exchange_timestamp": ex_ts_str,
             })
 
         return result
@@ -690,16 +724,65 @@ class KotakAccountManager(BaseBrokerManager):
             _check_neo_error(resp)
             if isinstance(resp, dict):
                 data = resp.get("data", resp)
-                net = data.get("Net", data.get("net"))
-                cash = data.get("cash", data.get("Cash"))
-                collateral = data.get("Collateral", data.get("collateral"))
+                net_val = data.get("Net", data.get("net"))
+
+                # In Kotak Neo / Omnesys RMS limits:
+                # - 'CollateralValue' holds the unpledged cash balance / cash ledger (e.g. 187266.73).
+                # - 'RmsCollateral' holds pledged stock / mutual fund margin (e.g. 7387384.37).
+                # - 'Collateral' holds secondary/additional collateral (e.g. 684982.66).
+                # Gross Available Margin = RmsCollateral + Collateral + CollateralValue.
+                # Net = Gross Margin - MarginUsed.
+                cash_val = (
+                    data.get("CollateralValue")
+                    if data.get("CollateralValue") is not None
+                    else data.get("cash", data.get("Cash", data.get("AvailableCash", data.get("TradingBalance", data.get("NotionalCash")))))
+                )
+
                 try:
-                    net = float(net) if net is not None else None
-                    cash = float(cash) if cash is not None else None
-                    collateral = float(collateral) if collateral is not None else None
+                    net = float(net_val) if net_val is not None else None
                 except (ValueError, TypeError):
-                    pass
-                return {"net": net, "cash": cash, "collateral": collateral}
+                    net = None
+
+                # Compute total collateral from RmsCollateral + Collateral
+                rms_col = 0.0
+                if data.get("RmsCollateral") is not None:
+                    try:
+                        rms_col = float(data.get("RmsCollateral") or 0.0)
+                    except (ValueError, TypeError):
+                        rms_col = 0.0
+
+                sec_col = 0.0
+                if data.get("Collateral") is not None:
+                    try:
+                        sec_col = float(data.get("Collateral") or 0.0)
+                    except (ValueError, TypeError):
+                        sec_col = 0.0
+
+                collateral = rms_col + sec_col
+
+                try:
+                    if cash_val is not None and str(cash_val).strip() != "":
+                        cash = float(cash_val)
+                    elif net is not None:
+                        # Fallback if CollateralValue is absent
+                        cash = max(0.0, net - collateral) if (collateral and net > collateral) else net
+                    else:
+                        cash = None
+                except (ValueError, TypeError):
+                    cash = net
+
+                margin_used_val = data.get("MarginUsed", data.get("marginUsed", 0.0))
+                try:
+                    margin_used = float(margin_used_val) if margin_used_val is not None else 0.0
+                except (ValueError, TypeError):
+                    margin_used = 0.0
+
+                return {
+                    "net": net,
+                    "cash": cash,
+                    "collateral": collateral,
+                    "margin_used": margin_used,
+                }
         except Exception as exc:
             logger.warning("Kotak get_margins failed for key=%s…: %s", account_key[:8], exc)
 
@@ -942,7 +1025,7 @@ class KotakAccountManager(BaseBrokerManager):
         trigger_price: float | None = None,
     ) -> str:
         """Modify an open Kotak Neo order."""
-        account_key = api_key
+        account_key = self._resolve_account_key(api_key)
         client = self._clients.get(account_key)
         if not client:
             raise ValueError(f"Kotak account not found: key={account_key[:8]}…")
@@ -978,7 +1061,7 @@ class KotakAccountManager(BaseBrokerManager):
 
     def cancel_order(self, api_key: str, order_id: str) -> str:
         """Cancel an open Kotak Neo order."""
-        account_key = api_key
+        account_key = self._resolve_account_key(api_key)
         client = self._clients.get(account_key)
         if not client:
             raise ValueError(f"Kotak account not found: key={account_key[:8]}…")
@@ -1076,6 +1159,137 @@ class KotakAccountManager(BaseBrokerManager):
         if not client:
             raise ValueError(f"Kotak account not found: key={account_key[:8]}…")
         return KotakTicker(account_key, self.get_access_token(account_key), client)
+
+    def get_order_margin(
+        self,
+        account_key: str,
+        tradingsymbol: str,
+        transaction_type: str,
+        quantity: int,
+        price: float | None = None,
+        product: str = "NRML",
+        exchange: str = "NFO",
+        order_type: str = "LIMIT",
+    ) -> dict[str, Any]:
+        """Calculate margin required for Kotak Neo orders."""
+        client = self._clients.get(account_key)
+        if not client or not self.is_authenticated(account_key):
+            return {"status": "error", "message": "Kotak account not authenticated"}
+
+        # Normalize segment for Neo API validation
+        # Allowed: ['NSE', 'nse', 'BSE', 'bse', 'NFO', 'nfo', 'BFO', 'bfo', 'nse_cm', 'bse_cm', 'nse_fo', 'bse_fo']
+        exch_u = (exchange or "NFO").upper()
+        if exch_u in ("NFO", "NSE_FO"):
+            neo_segment = "nse_fo"
+        elif exch_u in ("BFO", "BSE_FO"):
+            neo_segment = "bse_fo"
+        elif exch_u in ("NSE", "NSE_CM", "NSE_EQ"):
+            neo_segment = "nse_cm"
+        elif exch_u in ("BSE", "BSE_CM", "BSE_EQ"):
+            neo_segment = "bse_cm"
+        else:
+            neo_segment = "nse_fo"
+
+        # Normalize product for Neo API validation
+        # Allowed: ['NRML', 'CNC', 'MIS', 'INTRADAY', 'CO', 'BO']
+        prod_u = (product or "NRML").upper()
+        neo_product = "NRML"
+        if prod_u in ("MIS", "INTRADAY"):
+            neo_product = "MIS"
+        elif prod_u in ("CNC", "CASH"):
+            neo_product = "CNC"
+
+        # Normalize order_type for Neo API validation
+        # Allowed: ['Limit', 'Market', 'L', 'MKT', 'SL', 'SL-M']
+        ot_u = (order_type or "LIMIT").upper()
+        neo_order_type = "MKT" if (ot_u == "MARKET" or price is None or price <= 0) else "L"
+
+        # Normalize transaction_type for Neo API validation
+        # Allowed: ['B', 'S', 'Buy', 'Sell', 'sell', 'buy']
+        tt_u = (transaction_type or "BUY").upper()
+        neo_trans_type = "B" if tt_u.startswith("B") else "S"
+
+        # Resolve numeric instrument token for tok parameter
+        token_str = ""
+        sym_clean = tradingsymbol.strip().upper()
+        # 1. Check cached tok from open positions or order report
+        if hasattr(self, "_symbol_to_token") and sym_clean in self._symbol_to_token:
+            token_str = str(self._symbol_to_token[sym_clean])
+
+        # 2. Check NFO exchange token from kite_manager or ataraxia instruments manager if available
+        if not token_str:
+            try:
+                from cli.api_client import _kite_manager
+                if hasattr(_kite_manager, "get_nfo_exchange_token_map"):
+                    token_str = str(_kite_manager.get_nfo_exchange_token_map().get(sym_clean, ""))
+                if not token_str and hasattr(_kite_manager, "get_nfo_symbol_token_map"):
+                    token_str = str(_kite_manager.get_nfo_symbol_token_map().get(sym_clean, ""))
+            except Exception:
+                pass
+
+        if not token_str:
+            try:
+                from backend.instruments_manager import get_instrument_details
+                det = get_instrument_details(sym_clean)
+                if det and det.get("exchange_token"):
+                    token_str = str(det["exchange_token"])
+            except Exception:
+                pass
+
+        p_val = price if price is not None and price > 0 else 0.0
+
+        if token_str and hasattr(client, "margin_required") and callable(getattr(client, "margin_required")):
+            try:
+                margin_resp = client.margin_required(
+                    exchange_segment=neo_segment,
+                    price=str(p_val),
+                    order_type=neo_order_type,
+                    product=neo_product,
+                    quantity=str(abs(quantity)),
+                    instrument_token=token_str,
+                    transaction_type=neo_trans_type,
+                )
+                logger.debug("Kotak margin_required raw response: %s", margin_resp)
+                data = margin_resp.get("data") if isinstance(margin_resp, dict) else margin_resp
+                if isinstance(data, list) and len(data) > 0:
+                    data = data[0]
+                if isinstance(data, dict):
+                    if data.get("stCode") not in (200, "200", None) and data.get("stat") not in ("Ok", "OK", "success", None):
+                        err_msg = str(data.get("errMsg") or data.get("stat") or "Kotak margin check failed")
+                        return {"status": "error", "message": err_msg, "detail": data}
+
+                    margin_val = (
+                        data.get("ordMrgn")
+                        or data.get("ordMrg")
+                        or data.get("margin")
+                        or data.get("totalMargin")
+                        or data.get("total")
+                        or data.get("marginRequired")
+                        or data.get("reqdMrgn")
+                    )
+                    if margin_val is not None:
+                        val = float(margin_val)
+                        return {
+                            "status": "success",
+                            "total": val,
+                            "span": float(data.get("spanMrg") or data.get("span") or 0.0),
+                            "exposure": float(data.get("expoMrg") or data.get("exposure") or 0.0),
+                            "detail": data,
+                        }
+                    if data.get("errMsg") or data.get("message"):
+                        return {"status": "error", "message": str(data.get("errMsg") or data.get("message")), "detail": data}
+            except Exception as exc:
+                logger.warning("Kotak SDK margin_required call failed: %s", exc)
+                return {"status": "error", "message": f"Kotak margin API call failed: {exc}"}
+
+        if not token_str:
+            return {"status": "error", "message": f"Instrument token not found for {sym_clean}"}
+
+        return {"status": "error", "message": "Failed to calculate margin from Kotak Neo API"}
+
+    def get_market_depth(self, symbol: str) -> dict[str, Any]:
+        """Fetch market depth for Kotak Neo. Returns error if not directly available."""
+        return {"status": "error", "message": "Market depth via Kotak Neo SDK is not supported; delegated to primary Kite manager."}
 
 
 def _dummy_callback(*args, **kwargs):
@@ -1358,50 +1572,4 @@ class KotakTicker:
                 if self.on_order_update:
                     self.on_order_update(self, norm_data)
 
-    def get_order_margin(
-        self,
-        account_key: str,
-        tradingsymbol: str,
-        transaction_type: str,
-        quantity: int,
-        price: float | None = None,
-        product: str = "NRML",
-        exchange: str = "NFO",
-        order_type: str = "LIMIT",
-    ) -> dict[str, Any]:
-        """Calculate margin required for Kotak Neo orders."""
-        client = self._clients.get(account_key)
-        if not client or not self.is_authenticated(account_key):
-            return {"status": "error", "message": "Kotak account not authenticated"}
-
-        try:
-            p_val = price if price is not None else 0.0
-            if hasattr(client, "margin_required") and callable(getattr(client, "margin_required")):
-                margin_resp = client.margin_required(
-                    exchange_segment=exchange,
-                    price=str(p_val),
-                    product=product,
-                    quantity=str(abs(quantity)),
-                    token=tradingsymbol,
-                    transaction_type=transaction_type.upper(),
-                )
-                if isinstance(margin_resp, dict) and "margin" in margin_resp:
-                    return {
-                        "status": "success",
-                        "total": float(margin_resp.get("margin", 0.0)),
-                    }
-        except Exception as exc:
-            logger.debug("Kotak SDK margin_required call failed: %s", exc)
-
-        if price and price > 0:
-            return {
-                "status": "success",
-                "total": round(abs(quantity) * price, 2),
-                "is_estimated": True,
-            }
-        return {"status": "error", "message": "Kotak margin estimation unavailable"}
-
-    def get_market_depth(self, symbol: str) -> dict[str, Any]:
-        """Fetch market depth for Kotak Neo. Returns error if not directly available."""
-        return {"status": "error", "message": "Market depth via Kotak Neo SDK is not supported; delegated to primary Kite manager."}
 

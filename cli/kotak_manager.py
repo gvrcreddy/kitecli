@@ -821,8 +821,13 @@ class KotakAccountManager(BaseBrokerManager):
             except (ValueError, TypeError):
                 t1_qty = 0.0
 
+            # Exclude F&O derivative contracts or negative/zero quantities from Demat holdings
+            inst_type_lower = str(h.get("instrumentType") or h.get("securityType") or "").strip().lower()
+            if inst_type_lower in ("options", "futures", "nsederv"):
+                continue
+
             total_qty = qty + t1_qty
-            if total_qty == 0:
+            if total_qty <= 0:
                 continue
 
             # Investment / buy cost
@@ -876,9 +881,32 @@ class KotakAccountManager(BaseBrokerManager):
             day_change = (ltp - close_price) * total_qty
             day_change_pct = ((ltp - close_price) / close_price * 100.0) if close_price > 0 else 0.0
 
-            symbol = str(h.get("displaySymbol") or h.get("symbol") or h.get("tradingSymbol") or h.get("tradingsymbol") or "")
-            exchange = str(h.get("exchangeSegment") or h.get("exchange") or h.get("exch") or "NSE").replace("_cm", "").upper()
-            isin = str(h.get("isin") or h.get("exchangeIdentifier") or "")
+            raw_sym = str(h.get("displaySymbol") or h.get("symbol") or h.get("tradingSymbol") or h.get("tradingsymbol") or "").strip()
+            inst_name = str(h.get("instrumentName") or "").strip()
+            isin = str(h.get("isin") or h.get("exchangeIdentifier") or "").strip()
+
+            # Mutual funds in Kotak Neo have empty symbol/displaySymbol, but contain "Fund Name|ISIN" in instrumentName
+            if not raw_sym:
+                if inst_name:
+                    if "|" in inst_name:
+                        parts = inst_name.split("|", 1)
+                        raw_sym = parts[0].strip()
+                        if not isin and len(parts) > 1 and parts[1].strip():
+                            isin = parts[1].strip()
+                    else:
+                        raw_sym = inst_name
+                elif h.get("commonScripCode"):
+                    raw_sym = str(h.get("commonScripCode")).strip()
+
+            symbol = raw_sym
+
+            exchange_seg = str(h.get("exchangeSegment") or h.get("exchange") or h.get("exch") or "").strip()
+            if inst_type_lower == "mutual fund" or str(h.get("subType") or "").strip().lower() == "mutual fund":
+                exchange = "MF"
+            elif exchange_seg:
+                exchange = exchange_seg.replace("_cm", "").upper()
+            else:
+                exchange = "NSE"
 
             result.append({
                 "tradingsymbol": symbol,

@@ -89,6 +89,10 @@ class KCLIClient:
                     proxy=acct.get("proxy"),
                 )
                 _account_manager_map[account_key] = mgr
+                if acct.get("name"):
+                    _account_manager_map[acct["name"]] = mgr
+                if acct.get("ucc"):
+                    _account_manager_map[acct["ucc"]] = mgr
                 # Ensure api_key field is populated for downstream code
                 acct.setdefault("api_key", account_key)
             else:
@@ -101,6 +105,10 @@ class KCLIClient:
                     proxy=acct.get("proxy"),
                 )
                 _account_manager_map[api_key] = _kite_manager
+                if acct.get("name"):
+                    _account_manager_map[acct["name"]] = _kite_manager
+                if acct.get("user_id"):
+                    _account_manager_map[acct["user_id"]] = _kite_manager
                 self._api_keys.append(api_key)
 
         with ThreadPoolExecutor(max_workers=max(1, len(accounts))) as executor:
@@ -493,15 +501,32 @@ class KCLIClient:
 
     def get_option_chain(
         self,
-        api_key: str,
-        underlying: str,
+        api_key: str | None = None,
+        underlying: str = "NIFTY",
         expiry_week: int = 0,
         expiry_date: str | None = None,
     ) -> dict:
-        """Fetch option chain for a specific underlying and expiry."""
+        """Fetch option chain for a specific underlying and expiry.
+        
+        Falls back to the configured primary account (primary: true in config)
+        if api_key is missing or belongs to a non-Zerodha broker.
+        """
+        target_key = api_key
+        if not target_key or target_key not in getattr(_kite_manager, "_clients", {}):
+            # Resolve primary Zerodha account from config
+            for a in self._accounts:
+                if a.get("primary") is True and str(a.get("broker", "zerodha")).lower() == "zerodha":
+                    target_key = a.get("api_key")
+                    break
+            if not target_key or target_key not in getattr(_kite_manager, "_clients", {}):
+                for a in self._accounts:
+                    if str(a.get("broker", "zerodha")).lower() == "zerodha" and a.get("api_key") in getattr(_kite_manager, "_clients", {}):
+                        target_key = a.get("api_key")
+                        break
+
         try:
             return _manager.get_option_chain(
-                api_key=api_key,
+                api_key=target_key,
                 underlying=underlying,
                 expiry_week=expiry_week,
                 expiry_date=expiry_date,
@@ -656,6 +681,10 @@ class KCLIClient:
         """Fetch NFO tradingsymbol → instrument_token map."""
         return _kite_manager.get_nfo_symbol_token_map()
 
+    def get_nfo_exchange_token_map(self) -> dict:
+        """Fetch NFO tradingsymbol → exchange_token map."""
+        return _kite_manager.get_nfo_exchange_token_map()
+
     def get_market_indices(self) -> dict:
         """Fetch live Nifty, Sensex, and India VIX."""
         return _kite_manager.get_market_indices()
@@ -667,11 +696,18 @@ class KCLIClient:
         def fetch_one(api_key):
             mgr = _manager_for(api_key)
             result = mgr.get_margins(api_key)
+            acct_cfg = next(
+                (a for a in self._accounts if a.get("api_key") == api_key or a.get("consumer_key") == api_key or a.get("name") == api_key),
+                {}
+            )
             return {
                 "api_key": api_key,
+                "name": acct_cfg.get("name", api_key),
                 "net": result["net"],
                 "cash": result["cash"],
-                "collateral": result.get("collateral")
+                "collateral": result.get("collateral"),
+                "collateral_equity": result.get("collateral_equity"),
+                "collateral_liquid": result.get("collateral_liquid"),
             }
 
         with ThreadPoolExecutor(max_workers=max(1, len(keys))) as executor:

@@ -15,6 +15,8 @@ import pandas as pd
 logger = logging.getLogger("kitecli.indicators")
 
 CACHE_PATH = Path.home() / ".kcli" / "nifty_daily.json"
+_MEM_CLOSES_CACHE: dict[tuple[str, str], List[float]] = {}
+_MEM_IND_CACHE: dict[tuple[str, str, float], Dict[str, Optional[float]]] = {}
 
 
 def get_cached_daily_closes() -> tuple[Optional[str], List[float]]:
@@ -23,6 +25,11 @@ def get_cached_daily_closes() -> tuple[Optional[str], List[float]]:
     Returns:
         (last_updated_date, daily_closes_list)
     """
+    today_str = date.today().isoformat()
+    cache_key = (str(CACHE_PATH), today_str)
+    if cache_key in _MEM_CLOSES_CACHE:
+        return today_str, _MEM_CLOSES_CACHE[cache_key]
+
     if not CACHE_PATH.exists():
         return None, []
 
@@ -31,6 +38,8 @@ def get_cached_daily_closes() -> tuple[Optional[str], List[float]]:
             data = json.load(f)
             last_date = data.get("last_updated_date")
             closes = data.get("daily_closes", [])
+            if last_date == today_str and len(closes) >= 20:
+                _MEM_CLOSES_CACHE[cache_key] = closes
             return last_date, closes
     except Exception as exc:
         logger.warning("Failed to read nifty_daily.json cache: %s", exc)
@@ -41,6 +50,7 @@ def save_cached_daily_closes(daily_closes: List[float]) -> None:
     """Save daily close prices to ~/.kcli/nifty_daily.json with today's date."""
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     today_str = date.today().isoformat()
+    _MEM_CLOSES_CACHE[(str(CACHE_PATH), today_str)] = daily_closes
     try:
         with open(CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump({
@@ -139,6 +149,11 @@ def calculate_daily_indicators(
     if live_nifty_spot <= 0:
         return empty_res
 
+    today_str = date.today().isoformat()
+    ind_key = (str(CACHE_PATH), today_str, round(float(live_nifty_spot), 1))
+    if ind_key in _MEM_IND_CACHE:
+        return dict(_MEM_IND_CACHE[ind_key])
+
     # Append live Nifty spot as today's forming daily close
     all_closes = historical_closes + [live_nifty_spot]
     df = pd.DataFrame({"close": all_closes})
@@ -186,7 +201,7 @@ def calculate_daily_indicators(
     def _clean_val(v, decimals=2):
         return round(float(v), decimals) if pd.notna(v) else None
 
-    return {
+    res = {
         "nifty_ema_9": _clean_val(latest["ema_9"]),
         "nifty_sma_20": _clean_val(latest["sma_20"]),
         "nifty_sma_50": _clean_val(latest["sma_50"]),
@@ -206,3 +221,5 @@ def calculate_daily_indicators(
         "nifty_ret_5d_pct": _clean_val(latest["ret_5d_pct"]),
         "nifty_ret_20d_pct": _clean_val(latest["ret_20d_pct"]),
     }
+    _MEM_IND_CACHE[ind_key] = res
+    return dict(res)

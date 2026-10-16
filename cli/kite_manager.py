@@ -566,9 +566,7 @@ class KiteAccountManager(BaseBrokerManager):
                 total_legs, legs, self.FREEZE_QTY_LIMIT,
             )
 
-        order_ids: list[str] = []
-        for i, leg_qty in enumerate(legs):
-            # Build order parameters
+        def _place_single_leg(idx: int, leg_qty: int) -> str:
             params = {
                 "variety": kite.VARIETY_REGULAR,
                 "exchange": exchange,
@@ -588,7 +586,7 @@ class KiteAccountManager(BaseBrokerManager):
             if trigger_price is not None and trigger_price > 0:
                 params["trigger_price"] = trigger_price
 
-            leg_desc = f" (leg {i + 1}/{total_legs})" if total_legs > 1 else ""
+            leg_desc = f" (leg {idx + 1}/{total_legs})" if total_legs > 1 else ""
             logger.info(
                 "Placing %s %s order for %d %s on %s (%s) for account '%s'%s",
                 order_type,
@@ -602,17 +600,35 @@ class KiteAccountManager(BaseBrokerManager):
             )
 
             try:
-                order_id = kite.place_order(**params)
-                order_ids.append(str(order_id))
+                oid = kite.place_order(**params)
+                return str(oid)
             except Exception as exc:
                 logger.error(
                     "Failed to place order%s for api_key=%s…: %s",
                     leg_desc, api_key[:8], exc,
                 )
-                raise RuntimeError(
-                    f"Failed to place order{leg_desc}: {exc}"
-                    + (f" ({len(order_ids)}/{total_legs} legs placed successfully)" if total_legs > 1 else "")
-                ) from exc
+                raise RuntimeError(f"Failed to place order{leg_desc}: {exc}") from exc
+
+        if total_legs <= 1:
+            return [_place_single_leg(0, legs[0])] if legs else []
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        order_ids: list[str] = []
+        first_err: Exception | None = None
+        with ThreadPoolExecutor(max_workers=total_legs) as pool:
+            futures = [pool.submit(_place_single_leg, i, q) for i, q in enumerate(legs)]
+            for fut in futures:
+                try:
+                    order_ids.append(fut.result())
+                except Exception as exc:
+                    if first_err is None:
+                        first_err = exc
+
+        if first_err is not None:
+            raise RuntimeError(
+                f"{first_err} ({len(order_ids)}/{total_legs} legs placed successfully)"
+            ) from first_err
 
         return order_ids
 
@@ -1163,12 +1179,31 @@ class KiteAccountManager(BaseBrokerManager):
             data = kite.margins(segment="equity")
             net = data.get("net")
             # live_balance is the real-time available cash, not the stale opening_balance
-            cash = data.get("available", {}).get("live_balance")
-            collateral = data.get("available", {}).get("collateral")
-            return {"net": net, "cash": cash, "collateral": collateral}
+            avail = data.get("available", {})
+            utilised = data.get("utilised", {})
+            cash = avail.get("live_balance") if avail.get("live_balance") is not None else avail.get("cash")
+            collateral = avail.get("collateral")
+            collat_eq = utilised.get("stock_collateral")
+            collat_liq = utilised.get("liquid_collateral")
+            if collat_eq is None and collat_liq is None and collateral:
+                collat_eq = collateral
+                collat_liq = 0.0
+            return {
+                "net": net,
+                "cash": cash,
+                "collateral": collateral,
+                "collateral_equity": collat_eq,
+                "collateral_liquid": collat_liq,
+            }
         except Exception as exc:
             logger.warning("get_margins failed for api_key=%s…: %s", api_key[:8], exc)
-            return {"net": None, "cash": None, "collateral": None}
+            return {
+                "net": None,
+                "cash": None,
+                "collateral": None,
+                "collateral_equity": None,
+                "collateral_liquid": None,
+            }
 
     def get_holdings(self, api_key: str) -> list[dict[str, Any]]:
         """Fetch stock/equity and mutual fund holdings for an account using normalised schema.

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,47 @@ def _check_neo_error(resp: Any) -> None:
 from cli.config import load_sessions as _load_sessions, save_session as _save_session
 
 
+def _normalize_kotak_exchange(ex_seg: Any, tradingsymbol: str | None = None) -> str:
+    """Map Kotak Neo exSeg or trading symbol to canonical exchange string (BFO, NFO, NSE, BSE, etc.)."""
+    sym = str(tradingsymbol or "").strip().upper()
+    if sym.startswith(("SENSEX", "BANKEX")):
+        return "BFO"
+    if sym.startswith(("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")):
+        return "NFO"
+
+    s = str(ex_seg or "").strip().lower()
+    if "bse_fo" in s or "bfo" in s:
+        return "BFO"
+    if "nse_fo" in s or "nfo" in s:
+        return "NFO"
+    if "bse" in s:
+        return "BSE"
+    if "nse" in s:
+        return "NSE"
+    if "mcx" in s:
+        return "MCX"
+    if "cde" in s or "cds" in s:
+        return "CDS"
+    if "bcs" in s or "bcd" in s:
+        return "BCD"
+    return "NFO"
+
+
+def _to_neo_exchange_segment(exchange: str | None, tradingsymbol: str | None = None) -> str:
+    """Map canonical exchange string or trading symbol to Kotak Neo SDK exchange segment."""
+    canonical = _normalize_kotak_exchange(exchange, tradingsymbol)
+    seg_map = {
+        "BFO": "bse_fo",
+        "NFO": "nse_fo",
+        "NSE": "nse_cm",
+        "BSE": "bse_cm",
+        "CDS": "cde_fo",
+        "BCD": "bcs-fo",
+        "MCX": "mcx_fo",
+    }
+    return seg_map.get(canonical, "nse_fo")
+
+
 # ── KotakAccountManager ────────────────────────────────────────────────────────
 
 class KotakAccountManager(BaseBrokerManager):
@@ -133,6 +175,8 @@ class KotakAccountManager(BaseBrokerManager):
         self._auth_lock = _threading.Lock()
         self._last_login_time: dict[str, float] = {}
         self._symbol_to_token: dict[str, str] = {}
+        self._holdings_map_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._last_orders_cache: dict[str, list[dict[str, Any]]] = {}
 
     # ── account lifecycle ──────────────────────────────────────────────────────
 
@@ -494,20 +538,27 @@ class KotakAccountManager(BaseBrokerManager):
             raw_positions = resp
 
         # Fetch holdings to obtain correct average cost for carried-forward positions
-        holdings_map = {}
-        try:
-            holdings_resp = client.holdings()
-            if isinstance(holdings_resp, dict):
-                holdings_data = holdings_resp.get("data") or []
-                for h in holdings_data:
-                    tok = str(h.get("exchangeIdentifier") or "")
-                    if tok:
-                        holdings_map[tok] = {
-                            "quantity": int(h.get("quantity") or 0),
-                            "average_price": float(h.get("averagePrice") or 0.0),
-                        }
-        except Exception as e:
-            logger.warning("Failed to fetch holdings for Kotak account: %s", e)
+        # Cached for 60s to avoid redundant /portfolio/v1/holdings HTTP calls on every position poll
+        now_ts = time.time()
+        cached_h = self._holdings_map_cache.get(account_key)
+        if cached_h and (now_ts - cached_h[0] < 60.0):
+            holdings_map = cached_h[1]
+        else:
+            holdings_map = {}
+            try:
+                holdings_resp = client.holdings()
+                if isinstance(holdings_resp, dict):
+                    holdings_data = holdings_resp.get("data") or []
+                    for h in holdings_data:
+                        tok = str(h.get("exchangeIdentifier") or "")
+                        if tok:
+                            holdings_map[tok] = {
+                                "quantity": int(h.get("quantity") or 0),
+                                "average_price": float(h.get("averagePrice") or 0.0),
+                            }
+                self._holdings_map_cache[account_key] = (now_ts, holdings_map)
+            except Exception as e:
+                logger.warning("Failed to fetch holdings for Kotak account: %s", e)
 
         result = []
         for pos in raw_positions:
@@ -602,7 +653,7 @@ class KotakAccountManager(BaseBrokerManager):
                 "unrealised": (last_price - avg_price) * qty if qty != 0 else 0.0,
                 "pnl_pct": pnl_pct,
                 "product": pos.get("prod", pos.get("product", "NRML")),
-                "exchange": pos.get("exch", pos.get("exchange", "NFO")),
+                "exchange": _normalize_kotak_exchange(pos.get("exSeg") or pos.get("exch") or pos.get("exchange"), trd_sym),
                 "instrument_token": None,
             })
 
@@ -704,13 +755,14 @@ class KotakAccountManager(BaseBrokerManager):
                 "order_type": order_type,
                 "status": status,
                 "product": str(ord.get("prod", ord.get("product", "NRML"))).upper(),
-                "exchange": str(ord.get("exch", ord.get("exchange", "NFO"))).upper(),
+                "exchange": _normalize_kotak_exchange(ord.get("exSeg") or ord.get("exch") or ord.get("exchange"), trd_sym),
                 "parent_order_id": str(ord.get("parent_order_id", "")) or None,
                 "status_message": str(ord.get("rejRsn", ord.get("status_message", ""))),
                 "order_timestamp": ord_ts_str,
                 "exchange_timestamp": ex_ts_str,
             })
 
+        self._last_orders_cache[account_key] = result
         return result
 
     def get_margins(self, account_key: str) -> dict[str, Any]:
@@ -781,12 +833,20 @@ class KotakAccountManager(BaseBrokerManager):
                     "net": net,
                     "cash": cash,
                     "collateral": collateral,
+                    "collateral_equity": rms_col,
+                    "collateral_liquid": sec_col,
                     "margin_used": margin_used,
                 }
         except Exception as exc:
             logger.warning("Kotak get_margins failed for key=%s…: %s", account_key[:8], exc)
 
-        return {"net": None, "cash": None, "collateral": None}
+        return {
+            "net": None,
+            "cash": None,
+            "collateral": None,
+            "collateral_equity": None,
+            "collateral_liquid": None,
+        }
 
     def get_holdings(self, account_key: str) -> list[dict[str, Any]]:
         """Fetch Kotak Neo stock/equity holdings and normalise to KiteCLI schema."""
@@ -958,8 +1018,9 @@ class KotakAccountManager(BaseBrokerManager):
         transaction_type = transaction_type.upper()
         order_type = order_type.upper()
         product = product.upper()
-        exchange = exchange.upper()
         tradingsymbol = tradingsymbol.upper()
+        exchange = _normalize_kotak_exchange(exchange, tradingsymbol)
+        neo_exchange_segment = _to_neo_exchange_segment(exchange, tradingsymbol)
 
         # Map transaction_type to Kotak Neo expected values ('B' or 'S')
         transaction_type_map = {
@@ -968,24 +1029,26 @@ class KotakAccountManager(BaseBrokerManager):
         }
         kotak_transaction_type = transaction_type_map.get(transaction_type, transaction_type)
 
-        # Resolve option lot size to align split legs
-        from cli.api_client import _kite_manager
-        lot_size = _kite_manager.get_nfo_lot_sizes().get(tradingsymbol, 1)
-
         KOTAK_FREEZE_LIMIT = 1800
-        if lot_size > 1:
-            freeze_limit = (KOTAK_FREEZE_LIMIT // lot_size) * lot_size
-            if freeze_limit == 0:
-                freeze_limit = lot_size
+        if quantity <= KOTAK_FREEZE_LIMIT:
+            legs: list[int] = [quantity]
         else:
-            freeze_limit = KOTAK_FREEZE_LIMIT
+            # Resolve option lot size to align split legs only when exceeding freeze limit
+            from cli.api_client import _kite_manager
+            lot_size = _kite_manager.get_nfo_lot_sizes().get(tradingsymbol, 1)
+            if lot_size > 1:
+                freeze_limit = (KOTAK_FREEZE_LIMIT // lot_size) * lot_size
+                if freeze_limit == 0:
+                    freeze_limit = lot_size
+            else:
+                freeze_limit = KOTAK_FREEZE_LIMIT
 
-        legs: list[int] = []
-        remaining = quantity
-        while remaining > 0:
-            leg_qty = min(remaining, freeze_limit)
-            legs.append(leg_qty)
-            remaining -= leg_qty
+            legs = []
+            remaining = quantity
+            while remaining > 0:
+                leg_qty = min(remaining, freeze_limit)
+                legs.append(leg_qty)
+                remaining -= leg_qty
 
         # Map order_type to Kotak Neo strings
         order_type_map = {
@@ -996,10 +1059,9 @@ class KotakAccountManager(BaseBrokerManager):
         }
         kotak_order_type = order_type_map.get(order_type, order_type)
 
-        order_ids: list[str] = []
-        for leg_qty in legs:
+        def _place_single_kotak_leg(leg_qty: int) -> str:
             params = {
-                "exchange_segment": f"{exchange}_EQ" if exchange in ("NSE", "BSE") else exchange,
+                "exchange_segment": neo_exchange_segment,
                 "product": product,
                 "price": str(price or 0),
                 "order_type": kotak_order_type,
@@ -1019,7 +1081,7 @@ class KotakAccountManager(BaseBrokerManager):
                 logger.info("Kotak place_order raw response: %s", resp)
                 _check_neo_error(resp)
                 if isinstance(resp, dict):
-                    order_id = str(
+                    oid = str(
                         resp.get("nOrdNo")
                         or resp.get("norenordno")
                         or resp.get("order_id")
@@ -1031,15 +1093,34 @@ class KotakAccountManager(BaseBrokerManager):
                         or ""
                     )
                 else:
-                    order_id = str(resp)
-                order_ids.append(order_id)
+                    oid = str(resp)
                 logger.info(
                     "Kotak order placed: %s %s %d %s → %s",
-                    transaction_type, order_type, leg_qty, tradingsymbol, order_id,
+                    transaction_type, order_type, leg_qty, tradingsymbol, oid,
                 )
+                return oid
             except Exception as exc:
                 logger.error("Kotak place_order failed: %s", exc)
                 raise RuntimeError(f"Kotak place_order failed: {exc}") from exc
+
+        if len(legs) <= 1:
+            return [_place_single_kotak_leg(legs[0])] if legs else []
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        order_ids: list[str] = []
+        first_err: Exception | None = None
+        with ThreadPoolExecutor(max_workers=len(legs)) as pool:
+            futures = [pool.submit(_place_single_kotak_leg, q) for q in legs]
+            for fut in futures:
+                try:
+                    order_ids.append(fut.result())
+                except Exception as exc:
+                    if first_err is None:
+                        first_err = exc
+
+        if first_err is not None:
+            raise first_err
 
         return order_ids
 
@@ -1059,14 +1140,23 @@ class KotakAccountManager(BaseBrokerManager):
             raise ValueError(f"Kotak account not found: key={account_key[:8]}…")
 
         if not quantity or int(quantity) == 0:
-            try:
-                res = self.get_orders(account_key)
-                for o in res.get("orders", []):
-                    if str(o.get("order_id")) == str(order_id):
-                        quantity = int(o.get("quantity") or o.get("pending_quantity") or 0)
-                        break
-            except Exception:
-                pass
+            # 1. Check in-memory order cache first (0ms)
+            cached_orders = self._last_orders_cache.get(account_key, [])
+            for o in cached_orders:
+                if str(o.get("order_id")) == str(order_id):
+                    quantity = int(o.get("quantity") or o.get("pending_quantity") or 0)
+                    break
+            # 2. Fallback to REST order_report only if not found in cache
+            if not quantity or int(quantity) == 0:
+                try:
+                    res = self.get_orders(account_key)
+                    orders_list = res if isinstance(res, list) else res.get("orders", [])
+                    for o in orders_list:
+                        if str(o.get("order_id")) == str(order_id):
+                            quantity = int(o.get("quantity") or o.get("pending_quantity") or 0)
+                            break
+                except Exception:
+                    pass
 
         order_type_map = {"MARKET": "MKT", "LIMIT": "L", "SL": "SL", "SL-M": "SL-M"}
         params = {
@@ -1133,7 +1223,7 @@ class KotakAccountManager(BaseBrokerManager):
             transaction_type = "SELL" if qty > 0 else "BUY"
             exit_qty = abs(qty)
             product = pos.get("product", "NRML")
-            exchange = pos.get("exchange", "NFO")
+            exchange = _normalize_kotak_exchange(pos.get("exchange") or pos.get("exSeg"), sym)
             order_type = "LIMIT" if price is not None else "MARKET"
 
             # Cancel existing pending orders for this symbol before placing new exit order
@@ -1170,6 +1260,8 @@ class KotakAccountManager(BaseBrokerManager):
                     orders_placed.append({
                         "tradingsymbol": sym,
                         "quantity": exit_qty,
+                        "transaction_type": transaction_type,
+                        "exchange": exchange,
                         "product": product,
                         "order_id": oid,
                         "cancelled_order_ids": cancelled_ids,
@@ -1205,18 +1297,7 @@ class KotakAccountManager(BaseBrokerManager):
             return {"status": "error", "message": "Kotak account not authenticated"}
 
         # Normalize segment for Neo API validation
-        # Allowed: ['NSE', 'nse', 'BSE', 'bse', 'NFO', 'nfo', 'BFO', 'bfo', 'nse_cm', 'bse_cm', 'nse_fo', 'bse_fo']
-        exch_u = (exchange or "NFO").upper()
-        if exch_u in ("NFO", "NSE_FO"):
-            neo_segment = "nse_fo"
-        elif exch_u in ("BFO", "BSE_FO"):
-            neo_segment = "bse_fo"
-        elif exch_u in ("NSE", "NSE_CM", "NSE_EQ"):
-            neo_segment = "nse_cm"
-        elif exch_u in ("BSE", "BSE_CM", "BSE_EQ"):
-            neo_segment = "bse_cm"
-        else:
-            neo_segment = "nse_fo"
+        neo_segment = _to_neo_exchange_segment(exchange, tradingsymbol)
 
         # Normalize product for Neo API validation
         # Allowed: ['NRML', 'CNC', 'MIS', 'INTRADAY', 'CO', 'BO']

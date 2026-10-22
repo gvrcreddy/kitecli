@@ -8,6 +8,7 @@ cli/live_session.py require zero changes.
 """
 
 import logging
+from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 from cli.kite_manager import KiteAccountManager
 from cli.config import remove_session
@@ -644,6 +645,7 @@ class KCLIClient:
         price: float | None = None,
         order_type: str | None = None,
         trigger_price: float | None = None,
+        **kwargs: Any,
     ) -> dict:
         """Modify an order on a specific account."""
         try:
@@ -655,10 +657,11 @@ class KCLIClient:
                 price=price,
                 order_type=order_type,
                 trigger_price=trigger_price,
+                **kwargs,
             )
             return {"status": "success", "order_id": res_id, "message": f"Order modified: {res_id}"}
         except Exception as exc:
-            return {"status": "error", "order_id": None, "message": str(exc)}
+            return {"status": "error", "order_id": order_id, "message": str(exc)}
 
     def cancel_order(
         self,

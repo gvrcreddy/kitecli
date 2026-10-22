@@ -281,6 +281,7 @@ class KotakAccountManager(BaseBrokerManager):
                     u_curr = url
 
                 req_kwargs = {}
+                req_kwargs.setdefault("timeout", (3.05, 8.0))
                 if _proxies:
                     url_lower = u_curr.lower()
                     is_order_api = "/order/" in url_lower and any(x in url_lower for x in ["/place", "/modify", "/cancel"])
@@ -1132,6 +1133,12 @@ class KotakAccountManager(BaseBrokerManager):
         price: float | None = None,
         order_type: str | None = None,
         trigger_price: float | None = None,
+        instrument_token: int | str | None = None,
+        exchange_segment: str | None = None,
+        product: str | None = None,
+        trading_symbol: str | None = None,
+        transaction_type: str | None = None,
+        **kwargs: Any,
     ) -> str:
         """Modify an open Kotak Neo order."""
         account_key = self._resolve_account_key(api_key)
@@ -1139,35 +1146,109 @@ class KotakAccountManager(BaseBrokerManager):
         if not client:
             raise ValueError(f"Kotak account not found: key={account_key[:8]}…")
 
+        cached_orders = self._last_orders_cache.get(account_key, [])
+        matched_ord = None
+        for o in cached_orders:
+            if str(o.get("order_id")) == str(order_id) or str(o.get("nOrdNo")) == str(order_id):
+                matched_ord = o
+                break
+
         if not quantity or int(quantity) == 0:
             # 1. Check in-memory order cache first (0ms)
-            cached_orders = self._last_orders_cache.get(account_key, [])
-            for o in cached_orders:
-                if str(o.get("order_id")) == str(order_id):
-                    quantity = int(o.get("quantity") or o.get("pending_quantity") or 0)
-                    break
+            if matched_ord:
+                quantity = int(matched_ord.get("quantity") or matched_ord.get("pending_quantity") or 0)
             # 2. Fallback to REST order_report only if not found in cache
             if not quantity or int(quantity) == 0:
                 try:
                     res = self.get_orders(account_key)
                     orders_list = res if isinstance(res, list) else res.get("orders", [])
                     for o in orders_list:
-                        if str(o.get("order_id")) == str(order_id):
+                        if str(o.get("order_id")) == str(order_id) or str(o.get("nOrdNo")) == str(order_id):
+                            matched_ord = o
                             quantity = int(o.get("quantity") or o.get("pending_quantity") or 0)
                             break
                 except Exception:
                     pass
 
+        # Extract order metadata for Kotak quick_modification fast path
+        trd_sym = (
+            trading_symbol
+            or kwargs.get("tradingsymbol")
+            or (matched_ord.get("tradingsymbol") if matched_ord else None)
+            or (matched_ord.get("trdSym") if matched_ord else None)
+        )
+        ex_seg = (
+            exchange_segment
+            or kwargs.get("exchange")
+            or (matched_ord.get("exchange") if matched_ord else None)
+            or (matched_ord.get("exSeg") if matched_ord else None)
+        )
+        prod = (
+            product
+            or kwargs.get("product")
+            or (matched_ord.get("product") if matched_ord else None)
+            or (matched_ord.get("prod") if matched_ord else None)
+            or "NRML"
+        )
+        trns_type = (
+            transaction_type
+            or kwargs.get("transaction_type")
+            or (matched_ord.get("transaction_type") if matched_ord else None)
+            or (matched_ord.get("trnsTp") if matched_ord else None)
+        )
+        tok = (
+            instrument_token
+            or kwargs.get("instrument_token")
+            or (matched_ord.get("instrument_token") if matched_ord else None)
+            or (matched_ord.get("tok") if matched_ord else None)
+            or (self._symbol_to_token.get(str(trd_sym).strip().upper()) if trd_sym else None)
+        )
+
         order_type_map = {"MARKET": "MKT", "LIMIT": "L", "SL": "SL", "SL-M": "SL-M"}
-        params = {
-            "order_id": order_id,
+        norm_ot = order_type_map.get((order_type or "").upper(), order_type or "L")
+
+        params: dict[str, Any] = {
+            "order_id": str(order_id),
             "price": str(price or 0),
             "quantity": str(quantity or 0),
             "validity": "DAY",
             "disclosed_quantity": "0",
             "trigger_price": str(trigger_price or 0),
-            "order_type": order_type_map.get((order_type or "").upper(), order_type or "L"),
+            "order_type": norm_ot,
         }
+
+        # If all 4 key metadata fields are available, populate them so Kotak SDK
+        # takes the direct 'quick_modification' path (0 HTTP calls to order_report)
+        if tok and ex_seg and prod and trd_sym:
+            ex_up = str(ex_seg).upper().strip()
+            if ex_up in ("NFO", "NSE_FO"):
+                norm_ex = "nse_fo"
+            elif ex_up in ("BFO", "BSE_FO"):
+                norm_ex = "bse_fo"
+            elif ex_up in ("NSE", "NSE_CM"):
+                norm_ex = "nse_cm"
+            elif ex_up in ("BSE", "BSE_CM"):
+                norm_ex = "bse_cm"
+            elif ex_up in ("CDS", "CDE_FO"):
+                norm_ex = "cde_fo"
+            elif ex_up in ("BCD", "BCS-FO"):
+                norm_ex = "bcs-fo"
+            elif ex_up in ("MCX", "MCX_FO"):
+                norm_ex = "mcx_fo"
+            else:
+                norm_ex = ex_seg
+
+            prod_up = str(prod).upper().strip()
+            norm_prod = "NRML" if prod_up in ("NRML", "NORMAL") else ("CNC" if prod_up in ("CNC", "CASH AND CARRY") else ("MIS" if prod_up in ("MIS", "INTRADAY") else prod_up))
+
+            params["instrument_token"] = str(tok)
+            params["exchange_segment"] = norm_ex
+            params["product"] = norm_prod
+            params["trading_symbol"] = str(trd_sym)
+            if trns_type:
+                tt_up = str(trns_type).upper().strip()
+                params["transaction_type"] = "B" if tt_up in ("B", "BUY") else ("S" if tt_up in ("S", "SELL") else tt_up)
+
         try:
             resp = client.modify_order(**params)
             _check_neo_error(resp)

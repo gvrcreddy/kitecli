@@ -111,6 +111,7 @@ class BaseBrokerManager(ABC):
         price: float | None = None,
         order_type: str | None = None,
         trigger_price: float | None = None,
+        **kwargs: Any,
     ) -> str:
         """Modify an open order. Returns the order ID."""
 
@@ -146,6 +147,10 @@ class BaseBrokerManager(ABC):
 
     def get_nfo_symbol_token_map(self) -> dict[str, int]:
         """Return tradingsymbol → instrument_token map for NFO instruments. Default: empty dict."""
+        return {}
+
+    def get_nfo_exchange_token_map(self) -> dict[str, str]:
+        """Return tradingsymbol → exchange_token (NSE exchange token) map for NFO instruments. Default: empty dict."""
         return {}
 
     def get_market_indices(self) -> dict[str, Any]:

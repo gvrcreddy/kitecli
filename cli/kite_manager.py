@@ -766,6 +766,7 @@ class KiteAccountManager(BaseBrokerManager):
         price: float | None = None,
         order_type: str | None = None,
         trigger_price: float | None = None,
+        **kwargs: Any,
     ) -> str:
         """Modify an open order.
 
@@ -780,7 +781,7 @@ class KiteAccountManager(BaseBrokerManager):
             raise RuntimeError(f"Account '{self._account_names.get(api_key, api_key)}' is not authenticated.")
 
         params = {
-            "variety": kite.VARIETY_REGULAR,
+            "variety": kwargs.get("variety", kite.VARIETY_REGULAR),
             "order_id": order_id,
         }
         if quantity is not None:

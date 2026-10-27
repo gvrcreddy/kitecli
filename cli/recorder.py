@@ -760,6 +760,50 @@ class DataRecorder:
                 )
             conn.commit()
 
+    def update_conditional_order_parameters(
+        self,
+        cond_id: int,
+        child_symbol: str | None = None,
+        child_action: str | None = None,
+        child_qty: str | None = None,
+        child_price: float | None = None,
+        child_product: str | None = None,
+        child_command_raw: str | None = None,
+    ) -> bool:
+        """Update child parameters of an active conditional order in SQLite."""
+        updates = []
+        params = []
+        if child_symbol is not None:
+            updates.append("child_symbol = ?")
+            params.append(child_symbol)
+        if child_action is not None:
+            updates.append("child_action = ?")
+            params.append(child_action.upper())
+        if child_qty is not None:
+            updates.append("child_qty = ?")
+            params.append(str(child_qty))
+        if child_price is not None:
+            updates.append("child_price = ?")
+            params.append(float(child_price) if child_price > 0 else None)
+        if child_product is not None:
+            updates.append("child_product = ?")
+            params.append(child_product.upper())
+        if child_command_raw is not None:
+            updates.append("child_command_raw = ?")
+            params.append(child_command_raw)
+
+        if not updates:
+            return False
+
+        params.append(cond_id)
+        sql = f"UPDATE conditional_orders SET {', '.join(updates)} WHERE id = ? AND status = 'PENDING';"
+        with self.get_connection() as conn:
+            self._init_db(conn)
+            cursor = conn.cursor()
+            cursor.execute(sql, tuple(params))
+            conn.commit()
+            return cursor.rowcount > 0
+
     def expire_old_conditional_orders(self, today_str: str) -> int:
         """Expire all pending conditional orders from previous trading sessions."""
         with self.get_connection() as conn:

@@ -1449,6 +1449,9 @@ class KCLILiveSession:
         
         # Start scheduled orders poller
         asyncio.create_task(self._poll_scheduled_orders())
+
+        # Sync tradebook from remote server in background
+        asyncio.create_task(self._sync_tradebook_on_startup())
         
         try:
             token_statuses = await self._diagnose_tokens()
@@ -2924,6 +2927,39 @@ class KCLILiveSession:
             if hasattr(self, "app") and self.app and self.app.loop:
                 asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
 
+    async def _sync_tradebook_on_startup(self) -> None:
+        """Background task to sync tradebook table from remote server on session startup."""
+        try:
+            from cli.tradebook_sync import async_sync_tradebook_from_remote
+            db_path = getattr(self, "recorder", None).db_path if getattr(self, "recorder", None) else None
+            res = await async_sync_tradebook_from_remote(db_path=db_path, config=getattr(self, "config", None))
+            if res.get("inserted", 0) > 0:
+                self.log_message(f"[#56d364]✓ Synced {res['inserted']} tradebook records from remote server.[/#]")
+                if getattr(self, "info_mode", None) == "pnl":
+                    self._update_info_buffer()
+            elif res.get("status") == "success":
+                logger.debug("Tradebook sync on startup: %s", res.get("message"))
+        except Exception as exc:
+            logger.debug("Startup tradebook sync notice: %s", exc)
+
+    async def _manual_sync_tradebook(self) -> None:
+        """Manual trigger to sync tradebook table from remote server."""
+        try:
+            from cli.tradebook_sync import async_sync_tradebook_from_remote
+            db_path = getattr(self, "recorder", None).db_path if getattr(self, "recorder", None) else None
+            res = await async_sync_tradebook_from_remote(db_path=db_path, config=getattr(self, "config", None), timeout=10)
+            if res.get("status") == "success":
+                if res.get("inserted", 0) > 0:
+                    self.log_message(f"[#56d364]✓ Synced {res['inserted']} new tradebook records (Total: {res.get('total')}).[/#]")
+                else:
+                    self.log_message(f"[#39c5bb]Tradebook is already up to date (Total: {res.get('total')}).[/#]")
+                if getattr(self, "info_mode", None) == "pnl":
+                    self._update_info_buffer()
+            else:
+                self.log_message(f"[#ff8700]Tradebook sync:[/#] {res.get('message')}")
+        except Exception as exc:
+            self.log_message(f"[#ff0000]Tradebook sync error:[/#] {exc}")
+
     def _check_conditional_triggers(self, order_id: str, status: str, filled_qty: int = 0, ord_data: dict | None = None) -> None:
         """Check if an order update completes or cancels any pending conditional child orders."""
         oid = str(order_id).strip()
@@ -3039,7 +3075,12 @@ class KCLILiveSession:
             price = parent_cmd.price
             order_type = "LIMIT" if price else "MARKET"
             product = parent_cmd.product or "NRML"
-            exchange = "NFO" if (symbol.endswith("CE") or symbol.endswith("PE") or any(symbol.endswith(e) for e in ("FUT", "CE", "PE"))) else "NSE"
+            if symbol.startswith(("SENSEX", "BANKEX")):
+                exchange = "BFO"
+            elif (symbol.endswith("CE") or symbol.endswith("PE") or any(symbol.endswith(e) for e in ("FUT", "CE", "PE"))):
+                exchange = "NFO"
+            else:
+                exchange = "NSE"
             if exchange == "NSE" and product.upper() == "NRML":
                 product = "CNC"
 
@@ -3288,10 +3329,9 @@ class KCLILiveSession:
                 self.log_message(f"[#ff5555]Warning:[/#] Price '{price_str}' not a float, placing as MARKET order.")
 
         # 3. Auto-detect exchange
-        exchange = "NFO"
-        if symbol.endswith("CE") or symbol.endswith("PE"):
-            exchange = "NFO"
-        elif any(symbol.endswith(exp) for exp in ("FUT", "CE", "PE")):
+        if symbol.startswith(("SENSEX", "BANKEX")):
+            exchange = "BFO"
+        elif symbol.endswith("CE") or symbol.endswith("PE") or any(symbol.endswith(exp) for exp in ("FUT", "CE", "PE")):
             exchange = "NFO"
         else:
             exchange = "NSE"
@@ -3851,6 +3891,10 @@ class KCLILiveSession:
             self._update_info_buffer()
             if hasattr(self, "app") and self.app:
                 self.app.invalidate()
+            return
+        elif cmd_norm in ("sync", "syncdb", "sync-tradebook", "synctradebook", "sync-db", "synctrade"):
+            self.log_message("[#39c5bb]Syncing tradebook from remote server...[/#]")
+            asyncio.create_task(self._manual_sync_tradebook())
             return
         elif cmd_norm in ("help", "h", "8", "/8", "/help"):
             self.info_mode = "help"
@@ -7386,68 +7430,60 @@ class KCLILiveSession:
 """
 
     def _get_pnl_date_range(self, period: str) -> tuple[datetime, datetime, str]:
-        """Compute the start date, end date, and human-readable label for a P&L period.
-        
-        Periods:
-        - "week": From most recent Wednesday 00:00:00 to now.
-        - "last_week": From previous week's Wednesday 00:00:00 to most recent Tuesday 23:59:59.
-        - "month": From day after last month's last Tuesday (Wednesday) 00:00:00 to now.
-        - "year": From current financial year April 1st 00:00:00 to now.
-        - "custom": Custom start and end date range.
-        """
+        """Compute the start date, end date, and human-readable label for a P&L period."""
         now = datetime.now()
-        
-        # NIFTY Options F&O Week: Wednesday 00:00:00 to Tuesday (most recent Wednesday)
-        d = now.weekday()
-        days_ago = d - 2 if d >= 2 else d + 5
-        this_wed = (now - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
+        try:
+            from trading_commons.pnl_calculator import get_pnl_date_range
+            return get_pnl_date_range(
+                period=period,
+                custom_start=getattr(self, "pnl_custom_start", None),
+                custom_end=getattr(self, "pnl_custom_end", None),
+                now=now,
+            )
+        except ImportError:
+            d = now.weekday()
+            days_ago = d - 2 if d >= 2 else d + 5
+            this_wed = (now - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
 
-        if period == "week":
-            start_dt = this_wed
-            label = f"Week (Wed {start_dt.strftime('%b %d')} -> Now)"
-            return start_dt, now, label
-            
-        elif period == "last_week":
-            last_wed = this_wed - timedelta(days=7)
-            last_tue = (this_wed - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
-            label = f"Last Week (Wed {last_wed.strftime('%b %d')} -> Tue {last_tue.strftime('%b %d')})"
-            return last_wed, last_tue, label
-
-        elif period == "month":
-            first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            last_day_prev_month = first_of_this_month - timedelta(days=1)
-            offset = (last_day_prev_month.weekday() - 1) % 7
-            last_tue_prev_month = last_day_prev_month - timedelta(days=offset)
-            start_dt = (last_tue_prev_month + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            label = f"Month (Wed {start_dt.strftime('%b %d')} -> Now)"
-            return start_dt, now, label
-
-        elif period == "custom":
-            c_start = getattr(self, "pnl_custom_start", None)
-            c_end = getattr(self, "pnl_custom_end", None)
-            if not c_start:
-                c_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-            if not c_end:
-                c_end = now.strftime("%Y-%m-%d")
-
-            try:
-                start_dt = datetime.strptime(c_start, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
-            except Exception:
-                start_dt = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
-
-            try:
-                end_dt = datetime.strptime(c_end, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999)
-            except Exception:
-                end_dt = now
-
-            label = f"Custom Range ({start_dt.strftime('%b %d, %Y')} -> {end_dt.strftime('%b %d, %Y')})"
-            return start_dt, end_dt, label
-
-        else:  # "year" (Financial Year starting April 1st)
-            fy_year = now.year if now.month >= 4 else now.year - 1
-            start_dt = datetime(fy_year, 4, 1, 0, 0, 0)
-            label = f"FY Year (Apr 01, {fy_year} -> Now)"
-            return start_dt, now, label
+            if period == "week":
+                start_dt = this_wed
+                label = f"Week (Wed {start_dt.strftime('%b %d')} -> Now)"
+                return start_dt, now, label
+            elif period == "last_week":
+                last_wed = this_wed - timedelta(days=7)
+                last_tue = (this_wed - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
+                label = f"Last Week (Wed {last_wed.strftime('%b %d')} -> Tue {last_tue.strftime('%b %d')})"
+                return last_wed, last_tue, label
+            elif period == "month":
+                first_of_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                last_day_prev_month = first_of_this_month - timedelta(days=1)
+                offset = (last_day_prev_month.weekday() - 1) % 7
+                last_tue_prev_month = last_day_prev_month - timedelta(days=offset)
+                start_dt = (last_tue_prev_month + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                label = f"Month (Wed {start_dt.strftime('%b %d')} -> Now)"
+                return start_dt, now, label
+            elif period == "custom":
+                c_start = getattr(self, "pnl_custom_start", None)
+                c_end = getattr(self, "pnl_custom_end", None)
+                if not c_start:
+                    c_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+                if not c_end:
+                    c_end = now.strftime("%Y-%m-%d")
+                try:
+                    start_dt = datetime.strptime(c_start, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+                except Exception:
+                    start_dt = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+                try:
+                    end_dt = datetime.strptime(c_end, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999)
+                except Exception:
+                    end_dt = now
+                label = f"Custom Range ({start_dt.strftime('%b %d, %Y')} -> {end_dt.strftime('%b %d, %Y')})"
+                return start_dt, end_dt, label
+            else:
+                fy_year = now.year if now.month >= 4 else now.year - 1
+                start_dt = datetime(fy_year, 4, 1, 0, 0, 0)
+                label = f"FY Year (Apr 01, {fy_year} -> Now)"
+                return start_dt, now, label
 
     def _render_pnl_pane(self) -> str:
         """Render the P&L Analytics tab with Grand Total and Account-wise breakdown."""
@@ -7455,8 +7491,6 @@ class KCLILiveSession:
         start_dt, end_dt, period_label = self._get_pnl_date_range(period)
         now_dt = datetime.now()
         is_past_period = end_dt < now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_iso = start_dt.isoformat()
-        end_iso = end_dt.isoformat()
 
         # Build period selector buttons header line
         def _fmt_btn(p_key, p_name):
@@ -7474,253 +7508,31 @@ class KCLILiveSession:
         if period == "custom":
             header_selector += "  │  \033[90m(Type 'pnl YYYY-MM-DD YYYY-MM-DD' to set range)\033[0m"
 
-        # Collect completed orders strictly from SQLite database (~/.kcli/data.db)
-        executed_orders_map = {}
-
-        try:
-            import sqlite3
-            db_path = getattr(self, "recorder", None).db_path if getattr(self, "recorder", None) else None
-            if not db_path:
-                from pathlib import Path
-                db_path = Path.home() / ".kcli" / "data.db"
-            if db_path.exists():
-                conn = sqlite3.connect(str(db_path))
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT timestamp, account_name, user_id, tradingsymbol, transaction_type, quantity, price, order_id, status, COALESCE(is_settled_externally, 0), COALESCE(total_charges, 0.0)
-                    FROM executed_order_context
-                    WHERE (UPPER(status) = 'COMPLETE' OR (quantity > 0 AND UPPER(status) NOT IN ('REJECTED', 'OPEN')))
-                    ORDER BY id ASC;
-                    """
-                )
-                for row in cursor.fetchall():
-                    raw_oid = row[7]
-                    oid = str(raw_oid) if raw_oid and str(raw_oid).strip() != "" else f"DB_ROW_{row[0]}_{row[3]}"
-                    tt = str(row[4]).upper()
-                    if tt == "B": tt = "BUY"
-                    if tt == "S": tt = "SELL"
-                    executed_orders_map[oid] = {
-                        "timestamp": row[0],
-                        "account_name": row[1] or row[2] or "Default",
-                        "user_id": row[2] or "Default",
-                        "tradingsymbol": row[3],
-                        "transaction_type": tt,
-                        "quantity": int(row[5]),
-                        "price": float(row[6]),
-                        "order_id": oid,
-                        "status": str(row[8]),
-                        "is_settled_externally": int(row[9] or 0),
-                        "total_charges": float(row[10] or 0.0),
-                    }
-                conn.close()
-        except Exception as exc:
-            logger.warning("Failed to query executed_order_context for P&L: %s", exc)
-
-        executed_orders = list(executed_orders_map.values())
-
         # Active positions
         open_positions = getattr(self, "active_positions", []) if not is_past_period else []
 
-        # Group executed orders & active positions by account
-        acct_orders_map = defaultdict(list)
-        for o in executed_orders:
-            acct_orders_map[o["account_name"]].append(o)
+        # Delegate P&L calculation to shared canonical module
+        db_path = getattr(self, "recorder", None).db_path if getattr(self, "recorder", None) else None
+        if not db_path:
+            from pathlib import Path
+            db_path = Path.home() / ".kcli" / "data.db"
 
-        acct_pos_map = defaultdict(list)
-        for p in open_positions:
-            acct_name = p.get("account_name") or p.get("user_id") or "Default"
-            acct_pos_map[acct_name].append(p)
+        from trading_commons.pnl_calculator import calculate_pnl_summary
 
-        all_acct_names = sorted(list(set(list(acct_orders_map.keys()) + list(acct_pos_map.keys()))))
-        if not all_acct_names:
-            all_acct_names = ["Default"]
+        pnl_summary = calculate_pnl_summary(
+            db_path=db_path,
+            active_positions=open_positions,
+            configured_accounts=getattr(self, "accounts", []),
+            period=period,
+            custom_start=getattr(self, "pnl_custom_start", None),
+            custom_end=getattr(self, "pnl_custom_end", None),
+        )
 
-        from datetime import time
-        from cli.greeks import parse_nfo_symbol
-
-        grand_realised = 0.0
-        grand_unrealised = 0.0
-        grand_closed_cnt = 0
-        grand_win_cnt = 0
-
-        acct_summaries = {}
-
-        def _to_iso_str(ts_val):
-            if not ts_val:
-                return ""
-            if hasattr(ts_val, "isoformat"):
-                return ts_val.isoformat()
-            s = str(ts_val).strip()
-            if not s:
-                return ""
-            formats = [
-                "%Y-%m-%dT%H:%M:%S.%f",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S.%f",
-                "%Y-%m-%d %H:%M:%S",
-                "%d-%b-%Y %H:%M:%S",
-                "%d-%b-%Y %H:%M",
-                "%Y-%m-%d",
-            ]
-            for fmt in formats:
-                try:
-                    dt = datetime.strptime(s, fmt)
-                    return dt.isoformat()
-                except ValueError:
-                    pass
-            return s
-
-        for acct in all_acct_names:
-            orders = acct_orders_map[acct]
-            positions = acct_pos_map[acct]
-
-            trades_by_symbol = defaultdict(list)
-            for o in orders:
-                trades_by_symbol[o["tradingsymbol"]].append(o)
-
-            from cli.charges import calculate_option_charges
-
-            realised_pnl = 0.0
-            closed_cnt = 0
-            win_cnt = 0
-            trade_rows = []
-
-            # Calculate total charges strictly for trades EXECUTED within the selected period
-            total_acct_charges = sum(
-                float(o.get("total_charges") or 0.0)
-                for o in orders
-                if int(o.get("is_settled_externally", 0)) == 0
-                and start_iso <= _to_iso_str(o.get("timestamp")) <= end_iso
-            )
-
-            for symbol, s_orders in trades_by_symbol.items():
-                # FIFO trade matching for completed legs across all available history
-                buys = [{"qty": int(o["quantity"]), "orig_qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp")), "chg": float(o.get("total_charges") or 0.0)} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("B", "BUY") and int(o.get("is_settled_externally", 0)) == 0]
-                sells = [{"qty": int(o["quantity"]), "orig_qty": int(o["quantity"]), "price": float(o["price"]), "ts": _to_iso_str(o.get("timestamp")), "chg": float(o.get("total_charges") or 0.0)} for o in s_orders if str(o.get("transaction_type", "")).upper() in ("S", "SELL") and int(o.get("is_settled_externally", 0)) == 0]
-
-                m_pnl = 0.0
-                matched_qty = 0
-                b_val_matched = 0.0
-                s_val_matched = 0.0
-                m_chg = 0.0
-                b_idx, s_idx = 0, 0
-
-                while b_idx < len(buys) and s_idx < len(sells):
-                    b = buys[b_idx]
-                    s = sells[s_idx]
-                    match_q = min(b["qty"], s["qty"])
-                    if match_q > 0:
-                        close_ts = max(b["ts"], s["ts"])
-                        b_ratio = match_q / b["orig_qty"] if b["orig_qty"] > 0 else 1.0
-                        s_ratio = match_q / s["orig_qty"] if s["orig_qty"] > 0 else 1.0
-
-                        b_chg = b_ratio * b["chg"] if start_iso <= b["ts"] <= end_iso else 0.0
-                        s_chg = s_ratio * s["chg"] if start_iso <= s["ts"] <= end_iso else 0.0
-                        leg_chg = b_chg + s_chg
-
-                        if start_iso <= close_ts <= end_iso:
-                            m_pnl += (s["price"] - b["price"]) * match_q
-                            matched_qty += match_q
-                            b_val_matched += match_q * b["price"]
-                            s_val_matched += match_q * s["price"]
-                            m_chg += leg_chg
-
-                        b["qty"] -= match_q
-                        s["qty"] -= match_q
-                    if b["qty"] == 0:
-                        b_idx += 1
-                    if s["qty"] == 0:
-                        s_idx += 1
-
-                parsed = parse_nfo_symbol(symbol)
-                exp_date = parsed.get("expiry_date") if parsed else None
-
-                is_expired = False
-                if exp_date:
-                    if now_dt.date() > exp_date:
-                        is_expired = True
-                    elif now_dt.date() == exp_date and now_dt.time() >= time(15, 30):
-                        is_expired = True
-
-                rem_buy_qty = sum(b["qty"] for b in buys[b_idx:])
-                rem_sell_qty = sum(s["qty"] for s in sells[s_idx:])
-                net_qty = rem_buy_qty - rem_sell_qty
-
-                if matched_qty > 0:
-                    realised_pnl += m_pnl
-                    closed_cnt += 1
-                    if m_pnl >= 0:
-                        win_cnt += 1
-                    avg_b = b_val_matched / matched_qty if matched_qty > 0 else 0.0
-                    avg_s = s_val_matched / matched_qty if matched_qty > 0 else 0.0
-                    c_val = round(m_chg, 2)
-                    trade_rows.append({"symbol": symbol, "qty": matched_qty, "buy_price": avg_b, "sell_price": avg_s, "pnl": m_pnl, "charges": c_val, "net_pnl": m_pnl - c_val})
-
-                if is_expired and net_qty != 0:
-                    if net_qty < 0:  # Short option expired worthless
-                        exp_qty = abs(net_qty)
-                        rem_s_val = sum(s["qty"] * s["price"] for s in sells[s_idx:])
-                        exp_pnl = rem_s_val if rem_sell_qty > 0 else 0.0
-                        realised_pnl += exp_pnl
-                        closed_cnt += 1
-                        win_cnt += 1
-                        avg_s = rem_s_val / exp_qty if exp_qty > 0 else 0.0
-                        chg_info = calculate_option_charges(0.0, avg_s, exp_qty, 0, 1)
-                        c_val = chg_info["total_charges"]
-                        total_acct_charges += c_val
-                        trade_rows.append({"symbol": symbol, "qty": exp_qty, "buy_price": 0.0, "sell_price": avg_s, "pnl": exp_pnl, "charges": c_val, "net_pnl": exp_pnl - c_val})
-                    elif net_qty > 0:  # Long option expired worthless
-                        exp_qty = net_qty
-                        rem_b_val = sum(b["qty"] * b["price"] for b in buys[b_idx:])
-                        exp_pnl = -rem_b_val if rem_buy_qty > 0 else 0.0
-                        realised_pnl += exp_pnl
-                        closed_cnt += 1
-                        avg_b = rem_b_val / exp_qty if exp_qty > 0 else 0.0
-                        chg_info = calculate_option_charges(avg_b, 0.0, exp_qty, 1, 0)
-                        c_val = chg_info["total_charges"]
-                        total_acct_charges += c_val
-                        trade_rows.append({"symbol": symbol, "qty": exp_qty, "buy_price": avg_b, "sell_price": 0.0, "pnl": exp_pnl, "charges": c_val, "net_pnl": exp_pnl - c_val})
-
-            # Fallback for closed positions today (q == 0) in positions if not already in trade_rows
-            for p in positions:
-                q = p.get("quantity", 0)
-                sym = p.get("tradingsymbol", "")
-                if q == 0 and sym and not any(r["symbol"] == sym for r in trade_rows):
-                    p_pnl = float(p.get("realised") or p.get("pnl") or 0.0)
-                    if p_pnl != 0.0:
-                        realised_pnl += p_pnl
-                        closed_cnt += 1
-                        if p_pnl >= 0:
-                            win_cnt += 1
-                        bp = float(p.get("buy_price") or p.get("average_price") or 0.0)
-                        sp = float(p.get("sell_price") or p.get("average_price") or 0.0)
-                        matched_q = abs(p.get("buy_quantity") or p.get("sell_quantity") or 0)
-                        chg_info = calculate_option_charges(bp, sp, matched_q, 1, 1)
-                        c_val = chg_info["total_charges"]
-                        total_acct_charges += c_val
-                        trade_rows.append({"symbol": sym, "qty": matched_q, "buy_price": bp, "sell_price": sp, "pnl": p_pnl, "charges": c_val, "net_pnl": p_pnl - c_val})
-
-            unrealised_pnl = sum(float(p.get("pnl", p.get("unrealised", 0.0))) for p in positions if p.get("quantity", 0) != 0)
-            net_pnl = (realised_pnl - total_acct_charges) + unrealised_pnl
-
-            grand_realised += realised_pnl
-            grand_unrealised += unrealised_pnl
-            grand_closed_cnt += closed_cnt
-            grand_win_cnt += win_cnt
-            if not hasattr(self, "_grand_charges"): self._grand_charges = 0.0
-            self._grand_charges += total_acct_charges
-
-            acct_summaries[acct] = {
-                "realised": realised_pnl,
-                "charges": total_acct_charges,
-                "net_realised": realised_pnl - total_acct_charges,
-                "unrealised": unrealised_pnl,
-                "net": net_pnl,
-                "closed_cnt": closed_cnt,
-                "win_cnt": win_cnt,
-                "trade_rows": trade_rows,
-            }
+        grand_realised = pnl_summary["total_realised_pnl"]
+        grand_unrealised = pnl_summary["total_unrealised_pnl"]
+        grand_total_charges = pnl_summary["total_charges"]
+        account_summaries = pnl_summary["accounts"]
+        all_trade_rows = pnl_summary["trades"]
 
         def _fmt_money(val: float) -> str:
             color = "\033[38;5;48m" if val >= 0 else "\033[38;5;196m"
@@ -7751,32 +7563,14 @@ class KCLILiveSession:
         lines.append(head_r)
         lines.append(mid_b)
 
-        all_trade_rows = []
-
-        grand_total_charges = 0.0
-
-        for acct in all_acct_names:
-            d = acct_summaries[acct]
-            grand_total_charges += d["charges"]
-            acct_s = _pad_ansi(acct, w_acct)
-            r_s = _pad_ansi(_fmt_money(d["realised"]), w_real, ">")
+        for d in account_summaries:
+            acct_s = _pad_ansi(d["name"], w_acct)
+            r_s = _pad_ansi(_fmt_money(d["realised_pnl"]), w_real, ">")
             chg_s = _pad_ansi(_fmt_charges(d["charges"]), w_chg, ">")
-            nr_s = _pad_ansi(_fmt_money(d["net_realised"]), w_net_r, ">")
-            u_s = _pad_ansi(_fmt_money(d["unrealised"]), w_unreal, ">")
-            n_s = _pad_ansi(_fmt_money(d["net"]), w_net, ">")
+            nr_s = _pad_ansi(_fmt_money(d["net_realised_pnl"]), w_net_r, ">")
+            u_s = _pad_ansi(_fmt_money(d["unrealised_pnl"]), w_unreal, ">")
+            n_s = _pad_ansi(_fmt_money(d["total_pnl"]), w_net, ">")
             lines.append(f"│ {acct_s} │ {r_s} │ {chg_s} │ {nr_s} │ {u_s} │ {n_s} │")
-
-            for r in d["trade_rows"]:
-                all_trade_rows.append({
-                    "account": acct,
-                    "symbol": r["symbol"],
-                    "qty": r["qty"],
-                    "buy_price": r.get("buy_price", 0.0),
-                    "sell_price": r.get("sell_price", 0.0),
-                    "pnl": r["pnl"],
-                    "charges": r.get("charges", 0.0),
-                    "net_pnl": r.get("net_pnl", r["pnl"]),
-                })
 
         lines.append(mid_b)
 

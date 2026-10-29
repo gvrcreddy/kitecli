@@ -550,11 +550,19 @@ class KiteAccountManager(BaseBrokerManager):
         exchange = exchange.upper()
         tradingsymbol = tradingsymbol.upper()
 
-        # Split quantity into legs of at most FREEZE_QTY_LIMIT
+        # BSE derivatives (SENSEX, BANKEX) belong to BFO, NSE derivatives belong to NFO
+        if tradingsymbol.startswith(("SENSEX", "BANKEX")):
+            exchange = "BFO"
+        elif tradingsymbol.startswith(("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")):
+            exchange = "NFO"
+
+        freeze_limit = 1000 if exchange == "BFO" else self.FREEZE_QTY_LIMIT
+
+        # Split quantity into legs of at most freeze_limit
         legs: list[int] = []
         remaining = quantity
         while remaining > 0:
-            leg_qty = min(remaining, self.FREEZE_QTY_LIMIT)
+            leg_qty = min(remaining, freeze_limit)
             legs.append(leg_qty)
             remaining -= leg_qty
 
@@ -563,7 +571,7 @@ class KiteAccountManager(BaseBrokerManager):
             logger.info(
                 "Splitting %s %s order for %d %s into %d legs: %s (freeze limit=%d)",
                 order_type, transaction_type, quantity, tradingsymbol,
-                total_legs, legs, self.FREEZE_QTY_LIMIT,
+                total_legs, legs, freeze_limit,
             )
 
         def _place_single_leg(idx: int, leg_qty: int) -> str:
@@ -1326,7 +1334,13 @@ class KiteAccountManager(BaseBrokerManager):
                 kite = self._clients.get(api_key)
                 if kite:
                     try:
-                        instruments = kite.instruments("NFO")
+                        instruments = list(kite.instruments("NFO"))
+                        try:
+                            bfo_insts = kite.instruments("BFO")
+                            if bfo_insts:
+                                instruments.extend(bfo_insts)
+                        except Exception as bfo_exc:
+                            logger.warning("BFO instruments fetch warning: %s", bfo_exc)
                         self._nfo_lot_size_cache = {
                             inst["tradingsymbol"]: int(inst.get("lot_size", 1) or 1)
                             for inst in instruments
@@ -1442,6 +1456,13 @@ class KiteAccountManager(BaseBrokerManager):
         kite = self._clients.get(account_key)
         if not kite or not self.is_authenticated(account_key):
             return {"status": "error", "message": "Account not authenticated"}
+
+        tradingsymbol = tradingsymbol.upper().strip()
+        exchange = exchange.upper().strip()
+        if tradingsymbol.startswith(("SENSEX", "BANKEX")):
+            exchange = "BFO"
+        elif tradingsymbol.startswith(("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")):
+            exchange = "NFO"
 
         try:
             p_val = price if price is not None else 0.0

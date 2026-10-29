@@ -836,7 +836,15 @@ class KCLITelegramBot:
             
             tx_type = "BUY" if qty > 0 else "SELL"
             abs_qty = abs(qty)
-            exchange = "NFO" if len(symbol) > 6 else "NSE"
+            sym_up = symbol.upper()
+            if sym_up.startswith(("SENSEX", "BANKEX")):
+                exchange = "BFO"
+            elif sym_up.startswith(("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY")):
+                exchange = "NFO"
+            elif len(symbol) > 6:
+                exchange = "NFO"
+            else:
+                exchange = "NSE"
             
             ltp_plus_0_1 = ltp * 1.001
             ltp_minus_0_1 = ltp * 0.999

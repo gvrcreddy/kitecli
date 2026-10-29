@@ -1488,24 +1488,42 @@ class KiteAccountManager(BaseBrokerManager):
             return {"status": "error", "message": "No authenticated Zerodha account available"}
 
         clean_sym = symbol.strip().upper()
-        if ":" not in clean_sym:
-            if any(x in clean_sym for x in ["CE", "PE", "FUT"]):
-                pref_sym = f"NFO:{clean_sym}"
-            else:
-                pref_sym = f"NSE:{clean_sym}"
+        if ":" in clean_sym:
+            raw_sym = clean_sym.split(":")[-1]
+            candidates = [clean_sym]
         else:
-            pref_sym = clean_sym
+            raw_sym = clean_sym
+            candidates = []
+
+        # Determine primary preferred exchange based on derivative vs cash index
+        if raw_sym.startswith("SENSEX") or raw_sym.startswith("BANKEX"):
+            candidates.extend([f"BFO:{raw_sym}", f"BSE:{raw_sym}"])
+        elif any(x in raw_sym for x in ["CE", "PE", "FUT"]):
+            candidates.extend([f"NFO:{raw_sym}", f"BFO:{raw_sym}"])
+        else:
+            candidates.extend([f"NSE:{raw_sym}", f"BSE:{raw_sym}"])
+
+        # Also add any remaining exchanges as fallback
+        for seg in ["BFO", "NFO", "NSE", "BSE"]:
+            c = f"{seg}:{raw_sym}"
+            if c not in candidates:
+                candidates.append(c)
 
         try:
-            quote_res = kite.quote([pref_sym])
-            if not quote_res or pref_sym not in quote_res:
-                alt_sym = f"BSE:{clean_sym}" if pref_sym.startswith("NSE:") else (f"NSE:{clean_sym}" if pref_sym.startswith("BSE:") else pref_sym)
-                if alt_sym != pref_sym:
-                    quote_res = kite.quote([alt_sym])
-                    pref_sym = alt_sym
+            quote_res = None
+            pref_sym = None
+            for cand in candidates:
+                try:
+                    q_res = kite.quote([cand])
+                    if q_res and cand in q_res:
+                        quote_res = q_res
+                        pref_sym = cand
+                        break
+                except Exception:
+                    continue
 
-            if not quote_res or pref_sym not in quote_res:
-                return {"status": "error", "message": f"Symbol {clean_sym} not found"}
+            if not quote_res or not pref_sym or pref_sym not in quote_res:
+                return {"status": "error", "message": f"Symbol {raw_sym} not found"}
 
             q = quote_res[pref_sym]
             depth = q.get("depth", {})

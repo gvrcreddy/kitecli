@@ -72,7 +72,7 @@ def _check_neo_error(resp: Any) -> None:
 
     Instead of raising standard HTTP exceptions, the neo-api-client library
     frequently catches exceptions internally and returns a dictionary
-    containing 'Error' or 'Error Message' keys.
+    containing 'Error', 'error', or 'Error Message' keys.
     Additionally, the Kotak Neo backend server returns dictionaries with
     'stat': 'Not_Ok' and 'errMsg' keys when a request fails.
     """
@@ -83,6 +83,14 @@ def _check_neo_error(resp: Any) -> None:
             raise RuntimeError(str(err))
         if "Error Message" in resp:
             raise RuntimeError(str(resp["Error Message"]))
+        if "error" in resp:
+            err = resp["error"]
+            if isinstance(err, list) and err and isinstance(err[0], dict):
+                msg = err[0].get("message") or str(err[0])
+                code = err[0].get("code", "")
+                code_desc = f" (Code: {code})" if code else ""
+                raise RuntimeError(f"{msg}{code_desc}")
+            raise RuntimeError(str(err))
 
         # 2. Backend server-level errors
         stat = str(resp.get("stat", "")).upper()
@@ -449,14 +457,12 @@ class KotakAccountManager(BaseBrokerManager):
                     totp=totp_code,
                 )
                 logger.debug("Kotak login resp: %s", login_resp)
-                if isinstance(login_resp, dict) and "Error" in login_resp:
-                    raise RuntimeError(f"TOTP login failed: {login_resp}")
+                _check_neo_error(login_resp)
 
                 # Step 2: 2FA validation with MPIN
                 session_resp = client.totp_validate(mpin=mpin)
                 logger.debug("Kotak 2FA resp: %s", session_resp)
-                if isinstance(session_resp, dict) and "Error" in session_resp:
-                    raise RuntimeError(f"MPIN validation failed: {session_resp}")
+                _check_neo_error(session_resp)
 
                 # Persist token
                 conf = client.configuration
